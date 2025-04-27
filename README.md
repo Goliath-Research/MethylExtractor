@@ -1,20 +1,69 @@
-# Introduction 
-TODO: Give a short introduction of your project. Let this section explain the objectives or the motivation behind this project. 
+# EpiExtractor
 
-# Getting Started
-TODO: Guide users through getting your code up and running on their own system. In this section you can talk about:
-1.	Installation process
-2.	Software dependencies
-3.	Latest releases
-4.	API references
+EpiExtractor is a command-line tool for extracting methylation data from BAM files and writing it to HDF5 format.
 
-# Build and Test
-TODO: Describe and show how to build your code and run the tests. 
+## Project Structure
 
-# Contribute
-TODO: Explain how other users and developers can contribute to make your code better. 
+```
+epiextractor/
+├── src/
+│   └── epiextractor.c
+├── include/
+│   └── (header files for tshlib and hdf5 if needed)
+├── lib/
+│   └── (static/dynamic libs for tshlib and hdf5 if custom)
+├── build/
+│   ├── static/
+│   ├── dynamic/
+│   └── docker/
+├── Dockerfile
+├── Makefile
+└── README.md
+```
 
-If you want to learn more about creating good readme files then refer the following [guidelines](https://docs.microsoft.com/en-us/azure/devops/repos/git/create-a-readme?view=azure-devops). You can also seek inspiration from the below readme files:
-- [ASP.NET Core](https://github.com/aspnet/Home)
-- [Visual Studio Code](https://github.com/Microsoft/vscode)
-- [Chakra Core](https://github.com/Microsoft/ChakraCore)
+## Building the Project
+
+### Prerequisites
+
+- GCC compiler
+- Make
+- HDF5 library and development headers
+- HTSlib library and development headers
+
+### Build Instructions
+
+1. **Static Build**:
+   ```bash
+   make static
+   ```
+   This will create a statically linked binary at `build/static/epiextractor`.
+
+2. **Dynamic Build**:
+   ```bash
+   make dynamic
+   ```
+   This will create a dynamically linked binary at `build/dynamic/epiextractor`.
+
+3. **Containerized Build**:
+   ```bash
+   docker build -t epiextractor:latest .
+   ```
+   This will build a Docker image named `epiextractor:latest`.
+
+## Usage
+
+Run the tool with the following command:
+
+```bash
+./build/dynamic/epiextractor --hdf5-output-dir output --hdf5-compression 6 --hdf5-chunk-size 100000 --threads 8 reference.fa input.bam
+```
+
+For help and additional options:
+
+```bash
+./build/dynamic/epiextractor --help
+```
+
+## License
+
+[Add your license information here] 

@@ -1,0 +1,67 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "cppdbg",
+      "request": "launch",
+      "args": [
+        "--max-chr", "1",
+        "--o", "/home/dizada/Arabidopsis", 
+        "--hdf5-compression", "9", 
+        "--q", "30", 
+        "--p", "20", 
+        "--CHG", 
+        "--CHH", 
+        "--c", "1",
+        "--C", "100",
+        "/home/dizada/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa", 
+        "/home/dizada/A14.clara_parabrics.duplicates_marked.bam"
+      ],
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "cwd": "/home/dizada/build/debug",
+      "program": "/home/dizada/build/debug/MethylExtractor",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "C/C++ Runner: Run Session",
+      "type": "cppdbg",
+      "request": "launch",
+      "args": [
+        "--max-chr", "24",
+        "--o", "output", 
+        "--hdf5-compression", "9", 
+        "--q", "30", 
+        "--p", "20", 
+        "--CHG", 
+        "--CHH", 
+        "--c", "4",
+        "--C", "100",
+        "Homo_sapiens.GRCh38.dna.primary_assembly.fa", 
+        "sample30x.clara_parabrics.duplicates_marked.bam"
+      ],
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "cwd": "./build/dynamic",
+      "program": "MethylExtractor",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ]
+}
