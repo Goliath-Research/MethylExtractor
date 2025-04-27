@@ -364,23 +364,30 @@ static size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer,
         else
         {
             // Dataset doesn't exist, create it
-            dataset = H5Dcreate2(file, "methylation_data", type, space,
-                                 H5P_DEFAULT, dcpl, H5P_DEFAULT);
+            dataset = H5Dcreate2(
+                file, "methylation_data",
+                type,
+                space,
+                H5P_DEFAULT,
+                dcpl,
+                H5P_DEFAULT);
             if (dataset >= 0)
-            {
                 status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, buffer);
-            }
         }
     }
     else
     {
         // Create new dataset
-        dataset = H5Dcreate2(file, "methylation_data", type, space,
-                             H5P_DEFAULT, dcpl, H5P_DEFAULT);
+        dataset = H5Dcreate2(
+            file,
+            "methylation_data",
+            type,
+            space,
+            H5P_DEFAULT,
+            dcpl,
+            H5P_DEFAULT);
         if (dataset >= 0)
-        {
             status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, buffer);
-        }
     }
 
     if (dataset < 0)
@@ -396,12 +403,11 @@ static size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer,
     }
 
     // Explicitly flush the dataset and file
-    if (dataset >= 0) {
+    if (dataset >= 0)
         H5Dflush(dataset);
-    }
-    if (file >= 0) {
+
+    if (file >= 0)
         H5Fflush(file, H5F_SCOPE_GLOBAL);
-    }
 
     records_written = n_records;
 
@@ -414,8 +420,9 @@ cleanup:
         H5Pclose(dcpl);
     if (space >= 0)
         H5Sclose(space);
-    if (file >= 0) {
-        H5Fflush(file, H5F_SCOPE_GLOBAL);  // One final flush before closing
+    if (file >= 0)
+    {
+        H5Fflush(file, H5F_SCOPE_GLOBAL); // One final flush before closing
         H5Fclose(file);
     }
     if (type >= 0)
@@ -597,7 +604,7 @@ void *process_chromosome(void *arg)
 // Function to cleanup HDF5 resources
 void cleanup_hdf5(void)
 {
-    H5close();  // Close all remaining open HDF5 identifiers
+    H5close(); // Close all remaining open HDF5 identifiers
 }
 
 // Main function
