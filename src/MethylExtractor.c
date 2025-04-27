@@ -431,6 +431,60 @@ cleanup:
     return records_written;
 }
 
+int getRealStrand(bam1_t *b) 
+{
+    char *XG = (char *) bam_aux_get(b, "XG");
+    //Only bismark uses the XG tag like this. Some other aligners use it for other purposes...
+    if(XG != NULL && *(XG+1) != 'C' && *(XG+1) != 'G') XG = NULL;
+    if(XG == NULL) { //Can't handle non-directional libraries!
+        if(b->core.flag & BAM_FPAIRED) 
+        {
+            if((b->core.flag & 0x50) == 0x50) return 2; //Read1, reverse comp. == OB
+            else if(b->core.flag & 0x40) return 1; //Read1, forward == OT
+            else if((b->core.flag & 0x90) == 0x90) return 1; //Read2, reverse comp. == OT
+            else if(b->core.flag & 0x80) return 2; //Read2, forward == OB
+            return 0; //One of the above should be set!
+        } 
+        else 
+        {
+            if(b->core.flag & 0x10) return 2; //Reverse comp. == OB
+            return 1; //OT
+        }
+    } 
+    else 
+    {
+        if(*(XG+1) == 'C') 
+        { //OT or CTOT, due to C->T converted genome
+            if((b->core.flag & 0x51) == 0x41) return 1; //Read#1 forward == OT
+            else if((b->core.flag & 0x51) == 0x51) return 3; //Read #1 reverse == CTOT
+            else if((b->core.flag & 0x91) == 0x81) return 3; //Read #2 forward == CTOT
+            else if((b->core.flag & 0x91) == 0x91) return 1; //Read #2 reverse == OT
+            else if(b->core.flag & 0x10) return 3; //Single-end reverse == CTOT
+            else return 1; //Single-end forward == OT
+        } 
+        else 
+        {
+            if((b->core.flag & 0x51) == 0x41) return 4; //Read#1 forward == CTOB
+            else if((b->core.flag & 0x51) == 0x51) return 2; //Read #1 reverse == OB
+            else if((b->core.flag & 0x91) == 0x81) return 2; //Read #2 forward == OB
+            else if((b->core.flag & 0x91) == 0x91) return 4; //Read #2 reverse == CTOB
+            else if(b->core.flag & 0x10) return 2; //Single-end reverse == OB
+            else return 4; //Single-end forward == CTOB
+        }
+    }
+}
+
+int updateMetrics(bam1_t *b) {
+    uint8_t base = bam_seqi(bam_get_seq(b), b->core.pos);
+    int strand = getRealStrand(b); //1=OT, 2=OB, 3=CTOT, 4=CTOB
+    if(base == 2 && (strand==1 || strand==3)) return 1; //C on an OT/CTOT alignment
+    else if(base == 4 && (strand==2 || strand==4)) return 1; //G on an OB/CTOB alignment
+
+    else if(base == 8 && (strand==1 || strand==3)) return -1; //T on an OT/CTOT alignment
+    else if(base == 1 && (strand==2 || strand==4)) return -1; //A on an OB/CTOB alignment
+    return 0;
+}
+
 // Thread function to process a single chromosome
 void *process_chromosome(void *arg)
 {
@@ -504,6 +558,7 @@ void *process_chromosome(void *arg)
         // Get read sequence and quality
         uint8_t *seq = bam_get_seq(b);
         uint8_t *qual = bam_get_qual(b);
+        int strand = getRealStrand(b); //1=OT, 2=OB, 3=CTOT, 4=CTOB
 
         // Process each base in the read
         for (int i = 0; i < b->core.l_qseq; i++)
@@ -521,8 +576,15 @@ void *process_chromosome(void *arg)
             // Get context and check if it's a cytosine we care about
             int8_t strand_ctx;
             uint8_t tnc;
-            int ctx = get_context(targ->chr_seq, targ->chr_len, refpos,
-                                  &strand_ctx, &tnc, targ->keep_chg, targ->keep_chh);
+            int ctx = get_context(
+                targ->chr_seq, 
+                targ->chr_len, 
+                refpos,
+                &strand_ctx, 
+                &tnc, 
+                targ->keep_chg, 
+                targ->keep_chh
+            );
             if (ctx == 0)
                 continue;
 
@@ -541,10 +603,13 @@ void *process_chromosome(void *arg)
                         // If buffer is full, write to file
                         if (buffer_count == BUFFER_SIZE)
                         {
-                            if (!flush_buffer_to_hdf5(out_path, buffer, buffer_count,
-                                                      targ->hdf5_compression,
-                                                      targ->hdf5_chunk_size,
-                                                      !first_write))
+                            if (!flush_buffer_to_hdf5(
+                                out_path, 
+                                buffer, 
+                                buffer_count,
+                                targ->hdf5_compression, 
+                                targ->hdf5_chunk_size,
+                                !first_write))
                             {
                                 fprintf(stderr, "Thread %s: Failed to write buffer to HDF5\n",
                                         targ->chr);
@@ -564,12 +629,20 @@ void *process_chromosome(void *arg)
                 current.tnc = tnc;
             }
 
+            uint8_t base = bam_seqi(seq, i);
+
+            if (base == 2 && (strand==1 || strand==3)) current.unmethylated++; //C on an OT/CTOT alignment
+            else if(base == 4 && (strand==2 || strand==4)) current.unmethylated++; //G on an OB/CTOB alignment
+            else if(base == 8 && (strand==1 || strand==3)) current.methylated++; //T on an OT/CTOT alignment
+            else if(base == 1 && (strand==2 || strand==4)) current.methylated++; //A on an OB/CTOB alignment
+
             // Count methylation
-            char base = seq_nt16_str[bam_seqi(seq, i)];
-            if (base == 'C' || base == 'c')
-                current.methylated++;
-            else if (base == 'T' || base == 't')
+/*             char base = toupper(seq_nt16_str[bam_seqi(seq, i)]);
+
+            if (base == 'C')
                 current.unmethylated++;
+            else if (base == 'T')
+                current.methylated++; */
 
             last_pos = refpos;
         }
@@ -586,9 +659,13 @@ void *process_chromosome(void *arg)
     // Flush remaining records
     if (buffer_count > 0)
     {
-        if (!flush_buffer_to_hdf5(out_path, buffer, buffer_count,
-                                  targ->hdf5_compression, targ->hdf5_chunk_size,
-                                  !first_write))
+        if (!flush_buffer_to_hdf5(
+            out_path, 
+            buffer, 
+            buffer_count,
+            targ->hdf5_compression, 
+            targ->hdf5_chunk_size,
+            !first_write))
             fprintf(stderr, "Thread %s: Failed to write final buffer to HDF5\n", targ->chr);
     }
 
