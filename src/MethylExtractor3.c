@@ -12,9 +12,9 @@
 #include <sys/sysinfo.h>
 
 #define DEFAULT_MAX_CHR 24
-#define DEFAULT_HDF5_COMPRESSION 9
-#define DEFAULT_HDF5_CHUNK_SIZE 1000
-#define DEFAULT_THREADS 4
+#define DEFAULT_HDF5_COMPRESSION 6
+#define DEFAULT_HDF5_CHUNK_SIZE 10000
+#define DEFAULT_THREADS 16
 #define DEFAULT_MIN_MAPQ 30
 #define DEFAULT_MIN_PHRED 20
 #define DEFAULT_MIN_COV 4
@@ -30,22 +30,20 @@
 #define CONTEXT_CPG 1
 #define CONTEXT_CHG 2
 #define CONTEXT_CHH 3
-#define STRAND_MASK 0x80   // bit 7
-#define CONTEXT_MASK 0x03  // bits 0-1
-#define MAX_CHR_NAME 2     // Enough for "22" or "X" or "Y"
-#define BUFFER_SIZE 100000 // Size of the methylation record buffer
+#define STRAND_MASK 0x80
+#define CONTEXT_MASK 0x03
+#define MAX_CHR_NAME 2
+#define BUFFER_SIZE 100000
 
-// Structure for methylation record
 typedef struct
 {
     uint32_t position;
     uint32_t methylated;
     uint32_t unmethylated;
-    int8_t strand_ctx; // bit 7: strand (0=+, 1=-), bits 0-1: context
-    uint8_t tnc;       // trinucleotide context packed into a single byte
+    int8_t strand_ctx;
+    uint8_t tnc;
 } MethylRecord;
 
-// Structure for thread arguments
 typedef struct
 {
     const char *bam_file;
@@ -64,59 +62,51 @@ typedef struct
     int keep_chh;
     int hdf5_compression;
     int hdf5_chunk_size;
+    uint32_t start_pos;
+    uint32_t end_pos;
+    MethylRecord *buffer;
+    size_t buffer_offset;
+    size_t buffer_size;
+    pthread_mutex_t *buffer_mutex;
 } ThreadArg;
 
-// Valid chromosomes (without 'chr' prefix)
 static const char *valid_chromosomes[] = {
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
     "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
     "21", "22", "X", "Y"};
 static const int num_valid_chromosomes = 24;
 
-// Function to normalize chromosome name (strip 'chr' prefix)
 const char *normalize_chromosome(const char *chr)
 {
     if (strncmp(chr, "chr", 3) == 0)
-    {
         return chr + 3;
-    }
     return chr;
 }
 
-// Function to get standardized chromosome number/name
 static const char *get_std_chr_name(const char *chr)
 {
-    // Strip any prefix (chr, Chr, etc.)
     const char *norm = normalize_chromosome(chr);
-
-    // Return NULL if not a valid chromosome
     for (int i = 0; i < num_valid_chromosomes; i++)
     {
         if (strcmp(norm, valid_chromosomes[i]) == 0)
-        {
             return valid_chromosomes[i];
-        }
     }
     return NULL;
 }
 
-// Function to check if chromosome is valid
 int is_valid_chromosome(const char *chr)
 {
     return get_std_chr_name(chr) != NULL;
 }
 
-// Function to create directory
 int make_directory(const char *path)
 {
     struct stat st = {0};
     if (stat(path, &st) == -1)
-    {
         return mkdir(path, 0700);
-    }
     return 0;
 }
-// Function to encode a nucleotide to a 3-bit number
+
 static inline uint8_t encode_nucleotide(char n)
 {
     switch (toupper(n))
@@ -134,7 +124,6 @@ static inline uint8_t encode_nucleotide(char n)
     }
 }
 
-// Function to encode trinucleotide context into a single byte
 static inline uint8_t encode_trinucleotide(const char *trinucl)
 {
     uint8_t n1 = encode_nucleotide(trinucl[0]);
@@ -143,13 +132,68 @@ static inline uint8_t encode_trinucleotide(const char *trinucl)
     return (n1 << 6) | (n2 << 3) | n3;
 }
 
-// Function to encode strand and context into a single byte
 static inline int8_t encode_strand_context(char strand, int context)
 {
     return (strand == '-' ? STRAND_MASK : 0) | (context & CONTEXT_MASK);
 }
 
-// Function to get sequence context from cached sequence
+inline int isCpG(char *seq, int pos, int seqlen)
+{
+    if (pos >= seqlen)
+        return 0;
+    if (*(seq + pos) == 'C' || *(seq + pos) == 'c')
+    {
+        if (pos + 1 == seqlen)
+            return 0;
+        if (*(seq + pos + 1) == 'G' || *(seq + pos + 1) == 'g')
+            return 1;
+        return 0;
+    }
+    else if (*(seq + pos) == 'G' || *(seq + pos) == 'g')
+    {
+        if (pos == 0)
+            return 0;
+        if (*(seq + pos - 1) == 'C' || *(seq + pos - 1) == 'c')
+            return -1;
+        return 0;
+    }
+    return 0;
+}
+
+inline int isCHG(char *seq, int pos, int seqlen)
+{
+    if (pos >= seqlen)
+        return 0;
+    if (*(seq + pos) == 'C' || *(seq + pos) == 'c')
+    {
+        if (pos + 2 >= seqlen)
+            return 0;
+        if (*(seq + pos + 2) == 'G' || *(seq + pos + 2) == 'g')
+            return 1;
+        return 0;
+    }
+    else if (*(seq + pos) == 'G' || *(seq + pos) == 'g')
+    {
+        if (pos <= 1)
+            return 0;
+        if (*(seq + pos - 2) == 'C' || *(seq + pos - 2) == 'c')
+            return -1;
+        return 0;
+    }
+    return 0;
+}
+
+inline int isCHH(char *seq, int pos, int seqlen)
+{
+    if (pos >= seqlen)
+        return 0;
+    if (*(seq + pos) == 'C' || *(seq + pos) == 'c')
+        return 1;
+    else if (*(seq + pos) == 'G' || *(seq + pos) == 'g')
+        return -1;
+    return 0;
+}
+
 int get_context(const char *chr_seq, int chr_len, int pos, int8_t *strand_ctx, uint8_t *tnc, int keep_chg, int keep_chh)
 {
     if (pos < 1 || pos + 1 >= chr_len)
@@ -158,30 +202,25 @@ int get_context(const char *chr_seq, int chr_len, int pos, int8_t *strand_ctx, u
         *strand_ctx = encode_strand_context('+', CONTEXT_CHH);
         return keep_chh ? CONTEXT_CHH : 0;
     }
-
     char trinucl[4];
     trinucl[0] = toupper(chr_seq[pos - 1]);
     trinucl[1] = toupper(chr_seq[pos]);
     trinucl[2] = toupper(chr_seq[pos + 1]);
     trinucl[3] = '\0';
     *tnc = encode_trinucleotide(trinucl);
-
-    char c0 = trinucl[0], c1 = trinucl[1], c2 = trinucl[2];
-
-    if (c1 != 'C')
+    if (trinucl[1] != 'C')
     {
         *strand_ctx = 0;
         return 0;
     }
-
-    if (c2 == 'G')
+    if (trinucl[2] == 'G')
     {
         *strand_ctx = encode_strand_context('+', CONTEXT_CPG);
         return CONTEXT_CPG;
     }
-    else if (c2 == 'A' || c2 == 'C' || c2 == 'T')
+    else if (trinucl[2] == 'A' || trinucl[2] == 'C' || trinucl[2] == 'T')
     {
-        if (c0 == 'C' || c0 == 'A' || c0 == 'T')
+        if (trinucl[0] == 'C' || trinucl[0] == 'A' || trinucl[0] == 'T')
         {
             *strand_ctx = encode_strand_context('+', CONTEXT_CHH);
             return keep_chh ? CONTEXT_CHH : 0;
@@ -194,7 +233,7 @@ int get_context(const char *chr_seq, int chr_len, int pos, int8_t *strand_ctx, u
     }
     else
     {
-        if (c0 == 'C' || c0 == 'A' || c0 == 'T' || c0 == 'N')
+        if (trinucl[0] == 'C' || trinucl[0] == 'A' || trinucl[0] == 'T' || trinucl[0] == 'N')
         {
             *strand_ctx = encode_strand_context('+', CONTEXT_CHH);
             return keep_chh ? CONTEXT_CHH : 0;
@@ -207,75 +246,100 @@ int get_context(const char *chr_seq, int chr_len, int pos, int8_t *strand_ctx, u
     }
 }
 
-// Function to process CIGAR for read position
-int cigar2readpos(const bam1_t *b, int refpos, int *readpos)
+size_t count_methylation_sites(const char *chr_seq, uint32_t chr_len, int keep_chg, int keep_chh)
 {
-    int rpos = 0, qpos = 0;
-    uint32_t *cigar = bam_get_cigar(b);
-
-    for (int k = 0; k < b->core.n_cigar; k++)
+    size_t count = 0;
+    for (uint32_t pos = 0; pos < chr_len; pos++)
     {
-        int op = bam_cigar_op(cigar[k]);
-        int len = bam_cigar_oplen(cigar[k]);
-
-        if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF)
+        if (isCpG((char *)chr_seq, pos, chr_len) ||
+            (keep_chg && isCHG((char *)chr_seq, pos, chr_len)) ||
+            (keep_chh && isCHH((char *)chr_seq, pos, chr_len)))
         {
-            if (rpos + len > refpos)
-            {
-                *readpos = qpos + (refpos - rpos);
-                return 0;
-            }
-            rpos += len;
-            qpos += len;
-        }
-        else if (op == BAM_CDEL || op == BAM_CREF_SKIP)
-        {
-            rpos += len;
-        }
-        else if (op == BAM_CINS || op == BAM_CSOFT_CLIP)
-        {
-            qpos += len;
+            count++;
         }
     }
-    return -1;
+    return count;
 }
 
-// Function to write buffer to HDF5 and return number of records written
-static size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer,
-                                   size_t n_records, int compression, int chunk_size,
-                                   int append_mode)
+void initialize_buffer(MethylRecord *buffer, size_t site_count, const char *chr_seq, uint32_t chr_len, int keep_chg, int keep_chh)
 {
-    hid_t file = -1, dataset = -1, space = -1, type = -1;
-    hid_t mem_type = -1, dcpl = -1;
+    size_t idx = 0;
+    for (uint32_t pos = 0; pos < chr_len && idx < site_count; pos++)
+    {
+        int8_t strand_ctx;
+        uint8_t tnc;
+        int ctx = get_context(chr_seq, chr_len, pos, &strand_ctx, &tnc, keep_chg, keep_chh);
+        if (ctx)
+        {
+            buffer[idx].position = pos + 1;
+            buffer[idx].methylated = 0;
+            buffer[idx].unmethylated = 0;
+            buffer[idx].strand_ctx = strand_ctx;
+            buffer[idx].tnc = tnc;
+            idx++;
+        }
+    }
+}
+
+size_t find_buffer_index(MethylRecord *buffer, size_t offset, size_t size, uint32_t pos)
+{
+    size_t left = offset, right = offset + size - 1;
+    while (left <= right)
+    {
+        size_t mid = left + (right - left) / 2;
+        if (buffer[mid].position == pos + 1)
+            return mid;
+        if (buffer[mid].position < pos + 1)
+            left = mid + 1;
+        else
+            right = mid - 1;
+    }
+    return offset; // Should not occur if buffer is correctly initialized
+}
+
+size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n_records, 
+                            int compression, int chunk_size, int append_mode,
+                            int min_cov, int max_cov, int min_meth, int max_meth)
+{
+    hid_t file = -1, dataset = -1, space = -1, type = -1, mem_type = -1, dcpl = -1;
     herr_t status = -1;
     size_t records_written = 0;
-
-    // Create compound datatype
     type = H5Tcreate(H5T_COMPOUND, sizeof(MethylRecord));
-    if (type < 0)
-    {
-        fprintf(stderr, "Failed to create compound datatype\n");
-        goto cleanup;
-    }
-
     H5Tinsert(type, "position", HOFFSET(MethylRecord, position), H5T_NATIVE_UINT32);
     H5Tinsert(type, "methylated", HOFFSET(MethylRecord, methylated), H5T_NATIVE_UINT32);
     H5Tinsert(type, "unmethylated", HOFFSET(MethylRecord, unmethylated), H5T_NATIVE_UINT32);
     H5Tinsert(type, "strand_ctx", HOFFSET(MethylRecord, strand_ctx), H5T_NATIVE_INT8);
     H5Tinsert(type, "tnc", HOFFSET(MethylRecord, tnc), H5T_NATIVE_UINT8);
-
-    // Open or create file
-    file = append_mode ? H5Fopen(filename, H5F_ACC_RDWR, H5P_DEFAULT)
-                       : H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    file = append_mode ? H5Fopen(filename, H5F_ACC_RDWR, H5P_DEFAULT) : H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
     if (file < 0)
     {
-        fprintf(stderr, "Failed to %s HDF5 file: %s\n",
-                append_mode ? "open" : "create", filename);
+        fprintf(stderr, "Failed to %s HDF5 file: %s\n", append_mode ? "open" : "create", filename);
         goto cleanup;
     }
-
-    // Create dataspace
-    hsize_t dims[1] = {n_records};
+    hsize_t dims[1] = {0};
+    size_t valid_records = 0;
+    for (size_t i = 0; i < n_records; i++)
+    {
+        int total = buffer[i].methylated + buffer[i].unmethylated;
+        if (total >= min_cov && total <= max_cov)
+        {
+            double meth_level = 100.0 * ((double)buffer[i].methylated / total);
+            if (meth_level >= min_meth && meth_level <= max_meth)
+                dims[0]++;
+        }
+    }
+    MethylRecord *filtered_buffer = malloc(dims[0] * sizeof(MethylRecord));
+    size_t j = 0;
+    for (size_t i = 0; i < n_records; i++)
+    {
+        int total = buffer[i].methylated + buffer[i].unmethylated;
+        if (total >= min_cov && total <= max_cov)
+        {
+            double meth_level = 100.0 * ((double)buffer[i].methylated / total);
+            if (meth_level >= min_meth && meth_level <= max_meth)
+                filtered_buffer[j++] = buffer[i];
+        }
+    }
     hsize_t maxdims[1] = {H5S_UNLIMITED};
     space = H5Screate_simple(1, dims, maxdims);
     if (space < 0)
@@ -283,16 +347,12 @@ static size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer,
         fprintf(stderr, "Failed to create dataspace\n");
         goto cleanup;
     }
-
-    // Create property list for dataset creation
     dcpl = H5Pcreate(H5P_DATASET_CREATE);
     if (dcpl < 0)
     {
         fprintf(stderr, "Failed to create dataset creation property list\n");
         goto cleanup;
     }
-
-    // Set chunking and compression
     hsize_t chunk_dims[1] = {(hsize_t)chunk_size};
     if (H5Pset_chunk(dcpl, 1, chunk_dims) < 0)
     {
@@ -307,115 +367,60 @@ static size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer,
             goto cleanup;
         }
     }
-
-    // Create memory datatype
     mem_type = H5Tcopy(type);
     if (mem_type < 0)
     {
         fprintf(stderr, "Failed to create memory datatype\n");
         goto cleanup;
     }
-
     if (append_mode)
     {
         dataset = H5Dopen2(file, "methylation_data", H5P_DEFAULT);
         if (dataset >= 0)
         {
-            // Get current size and extend
             hsize_t curr_size;
             hid_t file_space = H5Dget_space(dataset);
-            if (file_space < 0)
-            {
-                fprintf(stderr, "Failed to get dataset space\n");
-                goto cleanup;
-            }
-
-            if (H5Sget_simple_extent_dims(file_space, &curr_size, NULL) < 0)
-            {
-                fprintf(stderr, "Failed to get dataset dimensions\n");
-                H5Sclose(file_space);
-                goto cleanup;
-            }
-
-            dims[0] = curr_size + n_records;
-            if (H5Dset_extent(dataset, dims) < 0)
-            {
-                fprintf(stderr, "Failed to extend dataset\n");
-                H5Sclose(file_space);
-                goto cleanup;
-            }
-
-            // Write at the end
+            H5Sget_simple_extent_dims(file_space, &curr_size, NULL);
+            dims[0] += curr_size;
+            H5Dset_extent(dataset, dims);
             file_space = H5Dget_space(dataset);
-            if (file_space < 0)
-            {
-                fprintf(stderr, "Failed to get dataset space after extension\n");
-                goto cleanup;
-            }
-
             hsize_t start[1] = {curr_size};
-            hsize_t count[1] = {n_records};
-            if (H5Sselect_hyperslab(file_space, H5S_SELECT_SET, start, NULL, count, NULL) < 0)
-            {
-                fprintf(stderr, "Failed to select hyperslab\n");
-                H5Sclose(file_space);
-                goto cleanup;
-            }
-
-            status = H5Dwrite(dataset, mem_type, space, file_space, H5P_DEFAULT, buffer);
+            hsize_t count[1] = {dims[0] - curr_size};
+            H5Sselect_hyperslab(file_space, H5S_SELECT_SET, start, NULL, count, NULL);
+            status = H5Dwrite(dataset, mem_type, space, file_space, H5P_DEFAULT, filtered_buffer);
             H5Sclose(file_space);
         }
         else
         {
-            // Dataset doesn't exist, create it
-            dataset = H5Dcreate2(
-                file, "methylation_data",
-                type,
-                space,
-                H5P_DEFAULT,
-                dcpl,
-                H5P_DEFAULT);
+            dataset = H5Dcreate2(file, "methylation_data", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
             if (dataset >= 0)
-                status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, buffer);
+                status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
         }
     }
     else
     {
-        // Create new dataset
-        dataset = H5Dcreate2(
-            file,
-            "methylation_data",
-            type,
-            space,
-            H5P_DEFAULT,
-            dcpl,
-            H5P_DEFAULT);
+        dataset = H5Dcreate2(file, "methylation_data", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
         if (dataset >= 0)
-            status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, buffer);
+            status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
     }
-
     if (dataset < 0)
     {
         fprintf(stderr, "Failed to create or open dataset\n");
         goto cleanup;
     }
-
     if (status < 0)
     {
         fprintf(stderr, "Failed to write data to HDF5 file\n");
         goto cleanup;
     }
-
-    // Explicitly flush the dataset and file
     if (dataset >= 0)
         H5Dflush(dataset);
-
     if (file >= 0)
         H5Fflush(file, H5F_SCOPE_GLOBAL);
-
-    records_written = n_records;
-
+    records_written = dims[0];
 cleanup:
+    if (filtered_buffer)
+        free(filtered_buffer);
     if (mem_type >= 0)
         H5Tclose(mem_type);
     if (dataset >= 0)
@@ -426,244 +431,127 @@ cleanup:
         H5Sclose(space);
     if (file >= 0)
     {
-        H5Fflush(file, H5F_SCOPE_GLOBAL); // One final flush before closing
+        H5Fflush(file, H5F_SCOPE_GLOBAL);
         H5Fclose(file);
     }
     if (type >= 0)
         H5Tclose(type);
-
     return records_written;
 }
 
-int getRealStrand(bam1_t *b) 
+int getRealStrand(bam1_t *b)
 {
-    char *XG = (char *) bam_aux_get(b, "XG");
-    //Only bismark uses the XG tag like this. Some other aligners use it for other purposes...
-    if(XG != NULL && *(XG+1) != 'C' && *(XG+1) != 'G') XG = NULL;
-    if(XG == NULL) { //Can't handle non-directional libraries!
-        if(b->core.flag & BAM_FPAIRED) 
-        {
-            if((b->core.flag & 0x50) == 0x50) return 2; //Read1, reverse comp. == OB
-            else if(b->core.flag & 0x40) return 1; //Read1, forward == OT
-            else if((b->core.flag & 0x90) == 0x90) return 1; //Read2, reverse comp. == OT
-            else if(b->core.flag & 0x80) return 2; //Read2, forward == OB
-            return 0; //One of the above should be set!
-        } 
-        else 
-        {
-            if(b->core.flag & 0x10) return 2; //Reverse comp. == OB
-            return 1; //OT
-        }
-    } 
-    else 
+    char *XG = (char *)bam_aux_get(b, "XG");
+    if (XG != NULL && *(XG + 1) != 'C' && *(XG + 1) != 'G')
+        XG = NULL;
+    if (XG == NULL)
     {
-        if(*(XG+1) == 'C') 
-        { //OT or CTOT, due to C->T converted genome
-            if((b->core.flag & 0x51) == 0x41) return 1; //Read#1 forward == OT
-            else if((b->core.flag & 0x51) == 0x51) return 3; //Read #1 reverse == CTOT
-            else if((b->core.flag & 0x91) == 0x81) return 3; //Read #2 forward == CTOT
-            else if((b->core.flag & 0x91) == 0x91) return 1; //Read #2 reverse == OT
-            else if(b->core.flag & 0x10) return 3; //Single-end reverse == CTOT
-            else return 1; //Single-end forward == OT
-        } 
-        else 
+        if (b->core.flag & BAM_FPAIRED)
         {
-            if((b->core.flag & 0x51) == 0x41) return 4; //Read#1 forward == CTOB
-            else if((b->core.flag & 0x51) == 0x51) return 2; //Read #1 reverse == OB
-            else if((b->core.flag & 0x91) == 0x81) return 2; //Read #2 forward == OB
-            else if((b->core.flag & 0x91) == 0x91) return 4; //Read #2 reverse == CTOB
-            else if(b->core.flag & 0x10) return 2; //Single-end reverse == OB
-            else return 4; //Single-end forward == CTOB
+            if ((b->core.flag & 0x50) == 0x50)
+                return 2;
+            else if (b->core.flag & 0x40)
+                return 1;
+            else if ((b->core.flag & 0x90) == 0x90)
+                return 1;
+            else if (b->core.flag & 0x80)
+                return 2;
+            return 0;
+        }
+        else
+        {
+            if (b->core.flag & 0x10)
+                return 2;
+            return 1;
+        }
+    }
+    else
+    {
+        if (*(XG + 1) == 'C')
+        {
+            if ((b->core.flag & 0x51) == 0x41)
+                return 1;
+            else if ((b->core.flag & 0x51) == 0x51)
+                return 3;
+            else if ((b->core.flag & 0x91) == 0x81)
+                return 3;
+            else if ((b->core.flag & 0x91) == 0x91)
+                return 1;
+            else if (b->core.flag & 0x10)
+                return 3;
+            else
+                return 1;
+        }
+        else
+        {
+            if ((b->core.flag & 0x51) == 0x41)
+                return 4;
+            else if ((b->core.flag & 0x51) == 0x51)
+                return 2;
+            else if ((b->core.flag & 0x91) == 0x81)
+                return 2;
+            else if ((b->core.flag & 0x91) == 0x91)
+                return 4;
+            else if (b->core.flag & 0x10)
+                return 2;
+            else
+                return 4;
         }
     }
 }
 
-// Thread function to process a single chromosome
-void *process_chromosome(void *arg)
+void *process_chromosome_region(void *arg)
 {
     ThreadArg *targ = (ThreadArg *)arg;
-
-    // Get standardized chromosome name
-    const char *std_chr = get_std_chr_name(targ->chr);
-    if (!std_chr)
-    {
-        fprintf(stderr, "Invalid chromosome name: %s\n", targ->chr);
-        return NULL;
-    }
-
-    char out_path[1024];
-    snprintf(out_path, sizeof(out_path), "%s/%s.h5", targ->out_dir, std_chr);
-
-    // Open BAM file and get index
     samFile *in = sam_open(targ->bam_file, "r");
     if (!in)
     {
-        fprintf(stderr, "Thread %s: Failed to open BAM file\n", targ->chr);
+        fprintf(stderr, "Thread %s:%u-%u: Failed to open BAM file\n", targ->chr, targ->start_pos, targ->end_pos);
         return NULL;
     }
-
     bam_hdr_t *header = sam_hdr_read(in);
-    if (!header)
-    {
-        fprintf(stderr, "Thread %s: Failed to read BAM header\n", targ->chr);
-        sam_close(in);
-        return NULL;
-    }
-
     hts_idx_t *idx = sam_index_load(in, targ->bam_file);
-    if (!idx)
-    {
-        fprintf(stderr, "Thread %s: BAM index missing\n", targ->chr);
-        sam_hdr_destroy(header);
-        sam_close(in);
-        return NULL;
-    }
-
-    // Create iterator for this chromosome
-    hts_itr_t *iter = sam_itr_queryi(idx, targ->tid, 0, header->target_len[targ->tid]);
+    hts_itr_t *iter = sam_itr_queryi(idx, targ->tid, targ->start_pos, targ->end_pos);
     if (!iter)
     {
-        fprintf(stderr, "Thread %s: Failed to create iterator\n", targ->chr);
-        hts_idx_destroy(idx);
+        fprintf(stderr, "Thread %s:%u-%u: Failed to create iterator\n", targ->chr, targ->start_pos, targ->end_pos);
         sam_hdr_destroy(header);
         sam_close(in);
         return NULL;
     }
-
-    // Initialize fixed-size buffers
-    MethylRecord current = {0};       // Current position being processed
-    MethylRecord buffer[BUFFER_SIZE]; // Buffer for valid records
-    size_t buffer_count = 0;          // Number of records in buffer
-    int first_write = 1;              // Flag for first write to file
-
-    // Process alignments
     bam1_t *b = bam_init1();
-    uint32_t last_pos = 0;
-
     while (sam_itr_next(in, iter, b) >= 0)
     {
-        // Skip if not meeting quality criteria
-        if (b->core.flag & DEFAULT_FLAGS)
+        if (b->core.flag & DEFAULT_FLAGS || b->core.qual < targ->min_mapq)
             continue;
-        if (b->core.qual < targ->min_mapq)
-            continue;
-
-        // Get the reference base at the current position
-        //char base = toupper(targ->chr_seq[b->core.pos]);
-        // Get the strand of the alignment (global to all reads)
-        int strand = getRealStrand(b); //1=OT, 2=OB, 3=CTOT, 4=CTOB
-
-        // Get read sequence and quality
         uint8_t *seq = bam_get_seq(b);
         uint8_t *qual = bam_get_qual(b);
-
-        // Process each base in the read
+        int strand = getRealStrand(b);
         for (int i = 0; i < b->core.l_qseq; i++)
         {
             uint32_t refpos = b->core.pos + i;
-
-            // Skip if moving backwards (shouldn't happen in sorted BAM)
-            if (refpos < last_pos)
+            if (refpos < targ->start_pos || refpos >= targ->end_pos)
                 continue;
-
-            // Check base quality
             if (qual[i] < targ->min_phred)
                 continue;
-
-            // Get context and check if it's a cytosine we care about
             int8_t strand_ctx;
             uint8_t tnc;
-            int ctx = get_context(
-                targ->chr_seq, 
-                targ->chr_len, 
-                refpos,
-                &strand_ctx, 
-                &tnc, 
-                targ->keep_chg, 
-                targ->keep_chh
-            );
+            int ctx = get_context(targ->chr_seq, targ->chr_len, refpos, &strand_ctx, &tnc, targ->keep_chg, targ->keep_chh);
             if (ctx == 0)
                 continue;
-
-            // If this is a new position, process the current one
-            if (current.position != refpos + 1)
-            {
-                // Check if current position meets coverage criteria
-                if (current.position > 0)
-                {
-                    int total = current.methylated + current.unmethylated;
-                    if (total >= targ->min_cov && total <= targ->max_cov)
-                    {
-                        // Calculate methylation level
-                        double meth_level = 100.0 * ((double)current.methylated / total);
-                        if (meth_level >= targ->min_meth && meth_level <= targ->max_meth)
-                        {
-                            // Add to buffer
-                            buffer[buffer_count++] = current;
-
-                            // If buffer is full, write to file
-                            if (buffer_count == BUFFER_SIZE)
-                            {
-                                if (!flush_buffer_to_hdf5(
-                                    out_path, 
-                                    buffer, 
-                                    buffer_count,
-                                    targ->hdf5_compression, 
-                                    targ->hdf5_chunk_size,
-                                    !first_write))
-                                {
-                                    fprintf(stderr, "Thread %s: Failed to write buffer to HDF5\n",
-                                            targ->chr);
-                                    break;
-                                }
-                                first_write = 0;
-                                buffer_count = 0;
-                            }
-                        }
-                    }
-                }
-
-                // Start new position
-                current.position = refpos + 1; // 1-based
-                current.methylated = 0;
-                current.unmethylated = 0;
-                current.strand_ctx = strand_ctx;
-                current.tnc = tnc;
-            }
-
-            uint8_t base = bam_seqi(seq, i);
-
-            if (base == 2 && (strand==1 || strand==3)) current.unmethylated++; //C on an OT/CTOT alignment
-            else if(base == 4 && (strand==2 || strand==4)) current.unmethylated++; //G on an OB/CTOB alignment
-            else if(base == 8 && (strand==1 || strand==3)) current.methylated++; //T on an OT/CTOT alignment
-            else if(base == 1 && (strand==2 || strand==4)) current.methylated++; //A on an OB/CTOB alignment
-
-            last_pos = refpos;
+            size_t idx = find_buffer_index(targ->buffer, targ->buffer_offset, targ->buffer_size, refpos);
+            pthread_mutex_lock(targ->buffer_mutex);
+            if (bam_seqi(seq, i) == 2 && (strand == 1 || strand == 3))
+                targ->buffer[idx].unmethylated++;
+            else if (bam_seqi(seq, i) == 4 && (strand == 2 || strand == 4))
+                targ->buffer[idx].unmethylated++;
+            else if (bam_seqi(seq, i) == 8 && (strand == 1 || strand == 3))
+                targ->buffer[idx].methylated++;
+            else if (bam_seqi(seq, i) == 1 && (strand == 2 || strand == 4))
+                targ->buffer[idx].methylated++;
+            pthread_mutex_unlock(targ->buffer_mutex);
         }
     }
-
-    // Process last position
-    if (current.position > 0)
-    {
-        int total = current.methylated + current.unmethylated;
-        if (total >= targ->min_cov && total <= targ->max_cov)
-            buffer[buffer_count++] = current;
-    }
-
-    // Flush remaining records
-    if (buffer_count > 0)
-    {
-        if (!flush_buffer_to_hdf5(
-            out_path, 
-            buffer, 
-            buffer_count,
-            targ->hdf5_compression, 
-            targ->hdf5_chunk_size,
-            !first_write))
-            fprintf(stderr, "Thread %s: Failed to write final buffer to HDF5\n", targ->chr);
-    }
-
-    // Cleanup
     bam_destroy1(b);
     hts_itr_destroy(iter);
     hts_idx_destroy(idx);
@@ -672,13 +560,49 @@ void *process_chromosome(void *arg)
     return NULL;
 }
 
-// Function to cleanup HDF5 resources
-void cleanup_hdf5(void)
+void process_chromosome(ThreadArg *targ)
 {
-    H5close(); // Close all remaining open HDF5 identifiers
+    size_t site_count = count_methylation_sites(targ->chr_seq, targ->chr_len, targ->keep_chg, targ->keep_chh);
+    MethylRecord *buffer = calloc(site_count, sizeof(MethylRecord));
+    if (!buffer)
+    {
+        fprintf(stderr, "Failed to allocate buffer for %s\n", targ->chr);
+        return;
+    }
+    initialize_buffer(buffer, site_count, targ->chr_seq, targ->chr_len, targ->keep_chg, targ->keep_chh);
+    int n_regions = targ->chr_len > 100000000 ? 4 : targ->chr_len > 50000000 ? 2
+                                                                             : 1;
+    ThreadArg region_args[n_regions];
+    pthread_mutex_t buffer_mutex;
+    pthread_mutex_init(&buffer_mutex, NULL);
+    size_t sites_per_region = site_count / n_regions;
+    for (int i = 0; i < n_regions; i++)
+    {
+        region_args[i] = *targ;
+        region_args[i].buffer = buffer;
+        region_args[i].buffer_mutex = &buffer_mutex;
+        region_args[i].buffer_offset = i * sites_per_region;
+        region_args[i].buffer_size = (i == n_regions - 1) ? site_count - i * sites_per_region : sites_per_region;
+        region_args[i].start_pos = i == 0 ? 0 : buffer[i * sites_per_region].position - 1;
+        region_args[i].end_pos = (i == n_regions - 1) ? targ->chr_len : buffer[(i + 1) * sites_per_region].position - 1;
+    }
+    pthread_t threads[n_regions];
+    for (int i = 0; i < n_regions; i++)
+        pthread_create(&threads[i], NULL, process_chromosome_region, &region_args[i]);
+    for (int i = 0; i < n_regions; i++)
+        pthread_join(threads[i], NULL);
+    pthread_mutex_destroy(&buffer_mutex);
+    char out_path[1024];
+    snprintf(out_path, sizeof(out_path), "%s/%s.h5", targ->out_dir, get_std_chr_name(targ->chr));
+    flush_buffer_to_hdf5(out_path, buffer, site_count, targ->hdf5_compression, targ->hdf5_chunk_size, 0, targ->min_cov, targ->max_cov, targ->min_meth, targ->max_meth);
+    free(buffer);
 }
 
-// Main function
+void cleanup_hdf5(void)
+{
+    H5close();
+}
+
 int main(int argc, char *argv[])
 {
     int max_chr = DEFAULT_MAX_CHR;
@@ -694,7 +618,6 @@ int main(int argc, char *argv[])
     int min_meth = DEFAULT_MIN_METH;
     int max_meth = DEFAULT_MAX_METH;
     const char *out_dir = NULL;
-
     struct option long_options[] = {
         {"max-chr", required_argument, 0, 'n'},
         {"o", required_argument, 0, 'o'},
@@ -710,7 +633,6 @@ int main(int argc, char *argv[])
         {"l", required_argument, 0, 'l'},
         {"L", required_argument, 0, 'L'},
         {0, 0, 0, 0}};
-
     int opt;
     while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:C:l:L:", long_options, NULL)) != -1)
     {
@@ -814,8 +736,8 @@ int main(int argc, char *argv[])
             fprintf(stderr, "  --hdf5-compression INT   Compression level (0-9, default: %d)\n", DEFAULT_HDF5_COMPRESSION);
             fprintf(stderr, "  --hdf5-chunk-size INT    Chunk size for HDF5 datasets (default: %d)\n", DEFAULT_HDF5_CHUNK_SIZE);
             fprintf(stderr, "  --@ INT                  Number of threads to use (default: %d)\n", DEFAULT_THREADS);
-            fprintf(stderr, "  --CHG                    Keep CHG context methylation data (default: false)\n");
-            fprintf(stderr, "  --CHH                    Keep CHH context methylation data (default: false)\n");
+            fprintf(stderr, "  --CHG                    Keep CHG context methylation data\n");
+            fprintf(stderr, "  --CHH                    Keep CHH context methylation data\n");
             fprintf(stderr, "  --q INT                  Minimum mapping quality (default: %d)\n", DEFAULT_MIN_MAPQ);
             fprintf(stderr, "  --p INT                  Minimum Phred score (default: %d)\n", DEFAULT_MIN_PHRED);
             fprintf(stderr, "  --c INT                  Minimum coverage (default: %d)\n", DEFAULT_MIN_COV);
@@ -825,7 +747,11 @@ int main(int argc, char *argv[])
             return 1;
         }
     }
-
+    if (argc - optind < 2)
+    {
+        fprintf(stderr, "Usage: %s [options] <ref.fa> <sorted_alignments.bam>\n", argv[0]);
+        return 1;
+    }
     if (min_cov > max_cov)
     {
         fprintf(stderr, "Minimum coverage (%d) must not exceed maximum coverage (%d)\n", min_cov, max_cov);
@@ -840,31 +766,23 @@ int main(int argc, char *argv[])
 
     const char *ref_file = argv[optind];
     const char *bam_file = argv[optind + 1];
-
-    // Auto-detect threads if not specified
     if (num_threads == DEFAULT_THREADS)
     {
         num_threads = sysconf(_SC_NPROCESSORS_ONLN);
         if (num_threads < 1)
             num_threads = DEFAULT_THREADS;
     }
-
-    // Create output directory
     if (make_directory(out_dir) != 0)
     {
         fprintf(stderr, "Failed to create output directory: %s\n", out_dir);
         return 1;
     }
-
-    // Load reference
     faidx_t *fai = fai_load(ref_file);
     if (!fai)
     {
         fprintf(stderr, "Failed to load reference: %s\n", ref_file);
         return 1;
     }
-
-    // Open BAM to get header
     samFile *in = sam_open(bam_file, "r");
     if (!in)
     {
@@ -872,7 +790,6 @@ int main(int argc, char *argv[])
         fai_destroy(fai);
         return 1;
     }
-
     bam_hdr_t *header = sam_hdr_read(in);
     if (!header)
     {
@@ -881,10 +798,7 @@ int main(int argc, char *argv[])
         fai_destroy(fai);
         return 1;
     }
-
     sam_close(in);
-
-    // Collect valid chromosomes and preallocate storage
     ThreadArg *thread_args = malloc(header->n_targets * sizeof(ThreadArg));
     if (!thread_args)
     {
@@ -894,13 +808,11 @@ int main(int argc, char *argv[])
         return 1;
     }
     int valid_chr_count = 0;
-
     for (int tid = 0; tid < header->n_targets && valid_chr_count < max_chr; tid++)
     {
         const char *chr = header->target_name[tid];
         if (!is_valid_chromosome(chr))
             continue;
-
         thread_args[valid_chr_count].bam_file = bam_file;
         thread_args[valid_chr_count].out_dir = out_dir;
         thread_args[valid_chr_count].tid = tid;
@@ -916,8 +828,6 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].keep_chh = keep_chh;
         thread_args[valid_chr_count].hdf5_compression = hdf5_compression;
         thread_args[valid_chr_count].hdf5_chunk_size = hdf5_chunk_size;
-
-        // Cache chromosome sequence
         int seq_len;
         char *seq = faidx_fetch_seq(fai, chr, 0, header->target_len[tid], &seq_len);
         if (!seq || seq_len <= 0)
@@ -928,29 +838,23 @@ int main(int argc, char *argv[])
             continue;
         }
         thread_args[valid_chr_count].chr_seq = seq;
-
         valid_chr_count++;
     }
-
-    // Process chromosomes in parallel
     pthread_t *threads = malloc(valid_chr_count * sizeof(pthread_t));
     if (!threads)
     {
         fprintf(stderr, "Failed to allocate threads\n");
         for (int i = 0; i < valid_chr_count; i++)
-        {
             free(thread_args[i].chr_seq);
-        }
         free(thread_args);
         sam_hdr_destroy(header);
         fai_destroy(fai);
         return 1;
     }
-
     int active_threads = 0;
     for (int i = 0; i < valid_chr_count; i++)
     {
-        if (pthread_create(&threads[i], NULL, process_chromosome, &thread_args[i]) != 0)
+        if (pthread_create(&threads[i], NULL, (void *(*)(void *))process_chromosome, &thread_args[i]) != 0)
         {
             fprintf(stderr, "Failed to create thread for %s\n", thread_args[i].chr);
             continue;
@@ -961,25 +865,15 @@ int main(int argc, char *argv[])
             for (int j = 0; j < i; j++)
             {
                 if (pthread_join(threads[j], NULL) == 0)
-                {
                     active_threads--;
-                }
             }
         }
     }
-
-    // Join remaining threads
     for (int i = 0; i < valid_chr_count; i++)
         pthread_join(threads[i], NULL);
-
-    // Cleanup HDF5 resources
     cleanup_hdf5();
-
-    // Cleanup
     for (int i = 0; i < valid_chr_count; i++)
-    {
         free(thread_args[i].chr_seq);
-    }
     free(threads);
     free(thread_args);
     sam_hdr_destroy(header);
