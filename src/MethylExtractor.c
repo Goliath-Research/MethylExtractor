@@ -37,6 +37,11 @@
 #define MAX_CHR_NAME 2
 #define MAX_REGIONS_PER_CHR 8
 
+// Function prototypes
+static inline char decode_nucleotide(uint8_t n);
+static inline void decode_trinucleotide(uint8_t tnc, char *trinucl);
+static inline const char* get_context_string(int context, char strand);
+
 typedef struct
 {
     uint32_t position;
@@ -71,6 +76,7 @@ typedef struct
     size_t buffer_offset;
     size_t buffer_size;
     pthread_mutex_t *buffer_mutex;
+    int debug_output;
 } ThreadArg;
 
 static const char *valid_chromosomes[] = {
@@ -95,6 +101,16 @@ static const char *get_std_chr_name(const char *chr)
             return valid_chromosomes[i];
     }
     return NULL;
+}
+
+static const char *get_bam_chr_name(const char *chr)
+{
+    static char bam_chr[16];
+    const char *std_name = get_std_chr_name(chr);
+    if (std_name == NULL)
+        return NULL;
+    snprintf(bam_chr, sizeof(bam_chr), "chr%s", std_name);
+    return bam_chr;
 }
 
 int is_valid_chromosome(const char *chr)
@@ -205,62 +221,97 @@ int get_context(const char *chr_seq, int chr_len, int pos, int8_t *strand_ctx, u
         *strand_ctx = encode_strand_context('+', CONTEXT_CHH);
         return keep_chh ? CONTEXT_CHH : 0;
     }
+
     char trinucl[4];
     trinucl[0] = toupper(chr_seq[pos - 1]);
     trinucl[1] = toupper(chr_seq[pos]);
     trinucl[2] = toupper(chr_seq[pos + 1]);
     trinucl[3] = '\0';
     *tnc = encode_trinucleotide(trinucl);
-    if (trinucl[1] != 'C')
+
+    // Check for C on forward strand
+    if (trinucl[1] == 'C')
     {
-        *strand_ctx = 0;
-        return 0;
-    }
-    if (trinucl[2] == 'G')
-    {
-        *strand_ctx = encode_strand_context('+', CONTEXT_CPG);
-        return CONTEXT_CPG;
-    }
-    else if (trinucl[2] == 'A' || trinucl[2] == 'C' || trinucl[2] == 'T')
-    {
-        if (trinucl[0] == 'C' || trinucl[0] == 'A' || trinucl[0] == 'T')
+        if (trinucl[2] == 'G')
         {
-            *strand_ctx = encode_strand_context('+', CONTEXT_CHH);
-            return keep_chh ? CONTEXT_CHH : 0;
+            *strand_ctx = encode_strand_context('+', CONTEXT_CPG);
+            return CONTEXT_CPG;
+        }
+        else if (trinucl[2] == 'A' || trinucl[2] == 'C' || trinucl[2] == 'T')
+        {
+            if (trinucl[0] == 'C' || trinucl[0] == 'A' || trinucl[0] == 'T')
+            {
+                *strand_ctx = encode_strand_context('+', CONTEXT_CHH);
+                return keep_chh ? CONTEXT_CHH : 0;
+            }
+            else
+            {
+                *strand_ctx = encode_strand_context('+', CONTEXT_CHG);
+                return keep_chg ? CONTEXT_CHG : 0;
+            }
         }
         else
         {
-            *strand_ctx = encode_strand_context('+', CONTEXT_CHG);
-            return keep_chg ? CONTEXT_CHG : 0;
+            if (trinucl[0] == 'C' || trinucl[0] == 'A' || trinucl[0] == 'T' || trinucl[0] == 'N')
+            {
+                *strand_ctx = encode_strand_context('+', CONTEXT_CHH);
+                return keep_chh ? CONTEXT_CHH : 0;
+            }
+            else
+            {
+                *strand_ctx = encode_strand_context('+', CONTEXT_CHG);
+                return keep_chg ? CONTEXT_CHG : 0;
+            }
         }
     }
-    else
+    // Check for G on reverse strand (complement of C)
+    else if (trinucl[1] == 'G')
     {
-        if (trinucl[0] == 'C' || trinucl[0] == 'A' || trinucl[0] == 'T' || trinucl[0] == 'N')
+        if (trinucl[0] == 'C')
         {
-            *strand_ctx = encode_strand_context('+', CONTEXT_CHH);
-            return keep_chh ? CONTEXT_CHH : 0;
+            *strand_ctx = encode_strand_context('-', CONTEXT_CPG);
+            return CONTEXT_CPG;
+        }
+        else if (trinucl[0] == 'T' || trinucl[0] == 'G' || trinucl[0] == 'A')
+        {
+            if (trinucl[2] == 'G' || trinucl[2] == 'T' || trinucl[2] == 'A')
+            {
+                *strand_ctx = encode_strand_context('-', CONTEXT_CHH);
+                return keep_chh ? CONTEXT_CHH : 0;
+            }
+            else
+            {
+                *strand_ctx = encode_strand_context('-', CONTEXT_CHG);
+                return keep_chg ? CONTEXT_CHG : 0;
+            }
         }
         else
         {
-            *strand_ctx = encode_strand_context('+', CONTEXT_CHG);
-            return keep_chg ? CONTEXT_CHG : 0;
+            if (trinucl[2] == 'G' || trinucl[2] == 'T' || trinucl[2] == 'A' || trinucl[2] == 'N')
+            {
+                *strand_ctx = encode_strand_context('-', CONTEXT_CHH);
+                return keep_chh ? CONTEXT_CHH : 0;
+            }
+            else
+            {
+                *strand_ctx = encode_strand_context('-', CONTEXT_CHG);
+                return keep_chg ? CONTEXT_CHG : 0;
+            }
         }
     }
+
+    *strand_ctx = 0;
+    return 0;
 }
 
 size_t count_methylation_sites(const char *chr_seq, uint32_t chr_len, int keep_chg, int keep_chh)
 {
     size_t count = 0;
     for (uint32_t pos = 0; pos < chr_len; pos++)
-    {
         if (isCpG((char *)chr_seq, pos, chr_len) ||
             (keep_chg && isCHG((char *)chr_seq, pos, chr_len)) ||
             (keep_chh && isCHH((char *)chr_seq, pos, chr_len)))
-        {
             count++;
-        }
-    }
     return count;
 }
 
@@ -302,7 +353,8 @@ size_t find_buffer_index(MethylRecord *buffer, size_t offset, size_t size, uint3
 
 size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n_records,
                             int compression, int chunk_size, int append_mode,
-                            int min_cov, int max_cov, int min_meth, int max_meth)
+                            int min_cov, int max_cov, int min_meth, int max_meth,
+                            int debug_output)
 {
     hid_t file = -1, dataset = -1, space = -1, type = -1, mem_type = -1, dcpl = -1;
     herr_t status = -1;
@@ -320,6 +372,9 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         goto cleanup;
     }
     hsize_t dims[1] = {0};
+    FILE *debug_fp = NULL;
+
+    // First pass: count records that meet criteria
     for (size_t i = 0; i < n_records; i++)
     {
         int total = buffer[i].methylated + buffer[i].unmethylated;
@@ -330,8 +385,36 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                 dims[0]++;
         }
     }
+
+    // Open debug file if needed
+    if (debug_output)
+    {
+        char debug_filename[1024];
+        const char *chr_num = strrchr(filename, '/');
+        const char *dir_end = chr_num;  // Save the directory end position
+        if (chr_num)
+            chr_num++; // Skip the '/'
+        else
+            chr_num = filename;
+
+        // Include the output directory in the debug filename
+        if (dir_end) {
+            // Copy the directory part and append the chromosome number
+            snprintf(debug_filename, sizeof(debug_filename), "%.*s%.*s.txt",
+                    (int)(dir_end - filename + 1), filename,  // +1 to include the '/'
+                    (int)(strrchr(chr_num, '.') - chr_num), chr_num);
+        } else {
+            snprintf(debug_filename, sizeof(debug_filename), "%.*s.txt",
+                    (int)(strrchr(chr_num, '.') - chr_num), chr_num);
+        }
+
+        debug_fp = fopen(debug_filename, "w");
+    }
+
     MethylRecord *filtered_buffer = malloc(dims[0] * sizeof(MethylRecord));
     size_t j = 0;
+
+    // Second pass: fill filtered buffer and write debug info
     for (size_t i = 0; i < n_records; i++)
     {
         int total = buffer[i].methylated + buffer[i].unmethylated;
@@ -339,9 +422,31 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         {
             double meth_level = 100.0 * ((double)buffer[i].methylated / total);
             if (meth_level >= min_meth && meth_level <= max_meth)
+            {
                 filtered_buffer[j++] = buffer[i];
+                
+                if (debug_fp)
+                {
+                    char tnc_str[4];
+                    decode_trinucleotide(buffer[i].tnc, tnc_str);
+                    char strand = buffer[i].strand_ctx > 0 ? '+' : '-';
+                    fprintf(
+                        debug_fp,
+                        "%u\t%u\t%u\t%c\t%s\t%s\n",
+                        buffer[i].position,
+                        buffer[i].methylated,
+                        buffer[i].unmethylated,
+                        strand,
+                        get_context_string(abs(buffer[i].strand_ctx), strand),
+                        tnc_str);
+                }
+            }
         }
     }
+
+    if (debug_fp)
+        fclose(debug_fp);
+
     hsize_t maxdims[1] = {H5S_UNLIMITED};
     space = H5Screate_simple(1, dims, maxdims);
     if (space < 0)
@@ -650,13 +755,55 @@ void process_chromosome(ThreadArg *targ)
         targ->min_cov,
         targ->max_cov,
         targ->min_meth,
-        targ->max_meth);
+        targ->max_meth,
+        targ->debug_output);
     free(buffer);
 }
 
 void cleanup_hdf5(void)
 {
     H5close();
+}
+
+static inline char decode_nucleotide(uint8_t n)
+{
+    switch (n)
+    {
+    case TNC_A:
+        return 'A';
+    case TNC_C:
+        return 'C';
+    case TNC_G:
+        return 'G';
+    case TNC_T:
+        return 'T';
+    default:
+        return 'N';
+    }
+}
+
+static inline void decode_trinucleotide(uint8_t tnc, char *trinucl)
+{
+    // Extract each nucleotide (3 bits each)
+    uint8_t n1 = (tnc >> 6) & 0x07;
+    uint8_t n2 = (tnc >> 3) & 0x07;
+    uint8_t n3 = tnc & 0x07;
+    
+    trinucl[0] = decode_nucleotide(n1);
+    trinucl[1] = decode_nucleotide(n2);
+    trinucl[2] = decode_nucleotide(n3);
+    trinucl[3] = '\0';
+}
+
+static inline const char* get_context_string(int context, char strand)
+{
+    if (context == CONTEXT_CPG)
+        return strand == '+' ? "CpG" : "GpC";
+    else if (context == CONTEXT_CHG)
+        return strand == '+' ? "CHG" : "GHC";
+    else if (context == CONTEXT_CHH)
+        return strand == '+' ? "CHH" : "GHH";
+    return "???";
 }
 
 int main(int argc, char *argv[])
@@ -674,6 +821,7 @@ int main(int argc, char *argv[])
     int max_cov = DEFAULT_MAX_COV;
     int min_meth = DEFAULT_MIN_METH;
     int max_meth = DEFAULT_MAX_METH;
+    int debug_output = 0;
     const char *out_dir = NULL;
     struct option long_options[] = {
         {"max-chr", required_argument, 0, 'n'},
@@ -690,9 +838,10 @@ int main(int argc, char *argv[])
         {"C", required_argument, 0, 'C'},
         {"l", required_argument, 0, 'l'},
         {"L", required_argument, 0, 'L'},
+        {"debug", no_argument, 0, 'd'},
         {0, 0, 0, 0}};
     int opt;
-    while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:C:l:L:", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:C:l:L:d", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -763,7 +912,7 @@ int main(int argc, char *argv[])
             break;
         case 'c':
             min_cov = atoi(optarg);
-            if (min_cov < 1)
+            if (min_cov < 0)
             {
                 fprintf(stderr, "Minimum coverage must be positive\n");
                 return 1;
@@ -793,6 +942,9 @@ int main(int argc, char *argv[])
                 return 1;
             }
             break;
+        case 'd':
+            debug_output = 1;
+            break;
         case '?':
         default:
             fprintf(stderr, "Usage: %s [options] <ref.fa> <sorted_alignments.bam>\n", argv[0]);
@@ -811,6 +963,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "  --C INT                  Maximum coverage (default: %d)\n", DEFAULT_MAX_COV);
             fprintf(stderr, "  --l INT                  Minimum methylation level (default: %d)\n", DEFAULT_MIN_METH);
             fprintf(stderr, "  --L INT                  Maximum methylation level (default: %d)\n", DEFAULT_MAX_METH);
+            fprintf(stderr, "  --debug                  Enable debug output (.txt files)\n");
             return 1;
         }
     }
@@ -878,12 +1031,42 @@ int main(int argc, char *argv[])
     for (int tid = 0; tid < header->n_targets && valid_chr_count < max_chr; tid++)
     {
         const char *chr = header->target_name[tid];
-        if (!is_valid_chromosome(chr))
+        const char *std_chr = get_std_chr_name(chr);
+        if (!std_chr)
             continue;
+
+        // Try both with and without 'chr' prefix when fetching from FASTA
+        int seq_len;
+        char *seq = NULL;
+
+        // First try with the standardized name (without chr)
+        seq = faidx_fetch_seq(fai, std_chr, 0, header->target_len[tid], &seq_len);
+
+        // If that fails, try with 'chr' prefix
+        if (!seq || seq_len <= 0)
+        {
+            const char *bam_chr = get_bam_chr_name(std_chr);
+            if (bam_chr)
+            {
+                if (seq)
+                    free(seq);
+                seq = faidx_fetch_seq(fai, bam_chr, 0, header->target_len[tid], &seq_len);
+            }
+        }
+
+        if (!seq || seq_len <= 0)
+        {
+            fprintf(stderr, "Failed to fetch sequence for %s (tried both %s and chr%s)\n",
+                    chr, std_chr, std_chr);
+            if (seq)
+                free(seq);
+            continue;
+        }
+
         thread_args[valid_chr_count].bam_file = bam_file;
         thread_args[valid_chr_count].out_dir = out_dir;
         thread_args[valid_chr_count].tid = tid;
-        thread_args[valid_chr_count].chr = chr;
+        thread_args[valid_chr_count].chr = chr; // Keep original BAM chromosome name
         thread_args[valid_chr_count].chr_len = header->target_len[tid];
         thread_args[valid_chr_count].min_mapq = min_mapq;
         thread_args[valid_chr_count].min_phred = min_phred;
@@ -896,16 +1079,8 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].hdf5_compression = hdf5_compression;
         thread_args[valid_chr_count].hdf5_chunk_size = hdf5_chunk_size;
         thread_args[valid_chr_count].chunk_size = chunk_size;
-        int seq_len;
-        char *seq = faidx_fetch_seq(fai, chr, 0, header->target_len[tid], &seq_len);
-        if (!seq || seq_len <= 0)
-        {
-            fprintf(stderr, "Failed to fetch sequence for %s\n", chr);
-            if (seq)
-                free(seq);
-            continue;
-        }
         thread_args[valid_chr_count].chr_seq = seq;
+        thread_args[valid_chr_count].debug_output = debug_output;
         valid_chr_count++;
     }
     pthread_t *threads = malloc(valid_chr_count * sizeof(pthread_t));

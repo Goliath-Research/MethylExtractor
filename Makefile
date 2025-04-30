@@ -39,11 +39,11 @@ $(STATIC_DIR)/MethylExtractor: src/MethylExtractor.c
 
 $(DYNAMIC_DIR)/MethylExtractor: src/MethylExtractor.c
 	mkdir -p $(DYNAMIC_DIR)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib/x86_64-linux-gnu/hdf5/serial $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib/x86_64-linux-gnu/hdf5/serial $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
 
 $(DEBUG_DIR)/MethylExtractor: src/MethylExtractor.c
 	mkdir -p $(DEBUG_DIR)
-	$(CC) $(DEBUG_CFLAGS) -o $@ $^ $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib/x86_64-linux-gnu/hdf5/serial $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread
+	$(CC) $(DEBUG_CFLAGS) -o $@ $^ $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib/x86_64-linux-gnu/hdf5/serial $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
 
 clean:
 	rm -rf build
