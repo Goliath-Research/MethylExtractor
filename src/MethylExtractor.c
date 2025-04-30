@@ -137,7 +137,7 @@ static inline uint8_t encode_trinucleotide(const char *trinucl)
 
 static inline int8_t encode_strand_context(char strand, int context)
 {
-    return (strand == '-' ? STRAND_MASK : 0) | (context & CONTEXT_MASK);
+    return strand == '-' ? -context : context;
 }
 
 static inline int isCpG(char *seq, int pos, int seqlen)
@@ -637,7 +637,7 @@ void process_chromosome(ThreadArg *targ)
     for (int i = 0; i < n_regions; i++)
         pthread_join(threads[i], NULL);
     pthread_mutex_destroy(&buffer_mutex);
-    
+
     char out_path[1024];
     snprintf(out_path, sizeof(out_path), "%s/%s.h5", targ->out_dir, get_std_chr_name(targ->chr));
     flush_buffer_to_hdf5(
