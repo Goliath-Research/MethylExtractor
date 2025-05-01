@@ -156,7 +156,7 @@ static inline int8_t encode_strand_context(char strand, int context)
     return strand == '-' ? -context : context;
 }
 
-static inline int isCpG(char *seq, int pos, int seqlen)
+static inline int isCpG(const char *seq, int pos, int seqlen)
 {
     if (pos >= seqlen)
         return 0;
@@ -179,7 +179,7 @@ static inline int isCpG(char *seq, int pos, int seqlen)
     return 0;
 }
 
-static inline int isCHG(char *seq, int pos, int seqlen)
+static inline int isCHG(const char *seq, int pos, int seqlen)
 {
     if (pos >= seqlen)
         return 0;
@@ -202,7 +202,7 @@ static inline int isCHG(char *seq, int pos, int seqlen)
     return 0;
 }
 
-static inline int isCHH(char *seq, int pos, int seqlen)
+static inline int isCHH(const char *seq, int pos, int seqlen)
 {
     if (pos >= seqlen)
         return 0;
@@ -215,11 +215,19 @@ static inline int isCHH(char *seq, int pos, int seqlen)
 
 int get_context(const char *chr_seq, int chr_len, int pos, int8_t *strand_ctx, uint8_t *tnc, int keep_chg, int keep_chh)
 {
+    int context = 0;
+    if (isCpG(chr_seq, pos, chr_len))
+        context = CONTEXT_CPG;
+    else if (isCHG(chr_seq, pos, chr_len))
+        context = CONTEXT_CHG;
+    else if (isCHH(chr_seq, pos, chr_len))
+        context = CONTEXT_CHH;
+
     if (pos < 1 || pos + 1 >= chr_len)
     {
         *tnc = encode_trinucleotide("NNN");
-        *strand_ctx = encode_strand_context('+', CONTEXT_CHH);
-        return keep_chh ? CONTEXT_CHH : 0;
+        *strand_ctx = encode_strand_context('+', context);
+        return context;
     }
 
     char trinucl[4];
@@ -232,76 +240,20 @@ int get_context(const char *chr_seq, int chr_len, int pos, int8_t *strand_ctx, u
     // Check for C on forward strand
     if (trinucl[1] == 'C')
     {
-        if (trinucl[2] == 'G')
-        {
-            *strand_ctx = encode_strand_context('+', CONTEXT_CPG);
-            return CONTEXT_CPG;
-        }
-        else if (trinucl[2] == 'A' || trinucl[2] == 'C' || trinucl[2] == 'T')
-        {
-            if (trinucl[0] == 'C' || trinucl[0] == 'A' || trinucl[0] == 'T')
-            {
-                *strand_ctx = encode_strand_context('+', CONTEXT_CHH);
-                return keep_chh ? CONTEXT_CHH : 0;
-            }
-            else
-            {
-                *strand_ctx = encode_strand_context('+', CONTEXT_CHG);
-                return keep_chg ? CONTEXT_CHG : 0;
-            }
-        }
-        else
-        {
-            if (trinucl[0] == 'C' || trinucl[0] == 'A' || trinucl[0] == 'T' || trinucl[0] == 'N')
-            {
-                *strand_ctx = encode_strand_context('+', CONTEXT_CHH);
-                return keep_chh ? CONTEXT_CHH : 0;
-            }
-            else
-            {
-                *strand_ctx = encode_strand_context('+', CONTEXT_CHG);
-                return keep_chg ? CONTEXT_CHG : 0;
-            }
-        }
+        *strand_ctx = encode_strand_context('+', context);
+        return context;
     }
     // Check for G on reverse strand (complement of C)
     else if (trinucl[1] == 'G')
     {
-        if (trinucl[0] == 'C')
-        {
-            *strand_ctx = encode_strand_context('-', CONTEXT_CPG);
-            return CONTEXT_CPG;
-        }
-        else if (trinucl[0] == 'T' || trinucl[0] == 'G' || trinucl[0] == 'A')
-        {
-            if (trinucl[2] == 'G' || trinucl[2] == 'T' || trinucl[2] == 'A')
-            {
-                *strand_ctx = encode_strand_context('-', CONTEXT_CHH);
-                return keep_chh ? CONTEXT_CHH : 0;
-            }
-            else
-            {
-                *strand_ctx = encode_strand_context('-', CONTEXT_CHG);
-                return keep_chg ? CONTEXT_CHG : 0;
-            }
-        }
-        else
-        {
-            if (trinucl[2] == 'G' || trinucl[2] == 'T' || trinucl[2] == 'A' || trinucl[2] == 'N')
-            {
-                *strand_ctx = encode_strand_context('-', CONTEXT_CHH);
-                return keep_chh ? CONTEXT_CHH : 0;
-            }
-            else
-            {
-                *strand_ctx = encode_strand_context('-', CONTEXT_CHG);
-                return keep_chg ? CONTEXT_CHG : 0;
-            }
-        }
+        *strand_ctx = encode_strand_context('-', context);
+        return context;
     }
-
-    *strand_ctx = 0;
-    return 0;
+    else
+    {
+        *strand_ctx = 0;
+        return 0;
+    }
 }
 
 size_t count_methylation_sites(const char *chr_seq, uint32_t chr_len, int keep_chg, int keep_chh)
@@ -348,7 +300,7 @@ size_t find_buffer_index(MethylRecord *buffer, size_t offset, size_t size, uint3
         else
             right = mid - 1;
     }
-    return offset; // Should not occur if buffer is correctly initialized
+    return -1; // Should not occur if buffer is correctly initialized
 }
 
 size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n_records,
@@ -634,6 +586,7 @@ void *process_chromosome_region(void *arg)
         uint8_t *seq = bam_get_seq(b);
         uint8_t *qual = bam_get_qual(b);
         int strand = getRealStrand(b);
+        int base = bam_seqi(seq, 0);
         for (int i = 0; i < b->core.l_qseq; i++)
         {
             uint32_t refpos = b->core.pos + i;
@@ -647,15 +600,36 @@ void *process_chromosome_region(void *arg)
             if (ctx == 0)
                 continue;
             size_t idx = find_buffer_index(targ->buffer, targ->buffer_offset, targ->buffer_size, refpos);
+            if (idx == -1)
+                continue;
+            // At this point, we have a valid buffer index and a valid context
+            char cstrand = (strand == 1 || strand == 3) ? '+' : '-';
+            strand_ctx = encode_strand_context(cstrand, abs(ctx));
+            targ->buffer[idx].strand_ctx = strand_ctx;
+
             pthread_mutex_lock(targ->buffer_mutex);
-            if (bam_seqi(seq, i) == 2 && (strand == 1 || strand == 3))
+
+            char base_as_char = toupper(seq_nt16_str[base]);
+
+                if (strand & 1)
+                {
+                    if (base_as_char != 'C')
+                        continue;
+                }
+                else
+                {
+                    if (base_as_char != 'G')
+                        continue;
+                }
+
+            // Increment unmethylated: 'C' (2) for odd strands (1, 3), 'G' (4) for even strands (2, 4)
+            if ((base == 2 && (strand & 1)) || (base == 4 && !(strand & 1)))
                 targ->buffer[idx].unmethylated++;
-            else if (bam_seqi(seq, i) == 4 && (strand == 2 || strand == 4))
-                targ->buffer[idx].unmethylated++;
-            else if (bam_seqi(seq, i) == 8 && (strand == 1 || strand == 3))
+
+            // Increment methylated: assuming 8 or 1 are valid only for 'C' (odd) or 'G' (even)
+            else if ((base == 8 && (strand & 1)) || (base == 1 && !(strand & 1)))
                 targ->buffer[idx].methylated++;
-            else if (bam_seqi(seq, i) == 1 && (strand == 2 || strand == 4))
-                targ->buffer[idx].methylated++;
+
             pthread_mutex_unlock(targ->buffer_mutex);
         }
     }
@@ -681,9 +655,7 @@ void process_chromosome(ThreadArg *targ)
     // Ensure chunk size is not larger than chromosome length
     uint32_t chunk_size = targ->chunk_size;
     if (chunk_size > targ->chr_len)
-    {
         chunk_size = targ->chr_len;
-    }
 
     // Calculate number of regions
     int n_regions = (int)ceil((double)targ->chr_len / chunk_size);
