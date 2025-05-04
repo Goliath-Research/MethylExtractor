@@ -4,6 +4,7 @@
 #include <math.h>
 #include <htslib/sam.h>
 #include <htslib/faidx.h>
+#include <htslib/khash.h>
 #include <unistd.h>
 #include <getopt.h>
 #include <sys/stat.h>
@@ -37,10 +38,13 @@
 #define MAX_CHR_NAME 2
 #define MAX_REGIONS_PER_CHR 8
 
+// Hash table for position-to-buffer-index mapping
+KHASH_MAP_INIT_INT64(pos, size_t)
+
 // Function prototypes
 static inline char decode_nucleotide(uint8_t n);
 static inline void decode_trinucleotide(uint8_t tnc, char *trinucl);
-static inline const char* get_context_string(int context, char strand);
+static inline const char *get_context_string(int context, char strand);
 
 typedef struct
 {
@@ -77,6 +81,7 @@ typedef struct
     size_t buffer_size;
     pthread_mutex_t *buffer_mutex;
     int debug_output;
+    khash_t(pos) * pos_map;
 } ThreadArg;
 
 static const char *valid_chromosomes[] = {
@@ -230,21 +235,22 @@ int get_context(const char *chr_seq, int chr_len, int pos, int8_t *strand_ctx, u
         return context;
     }
 
-    char trinucl[4];
-    trinucl[0] = toupper(chr_seq[pos - 1]);
-    trinucl[1] = toupper(chr_seq[pos]);
-    trinucl[2] = toupper(chr_seq[pos + 1]);
+    char trinucl[4], c1, c2, c3;
+    c1 = toupper(chr_seq[pos - 1]);
+    c2 = toupper(chr_seq[pos]);
+    c3 = toupper(chr_seq[pos + 1]);
+    trinucl[0] = c1;
+    trinucl[1] = c2;
+    trinucl[2] = c3;
     trinucl[3] = '\0';
     *tnc = encode_trinucleotide(trinucl);
 
-    // Check for C on forward strand
-    if (trinucl[1] == 'C')
+    if (c2 == 'C')
     {
         *strand_ctx = encode_strand_context('+', context);
         return context;
     }
-    // Check for G on reverse strand (complement of C)
-    else if (trinucl[1] == 'G')
+    else if (c2 == 'G')
     {
         *strand_ctx = encode_strand_context('-', context);
         return context;
@@ -300,7 +306,7 @@ size_t find_buffer_index(MethylRecord *buffer, size_t offset, size_t size, uint3
         else
             right = mid - 1;
     }
-    return -1; // Should not occur if buffer is correctly initialized
+    return -1;
 }
 
 size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n_records,
@@ -326,38 +332,37 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
     hsize_t dims[1] = {0};
     FILE *debug_fp = NULL;
 
-    // First pass: count records that meet criteria
     for (size_t i = 0; i < n_records; i++)
     {
         int total = buffer[i].methylated + buffer[i].unmethylated;
         if (total >= min_cov && total <= max_cov)
         {
-            double meth_level = 100.0 * ((double)buffer[i].methylated / total);
+            double meth_level = total > 0 ? 100.0 * ((double)buffer[i].methylated / total) : 0.0;
             if (meth_level >= min_meth && meth_level <= max_meth)
                 dims[0]++;
         }
     }
 
-    // Open debug file if needed
     if (debug_output)
     {
         char debug_filename[1024];
         const char *chr_num = strrchr(filename, '/');
-        const char *dir_end = chr_num;  // Save the directory end position
+        const char *dir_end = chr_num;
         if (chr_num)
-            chr_num++; // Skip the '/'
+            chr_num++;
         else
             chr_num = filename;
 
-        // Include the output directory in the debug filename
-        if (dir_end) {
-            // Copy the directory part and append the chromosome number
+        if (dir_end)
+        {
             snprintf(debug_filename, sizeof(debug_filename), "%.*s%.*s.txt",
-                    (int)(dir_end - filename + 1), filename,  // +1 to include the '/'
-                    (int)(strrchr(chr_num, '.') - chr_num), chr_num);
-        } else {
+                     (int)(dir_end - filename + 1), filename,
+                     (int)(strrchr(chr_num, '.') - chr_num), chr_num);
+        }
+        else
+        {
             snprintf(debug_filename, sizeof(debug_filename), "%.*s.txt",
-                    (int)(strrchr(chr_num, '.') - chr_num), chr_num);
+                     (int)(strrchr(chr_num, '.') - chr_num), chr_num);
         }
 
         debug_fp = fopen(debug_filename, "w");
@@ -366,17 +371,16 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
     MethylRecord *filtered_buffer = malloc(dims[0] * sizeof(MethylRecord));
     size_t j = 0;
 
-    // Second pass: fill filtered buffer and write debug info
     for (size_t i = 0; i < n_records; i++)
     {
         int total = buffer[i].methylated + buffer[i].unmethylated;
         if (total >= min_cov && total <= max_cov)
         {
-            double meth_level = 100.0 * ((double)buffer[i].methylated / total);
+            double meth_level = total > 0 ? 100.0 * ((double)buffer[i].methylated / total) : 0.0;
             if (meth_level >= min_meth && meth_level <= max_meth)
             {
                 filtered_buffer[j++] = buffer[i];
-                
+
                 if (debug_fp)
                 {
                     char tnc_str[4];
@@ -394,60 +398,66 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                 }
             }
         }
-    }
 
-    if (debug_fp)
-        fclose(debug_fp);
+        if (debug_fp)
+            fclose(debug_fp);
 
-    hsize_t maxdims[1] = {H5S_UNLIMITED};
-    space = H5Screate_simple(1, dims, maxdims);
-    if (space < 0)
-    {
-        fprintf(stderr, "Failed to create dataspace\n");
-        goto cleanup;
-    }
-    dcpl = H5Pcreate(H5P_DATASET_CREATE);
-    if (dcpl < 0)
-    {
-        fprintf(stderr, "Failed to create dataset creation property list\n");
-        goto cleanup;
-    }
-    hsize_t chunk_dims[1] = {(hsize_t)chunk_size};
-    if (H5Pset_chunk(dcpl, 1, chunk_dims) < 0)
-    {
-        fprintf(stderr, "Failed to set chunking\n");
-        goto cleanup;
-    }
-    if (compression > 0)
-    {
-        if (H5Pset_deflate(dcpl, compression) < 0)
+        hsize_t maxdims[1] = {H5S_UNLIMITED};
+        space = H5Screate_simple(1, dims, maxdims);
+        if (space < 0)
         {
-            fprintf(stderr, "Failed to set compression\n");
+            fprintf(stderr, "Failed to create dataspace\n");
             goto cleanup;
         }
-    }
-    mem_type = H5Tcopy(type);
-    if (mem_type < 0)
-    {
-        fprintf(stderr, "Failed to create memory datatype\n");
-        goto cleanup;
-    }
-    if (append_mode)
-    {
-        dataset = H5Dopen2(file, "methylation_data", H5P_DEFAULT);
-        if (dataset >= 0)
+        dcpl = H5Pcreate(H5P_DATASET_CREATE);
+        if (dcpl < 0)
         {
-            hsize_t curr_size;
-            hid_t file_space = H5Dget_space(dataset);
-            H5Sget_simple_extent_dims(file_space, &curr_size, NULL);
-            dims[0] += curr_size;
-            H5Dset_extent(dataset, dims);
-            file_space = H5Dget_space(dataset);
-            hsize_t start[1] = {curr_size};
-            hsize_t count[1] = {dims[0] - curr_size};
-            H5Sselect_hyperslab(file_space, H5S_SELECT_SET, start, NULL, count, NULL);
-            status = H5Dwrite(dataset, mem_type, space, file_space, H5P_DEFAULT, filtered_buffer);
-            H5Sclose(file_space);
+            fprintf(stderr, "Failed to create dataset creation property list\n");
+            goto cleanup;
+        }
+        hsize_t chunk_dims[1] = {(hsize_t)chunk_size};
+        if (H5Pset_chunk(dcpl, 1, chunk_dims) < 0)
+        {
+            fprintf(stderr, "Failed to set chunking\n");
+            goto cleanup;
+        }
+        if (compression > 0)
+        {
+            if (H5Pset_deflate(dcpl, compression) < 0)
+            {
+                fprintf(stderr, "Failed to set compression\n");
+                goto cleanup;
+            }
+        }
+        mem_type = H5Tcopy(type);
+        if (mem_type < 0)
+        {
+            fprintf(stderr, "Failed to create memory datatype\n");
+            goto cleanup;
+        }
+        if (append_mode)
+        {
+            dataset = H5Dopen2(file, "methylation_data", H5P_DEFAULT);
+            if (dataset >= 0)
+            {
+                hsize_t curr_size;
+                hid_t file_space = H5Dget_space(dataset);
+                H5Sget_simple_extent_dims(file_space, &curr_size, NULL);
+                dims[0] += curr_size;
+                H5Dset_extent(dataset, dims);
+                file_space = H5Dget_space(dataset);
+                hsize_t start[1] = {curr_size};
+                hsize_t count[1] = {dims[0] - curr_size};
+                H5Sselect_hyperslab(file_space, H5S_SELECT_SET, start, NULL, count, NULL);
+                status = H5Dwrite(dataset, mem_type, space, file_space, H5P_DEFAULT, filtered_buffer);
+                H5Sclose(file_space);
+            }
+            else
+            {
+                dataset = H5Dcreate2(file, "methylation_data", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+                if (dataset >= 0)
+                    status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
+            }
         }
         else
         {
@@ -455,43 +465,37 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
             if (dataset >= 0)
                 status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
         }
-    }
-    else
-    {
-        dataset = H5Dcreate2(file, "methylation_data", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+        if (dataset < 0)
+        {
+            fprintf(stderr, "Failed to create or open dataset\n");
+            goto cleanup;
+        }
+        if (status < 0)
+        {
+            fprintf(stderr, "Failed to write data to HDF5 file\n");
+            goto cleanup;
+        }
         if (dataset >= 0)
-            status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
-    }
-    if (dataset < 0)
-    {
-        fprintf(stderr, "Failed to create or open dataset\n");
-        goto cleanup;
-    }
-    if (status < 0)
-    {
-        fprintf(stderr, "Failed to write data to HDF5 file\n");
-        goto cleanup;
-    }
-    if (dataset >= 0)
-        H5Dflush(dataset);
-    if (file >= 0)
-        H5Fflush(file, H5F_SCOPE_GLOBAL);
-    records_written = dims[0];
-cleanup:
-    if (filtered_buffer)
-        free(filtered_buffer);
-    if (mem_type >= 0)
-        H5Tclose(mem_type);
-    if (dataset >= 0)
-        H5Dclose(dataset);
-    if (dcpl >= 0)
-        H5Pclose(dcpl);
-    if (space >= 0)
-        H5Sclose(space);
-    if (file >= 0)
-    {
-        H5Fflush(file, H5F_SCOPE_GLOBAL);
-        H5Fclose(file);
+            H5Dflush(dataset);
+        if (file >= 0)
+            H5Fflush(file, H5F_SCOPE_GLOBAL);
+        records_written = dims[0];
+    cleanup:
+        if (filtered_buffer)
+            free(filtered_buffer);
+        if (mem_type >= 0)
+            H5Tclose(mem_type);
+        if (dataset >= 0)
+            H5Dclose(dataset);
+        if (dcpl >= 0)
+            H5Pclose(dcpl);
+        if (space >= 0)
+            H5Sclose(space);
+        if (file >= 0)
+        {
+            H5Fflush(file, H5F_SCOPE_GLOBAL);
+            H5Fclose(file);
+        }
     }
     if (type >= 0)
         H5Tclose(type);
@@ -578,61 +582,102 @@ void *process_chromosome_region(void *arg)
         sam_close(in);
         return NULL;
     }
+
     bam1_t *b = bam_init1();
     while (sam_itr_next(in, iter, b) >= 0)
     {
         if (b->core.flag & DEFAULT_FLAGS || b->core.qual < targ->min_mapq)
             continue;
+
         uint8_t *seq = bam_get_seq(b);
         uint8_t *qual = bam_get_qual(b);
         int strand = getRealStrand(b);
-        int base = bam_seqi(seq, 0);
-        for (int i = 0; i < b->core.l_qseq; i++)
+        if (strand == 0)
+            continue;
+
+        uint32_t *cigar = bam_get_cigar(b);
+        uint32_t pos = b->core.pos;
+        int seq_idx = 0;
+
+        for (int i = 0; i < b->core.n_cigar; i++)
         {
-            uint32_t refpos = b->core.pos + i;
-            if (refpos < targ->start_pos || refpos >= targ->end_pos)
-                continue;
-            if (qual[i] < targ->min_phred)
-                continue;
-            int8_t strand_ctx;
-            uint8_t tnc;
-            int ctx = get_context(targ->chr_seq, targ->chr_len, refpos, &strand_ctx, &tnc, targ->keep_chg, targ->keep_chh);
-            if (ctx == 0)
-                continue;
-            size_t idx = find_buffer_index(targ->buffer, targ->buffer_offset, targ->buffer_size, refpos);
-            if (idx == -1)
-                continue;
-            // At this point, we have a valid buffer index and a valid context
-            char cstrand = (strand == 1 || strand == 3) ? '+' : '-';
-            strand_ctx = encode_strand_context(cstrand, abs(ctx));
-            targ->buffer[idx].strand_ctx = strand_ctx;
+            int op = bam_cigar_op(cigar[i]);
+            int len = bam_cigar_oplen(cigar[i]);
 
-            pthread_mutex_lock(targ->buffer_mutex);
-
-            char base_as_char = toupper(seq_nt16_str[base]);
-
-                if (strand & 1)
+            if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF)
+            {
+                for (int k = 0; k < len; k++)
                 {
-                    if (base_as_char != 'C')
+                    uint32_t refpos = pos + k;
+                    if (refpos < targ->start_pos || refpos >= targ->end_pos)
                         continue;
-                }
-                else
-                {
-                    if (base_as_char != 'G')
+                    if (qual[seq_idx] < targ->min_phred)
+                    {
+                        seq_idx++;
                         continue;
+                    }
+
+                    uint64_t key = ((uint64_t)targ->tid << 32) | refpos;
+                    khint_t iter = kh_get(pos, targ->pos_map, key);
+                    if (iter == kh_end(targ->pos_map))
+                    {
+                        seq_idx++;
+                        continue;
+                    }
+                    size_t idx = kh_val(targ->pos_map, iter);
+
+                    int base = bam_seqi(seq, seq_idx);
+                    char cstrand = (strand == 1 || strand == 3) ? '+' : '-';
+                    int ctx = abs(targ->buffer[idx].strand_ctx);
+                    targ->buffer[idx].strand_ctx = encode_strand_context(cstrand, ctx);
+
+                    pthread_mutex_lock(targ->buffer_mutex);
+
+                    if (strand & 1)
+                    {
+                        if (base != 2)
+                        {
+                            seq_idx++;
+                            pthread_mutex_unlock(targ->buffer_mutex);
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        if (base != 4)
+                        {
+                            seq_idx++;
+                            pthread_mutex_unlock(targ->buffer_mutex);
+                            continue;
+                        }
+                    }
+
+                    if ((base == 2 && (strand & 1)) || (base == 4 && !(strand & 1)))
+                        targ->buffer[idx].unmethylated++;
+                    else if ((base == 8 && (strand & 1)) || (base == 1 && !(strand & 1)))
+                        targ->buffer[idx].methylated++;
+
+                    pthread_mutex_unlock(targ->buffer_mutex);
+                    seq_idx++;
                 }
-
-            // Increment unmethylated: 'C' (2) for odd strands (1, 3), 'G' (4) for even strands (2, 4)
-            if ((base == 2 && (strand & 1)) || (base == 4 && !(strand & 1)))
-                targ->buffer[idx].unmethylated++;
-
-            // Increment methylated: assuming 8 or 1 are valid only for 'C' (odd) or 'G' (even)
-            else if ((base == 8 && (strand & 1)) || (base == 1 && !(strand & 1)))
-                targ->buffer[idx].methylated++;
-
-            pthread_mutex_unlock(targ->buffer_mutex);
+                pos += len;
+            }
+            else if (op == BAM_CINS)
+            {
+                seq_idx += len;
+            }
+            else if (op == BAM_CDEL || op == BAM_CREF_SKIP)
+            {
+                pos += len;
+            }
+            else if (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP)
+            {
+                if (op == BAM_CSOFT_CLIP)
+                    seq_idx += len;
+            }
         }
     }
+
     bam_destroy1(b);
     hts_itr_destroy(iter);
     hts_idx_destroy(idx);
@@ -652,17 +697,24 @@ void process_chromosome(ThreadArg *targ)
     }
     initialize_buffer(buffer, site_count, targ->chr_seq, targ->chr_len, targ->keep_chg, targ->keep_chh);
 
-    // Ensure chunk size is not larger than chromosome length
+    khash_t(pos) *pos_map = kh_init(pos);
+    for (size_t i = 0; i < site_count; i++)
+    {
+        uint64_t key = ((uint64_t)targ->tid << 32) | (buffer[i].position - 1);
+        int ret;
+        khint_t iter = kh_put(pos, pos_map, key, &ret);
+        kh_val(pos_map, iter) = i;
+    }
+
     uint32_t chunk_size = targ->chunk_size;
     if (chunk_size > targ->chr_len)
         chunk_size = targ->chr_len;
 
-    // Calculate number of regions
     int n_regions = (int)ceil((double)targ->chr_len / chunk_size);
     if (n_regions > MAX_REGIONS_PER_CHR)
     {
         n_regions = MAX_REGIONS_PER_CHR;
-        chunk_size = (targ->chr_len + n_regions - 1) / n_regions; // Recalculate chunk size
+        chunk_size = (targ->chr_len + n_regions - 1) / n_regions;
     }
     if (n_regions < 1)
         n_regions = 1;
@@ -671,36 +723,29 @@ void process_chromosome(ThreadArg *targ)
     pthread_mutex_t buffer_mutex;
     pthread_mutex_init(&buffer_mutex, NULL);
 
-    // Calculate sites per region based on actual methylation sites
-    size_t sites_per_region = (site_count + n_regions - 1) / n_regions; // Round up division
+    size_t sites_per_region = (site_count + n_regions - 1) / n_regions;
 
     for (int i = 0; i < n_regions; i++)
     {
         region_args[i] = *targ;
         region_args[i].buffer = buffer;
         region_args[i].buffer_mutex = &buffer_mutex;
-
-        // Calculate buffer offsets
+        region_args[i].pos_map = pos_map;
         region_args[i].buffer_offset = i * sites_per_region;
         region_args[i].buffer_size = (i == n_regions - 1) ? site_count - i * sites_per_region : sites_per_region;
 
-        // Calculate initial region boundaries
         uint32_t start_pos = i * chunk_size;
         uint32_t end_pos = (i == n_regions - 1) ? targ->chr_len : ((i + 1) * chunk_size);
 
-        // Ensure end position doesn't exceed chromosome length
         if (end_pos > targ->chr_len)
             end_pos = targ->chr_len;
 
-        // Adjust start position based on buffer position if needed
         if (i > 0 && buffer[region_args[i].buffer_offset].position > 0)
         {
             uint32_t buffer_start = buffer[region_args[i].buffer_offset].position - 1;
-            // Only adjust if buffer_start is less than end_pos to maintain valid range
             if (buffer_start < end_pos)
                 start_pos = buffer_start;
         }
-        // Final validation to ensure start < end
         if (start_pos >= end_pos)
             start_pos = (end_pos > chunk_size) ? end_pos - chunk_size : 0;
 
@@ -729,6 +774,8 @@ void process_chromosome(ThreadArg *targ)
         targ->min_meth,
         targ->max_meth,
         targ->debug_output);
+
+    kh_destroy(pos, pos_map);
     free(buffer);
 }
 
@@ -756,18 +803,17 @@ static inline char decode_nucleotide(uint8_t n)
 
 static inline void decode_trinucleotide(uint8_t tnc, char *trinucl)
 {
-    // Extract each nucleotide (3 bits each)
     uint8_t n1 = (tnc >> 6) & 0x07;
     uint8_t n2 = (tnc >> 3) & 0x07;
     uint8_t n3 = tnc & 0x07;
-    
+
     trinucl[0] = decode_nucleotide(n1);
     trinucl[1] = decode_nucleotide(n2);
     trinucl[2] = decode_nucleotide(n3);
     trinucl[3] = '\0';
 }
 
-static inline const char* get_context_string(int context, char strand)
+static inline const char *get_context_string(int context, char strand)
 {
     if (context == CONTEXT_CPG)
         return strand == '+' ? "CpG" : "GpC";
@@ -1007,14 +1053,11 @@ int main(int argc, char *argv[])
         if (!std_chr)
             continue;
 
-        // Try both with and without 'chr' prefix when fetching from FASTA
         int seq_len;
         char *seq = NULL;
 
-        // First try with the standardized name (without chr)
         seq = faidx_fetch_seq(fai, std_chr, 0, header->target_len[tid], &seq_len);
 
-        // If that fails, try with 'chr' prefix
         if (!seq || seq_len <= 0)
         {
             const char *bam_chr = get_bam_chr_name(std_chr);
@@ -1038,7 +1081,7 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].bam_file = bam_file;
         thread_args[valid_chr_count].out_dir = out_dir;
         thread_args[valid_chr_count].tid = tid;
-        thread_args[valid_chr_count].chr = chr; // Keep original BAM chromosome name
+        thread_args[valid_chr_count].chr = chr;
         thread_args[valid_chr_count].chr_len = header->target_len[tid];
         thread_args[valid_chr_count].min_mapq = min_mapq;
         thread_args[valid_chr_count].min_phred = min_phred;
