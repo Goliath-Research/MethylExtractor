@@ -314,6 +314,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                             int min_cov, int max_cov, int min_meth, int max_meth,
                             int debug_output)
 {
+    fprintf(stderr, "Starting flush_buffer_to_hdf5 for file %s\n", filename);
     hid_t file = -1, dataset = -1, space = -1, type = -1, mem_type = -1, dcpl = -1;
     herr_t status = -1;
     size_t records_written = 0;
@@ -329,6 +330,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         fprintf(stderr, "Failed to %s HDF5 file: %s\n", append_mode ? "open" : "create", filename);
         goto cleanup;
     }
+    fprintf(stderr, "HDF5 file %s opened/created\n", filename);
     hsize_t dims[1] = {0};
     FILE *debug_fp = NULL;
 
@@ -379,6 +381,11 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
             double meth_level = total > 0 ? 100.0 * ((double)buffer[i].methylated / total) : 0.0;
             if (meth_level >= min_meth && meth_level <= max_meth)
             {
+                if (j >= dims[0]) 
+                {
+                    fprintf(stderr, "Error: Attempting to write beyond allocated filtered_buffer size at index %zu\n", j);
+                    break;
+                }
                 filtered_buffer[j++] = buffer[i];
 
                 if (debug_fp)
@@ -398,66 +405,60 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                 }
             }
         }
+    }
 
-        if (debug_fp)
-            fclose(debug_fp);
+    if (debug_fp)
+        fclose(debug_fp);
 
-        hsize_t maxdims[1] = {H5S_UNLIMITED};
-        space = H5Screate_simple(1, dims, maxdims);
-        if (space < 0)
+    hsize_t maxdims[1] = {H5S_UNLIMITED};
+    space = H5Screate_simple(1, dims, maxdims);
+    if (space < 0)
+    {
+        fprintf(stderr, "Failed to create dataspace\n");
+        goto cleanup;
+    }
+    dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    if (dcpl < 0)
+    {
+        fprintf(stderr, "Failed to create dataset creation property list\n");
+        goto cleanup;
+    }
+    hsize_t chunk_dims[1] = {(hsize_t)chunk_size};
+    if (H5Pset_chunk(dcpl, 1, chunk_dims) < 0)
+    {
+        fprintf(stderr, "Failed to set chunking\n");
+        goto cleanup;
+    }
+    if (compression > 0)
+    {
+        if (H5Pset_deflate(dcpl, compression) < 0)
         {
-            fprintf(stderr, "Failed to create dataspace\n");
+            fprintf(stderr, "Failed to set compression\n");
             goto cleanup;
         }
-        dcpl = H5Pcreate(H5P_DATASET_CREATE);
-        if (dcpl < 0)
+    }
+    mem_type = H5Tcopy(type);
+    if (mem_type < 0)
+    {
+        fprintf(stderr, "Failed to create memory datatype\n");
+        goto cleanup;
+    }
+    if (append_mode)
+    {
+        dataset = H5Dopen2(file, "methylation_data", H5P_DEFAULT);
+        if (dataset >= 0)
         {
-            fprintf(stderr, "Failed to create dataset creation property list\n");
-            goto cleanup;
-        }
-        hsize_t chunk_dims[1] = {(hsize_t)chunk_size};
-        if (H5Pset_chunk(dcpl, 1, chunk_dims) < 0)
-        {
-            fprintf(stderr, "Failed to set chunking\n");
-            goto cleanup;
-        }
-        if (compression > 0)
-        {
-            if (H5Pset_deflate(dcpl, compression) < 0)
-            {
-                fprintf(stderr, "Failed to set compression\n");
-                goto cleanup;
-            }
-        }
-        mem_type = H5Tcopy(type);
-        if (mem_type < 0)
-        {
-            fprintf(stderr, "Failed to create memory datatype\n");
-            goto cleanup;
-        }
-        if (append_mode)
-        {
-            dataset = H5Dopen2(file, "methylation_data", H5P_DEFAULT);
-            if (dataset >= 0)
-            {
-                hsize_t curr_size;
-                hid_t file_space = H5Dget_space(dataset);
-                H5Sget_simple_extent_dims(file_space, &curr_size, NULL);
-                dims[0] += curr_size;
-                H5Dset_extent(dataset, dims);
-                file_space = H5Dget_space(dataset);
-                hsize_t start[1] = {curr_size};
-                hsize_t count[1] = {dims[0] - curr_size};
-                H5Sselect_hyperslab(file_space, H5S_SELECT_SET, start, NULL, count, NULL);
-                status = H5Dwrite(dataset, mem_type, space, file_space, H5P_DEFAULT, filtered_buffer);
-                H5Sclose(file_space);
-            }
-            else
-            {
-                dataset = H5Dcreate2(file, "methylation_data", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
-                if (dataset >= 0)
-                    status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
-            }
+            hsize_t curr_size;
+            hid_t file_space = H5Dget_space(dataset);
+            H5Sget_simple_extent_dims(file_space, &curr_size, NULL);
+            dims[0] += curr_size;
+            H5Dset_extent(dataset, dims);
+            file_space = H5Dget_space(dataset);
+            hsize_t start[1] = {curr_size};
+            hsize_t count[1] = {dims[0] - curr_size};
+            H5Sselect_hyperslab(file_space, H5S_SELECT_SET, start, NULL, count, NULL);
+            status = H5Dwrite(dataset, mem_type, space, file_space, H5P_DEFAULT, filtered_buffer);
+            H5Sclose(file_space);
         }
         else
         {
@@ -465,40 +466,45 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
             if (dataset >= 0)
                 status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
         }
-        if (dataset < 0)
-        {
-            fprintf(stderr, "Failed to create or open dataset\n");
-            goto cleanup;
-        }
-        if (status < 0)
-        {
-            fprintf(stderr, "Failed to write data to HDF5 file\n");
-            goto cleanup;
-        }
-        if (dataset >= 0)
-            H5Dflush(dataset);
-        if (file >= 0)
-            H5Fflush(file, H5F_SCOPE_GLOBAL);
-        records_written = dims[0];
-    cleanup:
-        if (filtered_buffer)
-            free(filtered_buffer);
-        if (mem_type >= 0)
-            H5Tclose(mem_type);
-        if (dataset >= 0)
-            H5Dclose(dataset);
-        if (dcpl >= 0)
-            H5Pclose(dcpl);
-        if (space >= 0)
-            H5Sclose(space);
-        if (file >= 0)
-        {
-            H5Fflush(file, H5F_SCOPE_GLOBAL);
-            H5Fclose(file);
-        }
     }
-    if (type >= 0)
-        H5Tclose(type);
+    else
+    {
+        dataset = H5Dcreate2(file, "methylation_data", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+        if (dataset >= 0)
+            status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
+    }
+    if (dataset < 0)
+    {
+        fprintf(stderr, "Failed to create or open dataset\n");
+        goto cleanup;
+    }
+    if (status < 0)
+    {
+        fprintf(stderr, "Failed to write data to HDF5 file\n");
+        goto cleanup;
+    }
+    if (dataset >= 0)
+        H5Dflush(dataset);
+    if (file >= 0)
+        H5Fflush(file, H5F_SCOPE_GLOBAL);
+    records_written = dims[0];
+    fprintf(stderr, "Finished processing records for %s, wrote %llu filtered records\n", filename, (unsigned long long)dims[0]);
+cleanup:
+    if (filtered_buffer)
+        free(filtered_buffer);
+    if (mem_type >= 0)
+        H5Tclose(mem_type);
+    if (dataset >= 0)
+        H5Dclose(dataset);
+    if (dcpl >= 0)
+        H5Pclose(dcpl);
+    if (space >= 0)
+        H5Sclose(space);
+    if (file >= 0)
+    {
+        H5Fflush(file, H5F_SCOPE_GLOBAL);
+        H5Fclose(file);
+    }
     return records_written;
 }
 
@@ -566,12 +572,14 @@ int getRealStrand(bam1_t *b)
 void *process_chromosome_region(void *arg)
 {
     ThreadArg *targ = (ThreadArg *)arg;
+    fprintf(stderr, "Thread %s:%u-%u: Starting processing\n", targ->chr, targ->start_pos, targ->end_pos);
     samFile *in = sam_open(targ->bam_file, "r");
     if (!in)
     {
         fprintf(stderr, "Thread %s:%u-%u: Failed to open BAM file\n", targ->chr, targ->start_pos, targ->end_pos);
         return NULL;
     }
+    fprintf(stderr, "Thread %s:%u-%u: BAM file opened\n", targ->chr, targ->start_pos, targ->end_pos);
     bam_hdr_t *header = sam_hdr_read(in);
     hts_idx_t *idx = sam_index_load(in, targ->bam_file);
     hts_itr_t *iter = sam_itr_queryi(idx, targ->tid, targ->start_pos, targ->end_pos);
@@ -582,10 +590,15 @@ void *process_chromosome_region(void *arg)
         sam_close(in);
         return NULL;
     }
-
+    fprintf(stderr, "Thread %s:%u-%u: Iterator created, starting read loop\n", targ->chr, targ->start_pos, targ->end_pos);
     bam1_t *b = bam_init1();
+    int read_count = 0;
     while (sam_itr_next(in, iter, b) >= 0)
     {
+        read_count++;
+        if (read_count % 10000 == 0) {
+            fprintf(stderr, "Thread %s:%u-%u: Processed %d reads\n", targ->chr, targ->start_pos, targ->end_pos, read_count);
+        }
         if (b->core.flag & DEFAULT_FLAGS || b->core.qual < targ->min_mapq)
             continue;
 
@@ -677,12 +690,13 @@ void *process_chromosome_region(void *arg)
             }
         }
     }
-
+    fprintf(stderr, "Thread %s:%u-%u: Finished processing %d reads\n", targ->chr, targ->start_pos, targ->end_pos, read_count);
     bam_destroy1(b);
     hts_itr_destroy(iter);
     hts_idx_destroy(idx);
     sam_hdr_destroy(header);
     sam_close(in);
+    fprintf(stderr, "Thread %s:%u-%u: Completed and resources cleaned up\n", targ->chr, targ->start_pos, targ->end_pos);
     return NULL;
 }
 
@@ -754,10 +768,57 @@ void process_chromosome(ThreadArg *targ)
     }
 
     pthread_t threads[n_regions];
+    int active_threads = 0;
+    int *joined = calloc(n_regions, sizeof(int));
+    if (!joined) {
+        fprintf(stderr, "Failed to allocate memory for joined array\n");
+        return;
+    }
     for (int i = 0; i < n_regions; i++)
-        pthread_create(&threads[i], NULL, process_chromosome_region, &region_args[i]);
+    {
+        if (pthread_create(&threads[i], NULL, process_chromosome_region, &region_args[i]) != 0)
+        {
+            fprintf(stderr, "Failed to create thread for %s\n", region_args[i].chr);
+            continue;
+        }
+        active_threads++;
+        fprintf(stderr, "Started thread %d for chromosome region %s:%u-%u, active threads: %d\n", i, region_args[i].chr, region_args[i].start_pos, region_args[i].end_pos, active_threads);
+        // Check for completed threads to prevent hanging
+        for (int j = 0; j <= i; j++)
+        {
+            if (!joined[j] && pthread_join(threads[j], NULL) == 0)
+            {
+                joined[j] = 1;
+                active_threads--;
+                fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
+            }
+        }
+        // Limit active threads if necessary
+        int max_region_threads = 8; // Default limit for region threads per chromosome
+        while (active_threads >= max_region_threads)
+        {
+            for (int j = 0; j <= i; j++)
+            {
+                if (!joined[j] && pthread_join(threads[j], NULL) == 0)
+                {
+                    joined[j] = 1;
+                    active_threads--;
+                    fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
+                }
+            }
+        }
+    }
+    // Ensure all threads are joined
     for (int i = 0; i < n_regions; i++)
-        pthread_join(threads[i], NULL);
+    {
+        if (!joined[i] && pthread_join(threads[i], NULL) == 0)
+        {
+            joined[i] = 1;
+            if (active_threads > 0) active_threads--;
+            fprintf(stderr, "Final join: Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", i, region_args[i].chr, region_args[i].start_pos, region_args[i].end_pos, active_threads);
+        }
+    }
+    free(joined);
     pthread_mutex_destroy(&buffer_mutex);
 
     char out_path[1024];
@@ -1118,17 +1179,38 @@ int main(int argc, char *argv[])
             continue;
         }
         active_threads++;
+        fprintf(stderr, "Started thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
+        // Check for completed threads to prevent hanging
+        for (int j = 0; j <= i; j++)
+        {
+            if (pthread_join(threads[j], NULL) == 0)
+            {
+                active_threads--;
+                fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
+            }
+        }
+        // Limit active threads if necessary
         while (active_threads >= num_threads)
         {
-            for (int j = 0; j < i; j++)
+            for (int j = 0; j <= i; j++)
             {
                 if (pthread_join(threads[j], NULL) == 0)
+                {
                     active_threads--;
+                    fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
+                }
             }
         }
     }
+    // Ensure all threads are joined
     for (int i = 0; i < valid_chr_count; i++)
-        pthread_join(threads[i], NULL);
+    {
+        if (pthread_join(threads[i], NULL) == 0)
+        {
+            if (active_threads > 0) active_threads--;
+            fprintf(stderr, "Final join: Completed thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
+        }
+    }
     cleanup_hdf5();
     for (int i = 0; i < valid_chr_count; i++)
         free(thread_args[i].chr_seq);
