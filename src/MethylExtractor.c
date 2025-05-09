@@ -38,6 +38,14 @@
 #define MAX_CHR_NAME 2
 #define MAX_REGIONS_PER_CHR 8
 
+// BAM flag constants for strand determination
+#define BAM_FLAG_PAIRED 0x1
+#define BAM_FLAG_FIRST_IN_PAIR 0x40
+#define BAM_FLAG_SECOND_IN_PAIR 0x80
+#define BAM_FLAG_REVERSE_STRAND 0x10
+#define BAM_FLAG_READ1_REVERSE 0x50
+#define BAM_FLAG_READ2_REVERSE 0x90
+
 // Hash table for position-to-buffer-index mapping
 KHASH_MAP_INIT_INT64(pos, size_t)
 
@@ -165,19 +173,19 @@ static inline int isCpG(const char *seq, int pos, int seqlen)
 {
     if (pos >= seqlen)
         return 0;
-    if (*(seq + pos) == 'C' || *(seq + pos) == 'c')
+    if (toupper(*(seq + pos)) == 'C')
     {
         if (pos + 1 == seqlen)
             return 0;
-        if (*(seq + pos + 1) == 'G' || *(seq + pos + 1) == 'g')
+        if (toupper(*(seq + pos + 1)) == 'G')
             return 1;
         return 0;
     }
-    else if (*(seq + pos) == 'G' || *(seq + pos) == 'g')
+    else if (toupper(*(seq + pos)) == 'G')
     {
         if (pos == 0)
             return 0;
-        if (*(seq + pos - 1) == 'C' || *(seq + pos - 1) == 'c')
+        if (toupper(*(seq + pos - 1)) == 'C')
             return -1;
         return 0;
     }
@@ -188,19 +196,19 @@ static inline int isCHG(const char *seq, int pos, int seqlen)
 {
     if (pos >= seqlen)
         return 0;
-    if (*(seq + pos) == 'C' || *(seq + pos) == 'c')
+    if (toupper(*(seq + pos)) == 'C')
     {
         if (pos + 2 >= seqlen)
             return 0;
-        if (*(seq + pos + 2) == 'G' || *(seq + pos + 2) == 'g')
+        if (toupper(*(seq + pos + 2)) == 'G')
             return 1;
         return 0;
     }
-    else if (*(seq + pos) == 'G' || *(seq + pos) == 'g')
+    else if (toupper(*(seq + pos)) == 'G')
     {
         if (pos <= 1)
             return 0;
-        if (*(seq + pos - 2) == 'C' || *(seq + pos - 2) == 'c')
+        if (toupper(*(seq + pos - 2)) == 'C')
             return -1;
         return 0;
     }
@@ -211,9 +219,9 @@ static inline int isCHH(const char *seq, int pos, int seqlen)
 {
     if (pos >= seqlen)
         return 0;
-    if (*(seq + pos) == 'C' || *(seq + pos) == 'c')
+    if (toupper(*(seq + pos)) == 'C')
         return 1;
-    else if (*(seq + pos) == 'G' || *(seq + pos) == 'g')
+    else if (toupper(*(seq + pos)) == 'G')
         return -1;
     return 0;
 }
@@ -515,21 +523,21 @@ int getRealStrand(bam1_t *b)
         XG = NULL;
     if (XG == NULL)
     {
-        if (b->core.flag & BAM_FPAIRED)
+        if (b->core.flag & BAM_FLAG_PAIRED)
         {
-            if ((b->core.flag & 0x50) == 0x50)
+            if ((b->core.flag & BAM_FLAG_READ1_REVERSE) == BAM_FLAG_READ1_REVERSE)
                 return 2;
-            else if (b->core.flag & 0x40)
+            else if (b->core.flag & BAM_FLAG_FIRST_IN_PAIR)
                 return 1;
-            else if ((b->core.flag & 0x90) == 0x90)
+            else if ((b->core.flag & BAM_FLAG_READ2_REVERSE) == BAM_FLAG_READ2_REVERSE)
                 return 1;
-            else if (b->core.flag & 0x80)
+            else if (b->core.flag & BAM_FLAG_SECOND_IN_PAIR)
                 return 2;
             return 0;
         }
         else
         {
-            if (b->core.flag & 0x10)
+            if (b->core.flag & BAM_FLAG_REVERSE_STRAND)
                 return 2;
             return 1;
         }
@@ -538,30 +546,30 @@ int getRealStrand(bam1_t *b)
     {
         if (*(XG + 1) == 'C')
         {
-            if ((b->core.flag & 0x51) == 0x41)
+            if ((b->core.flag & (BAM_FLAG_FIRST_IN_PAIR | BAM_FLAG_REVERSE_STRAND)) == (BAM_FLAG_FIRST_IN_PAIR | BAM_FLAG_REVERSE_STRAND))
                 return 1;
-            else if ((b->core.flag & 0x51) == 0x51)
+            else if ((b->core.flag & BAM_FLAG_READ1_REVERSE) == BAM_FLAG_READ1_REVERSE)
                 return 3;
-            else if ((b->core.flag & 0x91) == 0x81)
+            else if ((b->core.flag & (BAM_FLAG_SECOND_IN_PAIR | BAM_FLAG_REVERSE_STRAND)) == (BAM_FLAG_SECOND_IN_PAIR | BAM_FLAG_REVERSE_STRAND))
                 return 3;
-            else if ((b->core.flag & 0x91) == 0x91)
+            else if ((b->core.flag & BAM_FLAG_READ2_REVERSE) == BAM_FLAG_READ2_REVERSE)
                 return 1;
-            else if (b->core.flag & 0x10)
+            else if (b->core.flag & BAM_FLAG_REVERSE_STRAND)
                 return 3;
             else
                 return 1;
         }
         else
         {
-            if ((b->core.flag & 0x51) == 0x41)
+            if ((b->core.flag & (BAM_FLAG_FIRST_IN_PAIR | BAM_FLAG_REVERSE_STRAND)) == (BAM_FLAG_FIRST_IN_PAIR | BAM_FLAG_REVERSE_STRAND))
                 return 4;
-            else if ((b->core.flag & 0x51) == 0x51)
+            else if ((b->core.flag & BAM_FLAG_READ1_REVERSE) == BAM_FLAG_READ1_REVERSE)
                 return 2;
-            else if ((b->core.flag & 0x91) == 0x81)
+            else if ((b->core.flag & (BAM_FLAG_SECOND_IN_PAIR | BAM_FLAG_REVERSE_STRAND)) == (BAM_FLAG_SECOND_IN_PAIR | BAM_FLAG_REVERSE_STRAND))
                 return 2;
-            else if ((b->core.flag & 0x91) == 0x91)
+            else if ((b->core.flag & BAM_FLAG_READ2_REVERSE) == BAM_FLAG_READ2_REVERSE)
                 return 4;
-            else if (b->core.flag & 0x10)
+            else if (b->core.flag & BAM_FLAG_REVERSE_STRAND)
                 return 2;
             else
                 return 4;
@@ -596,9 +604,9 @@ void *process_chromosome_region(void *arg)
     while (sam_itr_next(in, iter, b) >= 0)
     {
         read_count++;
-        if (read_count % 10000 == 0) {
+        if (read_count % 10000 == 0)
             fprintf(stderr, "Thread %s:%u-%u: Processed %d reads\n", targ->chr, targ->start_pos, targ->end_pos, read_count);
-        }
+
         if (b->core.flag & DEFAULT_FLAGS || b->core.qual < targ->min_mapq)
             continue;
 
@@ -665,9 +673,9 @@ void *process_chromosome_region(void *arg)
                         }
                     }
 
-                    if ((base == 2 && (strand & 1)) || (base == 4 && !(strand & 1)))
+                    if ((base == 8 && (strand & 1)) || (base == 1 && !(strand & 1)))
                         targ->buffer[idx].unmethylated++;
-                    else if ((base == 8 && (strand & 1)) || (base == 1 && !(strand & 1)))
+                    else if ((base == 2 && (strand & 1)) || (base == 4 && !(strand & 1)))
                         targ->buffer[idx].methylated++;
 
                     pthread_mutex_unlock(targ->buffer_mutex);
