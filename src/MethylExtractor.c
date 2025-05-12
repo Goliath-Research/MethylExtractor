@@ -36,7 +36,7 @@
 #define STRAND_MASK 0x80
 #define CONTEXT_MASK 0x03
 #define MAX_CHR_NAME 2
-#define MAX_REGIONS_PER_CHR 8
+#define MAX_REGIONS_PER_CHR 1
 
 // BAM flag constants for strand determination
 #define BAM_FLAG_PAIRED 0x1
@@ -60,7 +60,7 @@ typedef struct
     uint32_t methylated;
     uint32_t unmethylated;
     int8_t strand_ctx;
-    uint8_t tnc;
+    uint8_t tnc; // Now stores MethylDackel-style TNC index (0-24)
 } MethylRecord;
 
 typedef struct
@@ -90,6 +90,7 @@ typedef struct
     pthread_mutex_t *buffer_mutex;
     int debug_output;
     khash_t(pos) * pos_map;
+    uint8_t *tnc_array; // New: TriNucleotideContexts[25] array
 } ThreadArg;
 
 static const char *valid_chromosomes[] = {
@@ -156,12 +157,69 @@ static inline uint8_t encode_nucleotide(char n)
     }
 }
 
-static inline uint8_t encode_trinucleotide(const char *trinucl)
+static inline uint8_t encode_trinucleotide_context(const char *chr_seq, int pos, int chr_len, char strand)
 {
-    uint8_t n1 = encode_nucleotide(trinucl[0]);
-    uint8_t n2 = encode_nucleotide(trinucl[1]);
-    uint8_t n3 = encode_nucleotide(trinucl[2]);
-    return (n1 << 6) | (n2 << 3) | n3;
+    // MethylDackel-style: encode based on surrounding bases considering strand direction
+    int direction = (strand == '+') ? 1 : -1;
+    uint8_t rv = 0;
+    char base;
+
+    // Last base: column
+    if ((direction > 0 && pos + 2 >= chr_len) || (direction < 0 && pos <= 1))
+        rv = 4;
+    else
+    {
+        base = chr_seq[pos + 2 * direction];
+        if (direction < 0)
+            base = (base == 'A') ? 'T' : (base == 'T') ? 'A' : (base == 'C') ? 'G' : (base == 'G') ? 'C' : 'N';
+        switch (toupper(base))
+        {
+        case 'A':
+            rv = 0;
+            break;
+        case 'C':
+            rv = 1;
+            break;
+        case 'G':
+            rv = 2;
+            break;
+        case 'T':
+            rv = 3;
+            break;
+        default:
+            rv = 4;
+            break;
+        }
+    }
+
+    // Middle base
+    if ((direction > 0 && pos + 1 >= chr_len) || (direction < 0 && pos == 0))
+        rv += 20;
+    else
+    {
+        base = chr_seq[pos + direction];
+        if (direction < 0)
+            base = (base == 'A') ? 'T' : (base == 'T') ? 'A' : (base == 'C') ? 'G' : (base == 'G') ? 'C' : 'N';
+        switch (toupper(base))
+        {
+        case 'A':
+            rv += 0;
+            break;
+        case 'C':
+            rv += 5;
+            break;
+        case 'G':
+            rv += 10;
+            break;
+        case 'T':
+            rv += 15;
+            break;
+        default:
+            rv += 20;
+            break;
+        }
+    }
+    return rv; // 0-24
 }
 
 static inline int8_t encode_strand_context(char strand, int context)
@@ -236,38 +294,17 @@ int get_context(const char *chr_seq, int chr_len, int pos, int8_t *strand_ctx, u
     else if (isCHH(chr_seq, pos, chr_len))
         context = CONTEXT_CHH;
 
-    if (pos < 1 || pos + 1 >= chr_len)
-    {
-        *tnc = encode_trinucleotide("NNN");
-        *strand_ctx = encode_strand_context('+', context);
-        return context;
-    }
-
-    char trinucl[4], c1, c2, c3;
-    c1 = toupper(chr_seq[pos - 1]);
-    c2 = toupper(chr_seq[pos]);
-    c3 = toupper(chr_seq[pos + 1]);
-    trinucl[0] = c1;
-    trinucl[1] = c2;
-    trinucl[2] = c3;
-    trinucl[3] = '\0';
-    *tnc = encode_trinucleotide(trinucl);
-
+    char c2 = toupper(chr_seq[pos]);
+    char strand = (c2 == 'C') ? '+' : '-';
+    *tnc = encode_trinucleotide_context(chr_seq, pos, chr_len, strand);
     if (c2 == 'C')
-    {
         *strand_ctx = encode_strand_context('+', context);
-        return context;
-    }
     else if (c2 == 'G')
-    {
         *strand_ctx = encode_strand_context('-', context);
-        return context;
-    }
     else
-    {
         *strand_ctx = 0;
-        return 0;
-    }
+    
+    return context;
 }
 
 size_t count_methylation_sites(const char *chr_seq, uint32_t chr_len, int keep_chg, int keep_chh)
@@ -322,7 +359,8 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                             int min_cov, int max_cov, int min_meth, int max_meth,
                             int debug_output)
 {
-    fprintf(stderr, "Starting flush_buffer_to_hdf5 for file %s\n", filename);
+    //fprintf(stderr, "Starting flush_buffer_to_hdf5 for file %s\n", filename);
+    fprintf(stderr, "\nStarting to write HDF5 file: %s\n", filename);
     hid_t file = -1, dataset = -1, space = -1, type = -1, mem_type = -1, dcpl = -1;
     herr_t status = -1;
     size_t records_written = 0;
@@ -338,7 +376,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         fprintf(stderr, "Failed to %s HDF5 file: %s\n", append_mode ? "open" : "create", filename);
         goto cleanup;
     }
-    fprintf(stderr, "HDF5 file %s opened/created\n", filename);
+    //fprintf(stderr, "HDF5 file %s opened/created\n", filename);
     hsize_t dims[1] = {0};
     FILE *debug_fp = NULL;
 
@@ -353,9 +391,9 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         }
     }
 
+    char debug_filename[1024];
     if (debug_output)
     {
-        char debug_filename[1024];
         const char *chr_num = strrchr(filename, '/');
         const char *dir_end = chr_num;
         if (chr_num)
@@ -365,16 +403,28 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
 
         if (dir_end)
         {
-            snprintf(debug_filename, sizeof(debug_filename), "%.*s%.*s.txt",
-                     (int)(dir_end - filename + 1), filename,
-                     (int)(strrchr(chr_num, '.') - chr_num), chr_num);
+            snprintf(
+                debug_filename, 
+                sizeof(debug_filename), 
+                "%.*s%.*s.txt",
+                (int)(dir_end - filename + 1), 
+                filename,
+                (int)(strrchr(chr_num, '.') - chr_num), 
+                chr_num
+            );
         }
         else
         {
-            snprintf(debug_filename, sizeof(debug_filename), "%.*s.txt",
-                     (int)(strrchr(chr_num, '.') - chr_num), chr_num);
+            snprintf(
+                debug_filename, 
+                sizeof(debug_filename), 
+                "%.*s.txt",
+                (int)(strrchr(chr_num, '.') - chr_num), 
+                chr_num
+            );
         }
 
+        fprintf(stderr, "Starting to write debug file: %s\n", debug_filename);
         debug_fp = fopen(debug_filename, "w");
     }
 
@@ -403,11 +453,11 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                     char strand = buffer[i].strand_ctx > 0 ? '+' : '-';
                     fprintf(
                         debug_fp,
-                        "%u\t%u\t%u\t%c\t%s\t%s\n",
+                        "%u\t%c\t%u\t%u\t%s\t%s\n",
                         buffer[i].position,
+                        strand,
                         buffer[i].methylated,
                         buffer[i].unmethylated,
-                        strand,
                         get_context_string(abs(buffer[i].strand_ctx), strand),
                         tnc_str);
                 }
@@ -416,7 +466,10 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
     }
 
     if (debug_fp)
+    {
+        fprintf(stderr, "Finished writing debug file: %s\n", debug_filename);
         fclose(debug_fp);
+    }
 
     hsize_t maxdims[1] = {H5S_UNLIMITED};
     space = H5Screate_simple(1, dims, maxdims);
@@ -496,7 +549,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
     if (file >= 0)
         H5Fflush(file, H5F_SCOPE_GLOBAL);
     records_written = dims[0];
-    fprintf(stderr, "Finished processing records for %s, wrote %llu filtered records\n", filename, (unsigned long long)dims[0]);
+    //fprintf(stderr, "Finished processing records for %s, wrote %llu filtered records\n", filename, (unsigned long long)dims[0]);
 cleanup:
     if (filtered_buffer)
         free(filtered_buffer);
@@ -513,6 +566,7 @@ cleanup:
         H5Fflush(file, H5F_SCOPE_GLOBAL);
         H5Fclose(file);
     }
+    fprintf(stderr, "Finished writing HDF5 file: %s, wrote %llu filtered records\n", filename, (unsigned long long)dims[0]);
     return records_written;
 }
 
@@ -580,14 +634,14 @@ int getRealStrand(bam1_t *b)
 void *process_chromosome_region(void *arg)
 {
     ThreadArg *targ = (ThreadArg *)arg;
-    fprintf(stderr, "Thread %s:%u-%u: Starting processing\n", targ->chr, targ->start_pos, targ->end_pos);
+    //fprintf(stderr, "Thread %s:%u-%u: Starting processing\n", targ->chr, targ->start_pos, targ->end_pos);
     samFile *in = sam_open(targ->bam_file, "r");
     if (!in)
     {
         fprintf(stderr, "Thread %s:%u-%u: Failed to open BAM file\n", targ->chr, targ->start_pos, targ->end_pos);
         return NULL;
     }
-    fprintf(stderr, "Thread %s:%u-%u: BAM file opened\n", targ->chr, targ->start_pos, targ->end_pos);
+    //fprintf(stderr, "Thread %s:%u-%u: BAM file opened\n", targ->chr, targ->start_pos, targ->end_pos);
     bam_hdr_t *header = sam_hdr_read(in);
     hts_idx_t *idx = sam_index_load(in, targ->bam_file);
     hts_itr_t *iter = sam_itr_queryi(idx, targ->tid, targ->start_pos, targ->end_pos);
@@ -598,20 +652,23 @@ void *process_chromosome_region(void *arg)
         sam_close(in);
         return NULL;
     }
-    fprintf(stderr, "Thread %s:%u-%u: Iterator created, starting read loop\n", targ->chr, targ->start_pos, targ->end_pos);
+    //fprintf(stderr, "Thread %s:%u-%u: Iterator created, starting read loop\n", targ->chr, targ->start_pos, targ->end_pos);
     bam1_t *b = bam_init1();
     int read_count = 0;
     while (sam_itr_next(in, iter, b) >= 0)
     {
         read_count++;
+        // Print '+' to stderr for every 10000 reads as a simple progress bar
         if (read_count % 10000 == 0)
-            fprintf(stderr, "Thread %s:%u-%u: Processed %d reads\n", targ->chr, targ->start_pos, targ->end_pos, read_count);
+            fprintf(stderr, "+");
 
         if (b->core.flag & DEFAULT_FLAGS || b->core.qual < targ->min_mapq)
             continue;
 
         uint8_t *seq = bam_get_seq(b);
         uint8_t *qual = bam_get_qual(b);
+
+        // Calculate strand for the current read once before processing CIGAR operations
         int strand = getRealStrand(b);
         if (strand == 0)
             continue;
@@ -648,63 +705,42 @@ void *process_chromosome_region(void *arg)
                     size_t idx = kh_val(targ->pos_map, iter);
 
                     int base = bam_seqi(seq, seq_idx);
-                    char cstrand = (strand == 1 || strand == 3) ? '+' : '-';
-                    int ctx = abs(targ->buffer[idx].strand_ctx);
-                    targ->buffer[idx].strand_ctx = encode_strand_context(cstrand, ctx);
 
                     pthread_mutex_lock(targ->buffer_mutex);
 
-                    if (strand & 1)
+                    if (strand & 1) // Forward strand
                     {
-                        if (base != 2)
-                        {
-                            seq_idx++;
-                            pthread_mutex_unlock(targ->buffer_mutex);
-                            continue;
-                        }
+                        if (base == 2) // C
+                            targ->buffer[idx].methylated++;
+                        else if (base == 8) // T    
+                            targ->buffer[idx].unmethylated++;
                     }
-                    else
+                    else // Reverse strand
                     {
-                        if (base != 4)
-                        {
-                            seq_idx++;
-                            pthread_mutex_unlock(targ->buffer_mutex);
-                            continue;
-                        }
+                        if (base == 4) // G
+                            targ->buffer[idx].methylated++;
+                        else if (base == 1) // A    
+                            targ->buffer[idx].unmethylated++;
                     }
-
-                    if ((base == 8 && (strand & 1)) || (base == 1 && !(strand & 1)))
-                        targ->buffer[idx].unmethylated++;
-                    else if ((base == 2 && (strand & 1)) || (base == 4 && !(strand & 1)))
-                        targ->buffer[idx].methylated++;
 
                     pthread_mutex_unlock(targ->buffer_mutex);
                     seq_idx++;
                 }
                 pos += len;
             }
-            else if (op == BAM_CINS)
-            {
+            else if (op == BAM_CINS || op == BAM_CSOFT_CLIP)
                 seq_idx += len;
-            }
             else if (op == BAM_CDEL || op == BAM_CREF_SKIP)
-            {
                 pos += len;
-            }
-            else if (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP)
-            {
-                if (op == BAM_CSOFT_CLIP)
-                    seq_idx += len;
-            }
         }
     }
-    fprintf(stderr, "Thread %s:%u-%u: Finished processing %d reads\n", targ->chr, targ->start_pos, targ->end_pos, read_count);
+    //fprintf(stderr, "Thread %s:%u-%u: Finished processing %d reads\n", targ->chr, targ->start_pos, targ->end_pos, read_count);
     bam_destroy1(b);
     hts_itr_destroy(iter);
     hts_idx_destroy(idx);
     sam_hdr_destroy(header);
     sam_close(in);
-    fprintf(stderr, "Thread %s:%u-%u: Completed and resources cleaned up\n", targ->chr, targ->start_pos, targ->end_pos);
+    //fprintf(stderr, "Thread %s:%u-%u: Completed and resources cleaned up\n", targ->chr, targ->start_pos, targ->end_pos);
     return NULL;
 }
 
@@ -790,19 +826,17 @@ void process_chromosome(ThreadArg *targ)
             continue;
         }
         active_threads++;
-        fprintf(stderr, "Started thread %d for chromosome region %s:%u-%u, active threads: %d\n", i, region_args[i].chr, region_args[i].start_pos, region_args[i].end_pos, active_threads);
-        // Check for completed threads to prevent hanging
+        //fprintf(stderr, "Started thread %d for chromosome region %s:%u-%u, active threads: %d\n", i, region_args[i].chr, region_args[i].start_pos, region_args[i].end_pos, active_threads);
         for (int j = 0; j <= i; j++)
         {
             if (!joined[j] && pthread_join(threads[j], NULL) == 0)
             {
                 joined[j] = 1;
                 active_threads--;
-                fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
+                //fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
             }
         }
-        // Limit active threads if necessary
-        int max_region_threads = 8; // Default limit for region threads per chromosome
+        int max_region_threads = 8;
         while (active_threads >= max_region_threads)
         {
             for (int j = 0; j <= i; j++)
@@ -811,26 +845,40 @@ void process_chromosome(ThreadArg *targ)
                 {
                     joined[j] = 1;
                     active_threads--;
-                    fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
+                    //fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
                 }
             }
         }
     }
-    // Ensure all threads are joined
     for (int i = 0; i < n_regions; i++)
     {
         if (!joined[i] && pthread_join(threads[i], NULL) == 0)
         {
             joined[i] = 1;
-            if (active_threads > 0) active_threads--;
-            fprintf(stderr, "Final join: Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", i, region_args[i].chr, region_args[i].start_pos, region_args[i].end_pos, active_threads);
+            if (active_threads > 0) 
+                active_threads--;
+            fprintf(
+                stderr, 
+                "Final join: Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", 
+                i, 
+                region_args[i].chr, 
+                region_args[i].start_pos, 
+                region_args[i].end_pos, 
+                active_threads
+            );
         }
     }
     free(joined);
     pthread_mutex_destroy(&buffer_mutex);
 
     char out_path[1024];
-    snprintf(out_path, sizeof(out_path), "%s/%s.h5", targ->out_dir, get_std_chr_name(targ->chr));
+    snprintf(
+        out_path, 
+        sizeof(out_path), 
+        "%s/%s.h5", 
+        targ->out_dir, 
+        get_std_chr_name(targ->chr)
+    );
     flush_buffer_to_hdf5(
         out_path,
         buffer,
@@ -842,7 +890,8 @@ void process_chromosome(ThreadArg *targ)
         targ->max_cov,
         targ->min_meth,
         targ->max_meth,
-        targ->debug_output);
+        targ->debug_output
+    );
 
     kh_destroy(pos, pos_map);
     free(buffer);
@@ -872,11 +921,10 @@ static inline char decode_nucleotide(uint8_t n)
 
 static inline void decode_trinucleotide(uint8_t tnc, char *trinucl)
 {
-    uint8_t n1 = (tnc >> 6) & 0x07;
-    uint8_t n2 = (tnc >> 3) & 0x07;
-    uint8_t n3 = tnc & 0x07;
-
-    trinucl[0] = decode_nucleotide(n1);
+    // Decode MethylDackel-style TNC index (0-24) to first and second bases (middle base not stored)
+    uint8_t n2 = (tnc / 5) % 4; // Middle base index
+    uint8_t n3 = tnc % 5;       // Last base index
+    trinucl[0] = 'C';           // Central base is always C in MethylDackel naming
     trinucl[1] = decode_nucleotide(n2);
     trinucl[2] = decode_nucleotide(n3);
     trinucl[3] = '\0';
@@ -895,6 +943,12 @@ static inline const char *get_context_string(int context, char strand)
 
 int main(int argc, char *argv[])
 {
+    fprintf(stderr, "Program: MethylExtractor\nParameters:\n");
+    for (int i = 0; i < argc; i++) {
+        fprintf(stderr, "  Arg %d: %s\n", i, argv[i]);
+    }
+    fprintf(stderr, "Starting processing...\n");
+    
     int max_chr = DEFAULT_MAX_CHR;
     int hdf5_compression = DEFAULT_HDF5_COMPRESSION;
     int hdf5_chunk_size = DEFAULT_HDF5_CHUNK_SIZE;
@@ -1187,17 +1241,15 @@ int main(int argc, char *argv[])
             continue;
         }
         active_threads++;
-        fprintf(stderr, "Started thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
-        // Check for completed threads to prevent hanging
+        //fprintf(stderr, "Started thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
         for (int j = 0; j <= i; j++)
         {
             if (pthread_join(threads[j], NULL) == 0)
             {
                 active_threads--;
-                fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
+                //fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
             }
         }
-        // Limit active threads if necessary
         while (active_threads >= num_threads)
         {
             for (int j = 0; j <= i; j++)
@@ -1205,18 +1257,17 @@ int main(int argc, char *argv[])
                 if (pthread_join(threads[j], NULL) == 0)
                 {
                     active_threads--;
-                    fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
+                    //fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
                 }
             }
         }
     }
-    // Ensure all threads are joined
     for (int i = 0; i < valid_chr_count; i++)
     {
         if (pthread_join(threads[i], NULL) == 0)
         {
             if (active_threads > 0) active_threads--;
-            fprintf(stderr, "Final join: Completed thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
+            //fprintf(stderr, "Final join: Completed thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
         }
     }
     cleanup_hdf5();
@@ -1226,5 +1277,6 @@ int main(int argc, char *argv[])
     free(thread_args);
     sam_hdr_destroy(header);
     fai_destroy(fai);
+    fprintf(stderr, "\nProcessing complete. MethylExtractor has finished.\n");
     return 0;
 }
