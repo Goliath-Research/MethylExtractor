@@ -36,7 +36,7 @@
 #define STRAND_MASK 0x80
 #define CONTEXT_MASK 0x03
 #define MAX_CHR_NAME 2
-#define MAX_REGIONS_PER_CHR 1
+#define MAX_REGIONS_PER_CHR 8
 
 // BAM flag constants for strand determination
 #define BAM_FLAG_PAIRED 0x1
@@ -429,6 +429,12 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
     }
 
     MethylRecord *filtered_buffer = malloc(dims[0] * sizeof(MethylRecord));
+    if (!filtered_buffer)
+    {
+        fprintf(stderr, "Failed to allocate memory for filtered_buffer\n");
+        goto cleanup;
+    }
+    
     size_t j = 0;
 
     for (size_t i = 0; i < n_records; i++)
@@ -504,6 +510,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         fprintf(stderr, "Failed to create memory datatype\n");
         goto cleanup;
     }
+
     if (append_mode)
     {
         dataset = H5Dopen2(file, "methylation_data", H5P_DEFAULT);
@@ -534,16 +541,19 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         if (dataset >= 0)
             status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
     }
+
     if (dataset < 0)
     {
         fprintf(stderr, "Failed to create or open dataset\n");
         goto cleanup;
     }
+    
     if (status < 0)
     {
         fprintf(stderr, "Failed to write data to HDF5 file\n");
         goto cleanup;
     }
+
     if (dataset >= 0)
         H5Dflush(dataset);
     if (file >= 0)
@@ -566,7 +576,12 @@ cleanup:
         H5Fflush(file, H5F_SCOPE_GLOBAL);
         H5Fclose(file);
     }
-    fprintf(stderr, "Finished writing HDF5 file: %s, wrote %llu filtered records\n", filename, (unsigned long long)dims[0]);
+    fprintf(
+        stderr, 
+        "\nFinished writing HDF5 file: %s, wrote %llu filtered records\n", 
+        filename, 
+        (unsigned long long)dims[0]
+    );
     return records_written;
 }
 
@@ -647,7 +662,13 @@ void *process_chromosome_region(void *arg)
     hts_itr_t *iter = sam_itr_queryi(idx, targ->tid, targ->start_pos, targ->end_pos);
     if (!iter)
     {
-        fprintf(stderr, "Thread %s:%u-%u: Failed to create iterator\n", targ->chr, targ->start_pos, targ->end_pos);
+        fprintf(
+            stderr, 
+            "\nThread %s:%u-%u: Failed to create iterator\n", 
+            targ->chr, 
+            targ->start_pos, 
+            targ->end_pos
+        );
         sam_hdr_destroy(header);
         sam_close(in);
         return NULL;
