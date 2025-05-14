@@ -48,6 +48,7 @@
 
 // Hash table for position-to-buffer-index mapping
 KHASH_MAP_INIT_INT64(pos, size_t)
+KHASH_SET_INIT_STR(str)
 
 // Function prototypes
 static inline char decode_nucleotide(uint8_t n);
@@ -171,7 +172,10 @@ static inline uint8_t encode_trinucleotide_context(const char *chr_seq, int pos,
     {
         base = chr_seq[pos + 2 * direction];
         if (direction < 0)
-            base = (base == 'A') ? 'T' : (base == 'T') ? 'A' : (base == 'C') ? 'G' : (base == 'G') ? 'C' : 'N';
+            base = (base == 'A') ? 'T'  : (base == 'T') ? 'A'
+                                        : (base == 'C') ? 'G'
+                                        : (base == 'G') ? 'C'
+                                        : 'N';
         switch (toupper(base))
         {
         case 'A':
@@ -199,7 +203,10 @@ static inline uint8_t encode_trinucleotide_context(const char *chr_seq, int pos,
     {
         base = chr_seq[pos + direction];
         if (direction < 0)
-            base = (base == 'A') ? 'T' : (base == 'T') ? 'A' : (base == 'C') ? 'G' : (base == 'G') ? 'C' : 'N';
+            base = (base == 'A') ? 'T'  : (base == 'T') ? 'A'
+                                        : (base == 'C') ? 'G'
+                                        : (base == 'G') ? 'C'
+                                        : 'N';
         switch (toupper(base))
         {
         case 'A':
@@ -303,7 +310,7 @@ int get_context(const char *chr_seq, int chr_len, int pos, int8_t *strand_ctx, u
         *strand_ctx = encode_strand_context('-', context);
     else
         *strand_ctx = 0;
-    
+
     return context;
 }
 
@@ -359,7 +366,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                             int min_cov, int max_cov, int min_meth, int max_meth,
                             int debug_output)
 {
-    //fprintf(stderr, "Starting flush_buffer_to_hdf5 for file %s\n", filename);
+    // fprintf(stderr, "Starting flush_buffer_to_hdf5 for file %s\n", filename);
     fprintf(stderr, "\nStarting to write HDF5 file: %s\n", filename);
     hid_t file = -1, dataset = -1, space = -1, type = -1, mem_type = -1, dcpl = -1;
     herr_t status = -1;
@@ -376,7 +383,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         fprintf(stderr, "Failed to %s HDF5 file: %s\n", append_mode ? "open" : "create", filename);
         goto cleanup;
     }
-    //fprintf(stderr, "HDF5 file %s opened/created\n", filename);
+    // fprintf(stderr, "HDF5 file %s opened/created\n", filename);
     hsize_t dims[1] = {0};
     FILE *debug_fp = NULL;
 
@@ -404,24 +411,22 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         if (dir_end)
         {
             snprintf(
-                debug_filename, 
-                sizeof(debug_filename), 
+                debug_filename,
+                sizeof(debug_filename),
                 "%.*s%.*s.txt",
-                (int)(dir_end - filename + 1), 
+                (int)(dir_end - filename + 1),
                 filename,
-                (int)(strrchr(chr_num, '.') - chr_num), 
-                chr_num
-            );
+                (int)(strrchr(chr_num, '.') - chr_num),
+                chr_num);
         }
         else
         {
             snprintf(
-                debug_filename, 
-                sizeof(debug_filename), 
+                debug_filename,
+                sizeof(debug_filename),
                 "%.*s.txt",
-                (int)(strrchr(chr_num, '.') - chr_num), 
-                chr_num
-            );
+                (int)(strrchr(chr_num, '.') - chr_num),
+                chr_num);
         }
 
         fprintf(stderr, "Starting to write debug file: %s\n", debug_filename);
@@ -434,7 +439,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         fprintf(stderr, "Failed to allocate memory for filtered_buffer\n");
         goto cleanup;
     }
-    
+
     size_t j = 0;
 
     for (size_t i = 0; i < n_records; i++)
@@ -445,7 +450,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
             double meth_level = total > 0 ? 100.0 * ((double)buffer[i].methylated / total) : 0.0;
             if (meth_level >= min_meth && meth_level <= max_meth)
             {
-                if (j >= dims[0]) 
+                if (j >= dims[0])
                 {
                     fprintf(stderr, "Error: Attempting to write beyond allocated filtered_buffer size at index %zu\n", j);
                     break;
@@ -547,7 +552,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         fprintf(stderr, "Failed to create or open dataset\n");
         goto cleanup;
     }
-    
+
     if (status < 0)
     {
         fprintf(stderr, "Failed to write data to HDF5 file\n");
@@ -559,7 +564,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
     if (file >= 0)
         H5Fflush(file, H5F_SCOPE_GLOBAL);
     records_written = dims[0];
-    //fprintf(stderr, "Finished processing records for %s, wrote %llu filtered records\n", filename, (unsigned long long)dims[0]);
+    // fprintf(stderr, "Finished processing records for %s, wrote %llu filtered records\n", filename, (unsigned long long)dims[0]);
 cleanup:
     if (filtered_buffer)
         free(filtered_buffer);
@@ -577,11 +582,10 @@ cleanup:
         H5Fclose(file);
     }
     fprintf(
-        stderr, 
-        "\nFinished writing HDF5 file: %s, wrote %llu filtered records\n", 
-        filename, 
-        (unsigned long long)dims[0]
-    );
+        stderr,
+        "\nFinished writing HDF5 file: %s, wrote %llu filtered records\n",
+        filename,
+        (unsigned long long)dims[0]);
     return records_written;
 }
 
@@ -649,31 +653,31 @@ int getRealStrand(bam1_t *b)
 void *process_chromosome_region(void *arg)
 {
     ThreadArg *targ = (ThreadArg *)arg;
-    //fprintf(stderr, "Thread %s:%u-%u: Starting processing\n", targ->chr, targ->start_pos, targ->end_pos);
+    // fprintf(stderr, "Thread %s:%u-%u: Starting processing\n", targ->chr, targ->start_pos, targ->end_pos);
     samFile *in = sam_open(targ->bam_file, "r");
     if (!in)
     {
         fprintf(stderr, "Thread %s:%u-%u: Failed to open BAM file\n", targ->chr, targ->start_pos, targ->end_pos);
         return NULL;
     }
-    //fprintf(stderr, "Thread %s:%u-%u: BAM file opened\n", targ->chr, targ->start_pos, targ->end_pos);
+    // fprintf(stderr, "Thread %s:%u-%u: BAM file opened\n", targ->chr, targ->start_pos, targ->end_pos);
     bam_hdr_t *header = sam_hdr_read(in);
     hts_idx_t *idx = sam_index_load(in, targ->bam_file);
     hts_itr_t *iter = sam_itr_queryi(idx, targ->tid, targ->start_pos, targ->end_pos);
     if (!iter)
     {
         fprintf(
-            stderr, 
-            "\nThread %s:%u-%u: Failed to create iterator\n", 
-            targ->chr, 
-            targ->start_pos, 
-            targ->end_pos
-        );
+            stderr,
+            "\nThread %s:%u-%u: Failed to create iterator\n",
+            targ->chr,
+            targ->start_pos,
+            targ->end_pos);
         sam_hdr_destroy(header);
         sam_close(in);
         return NULL;
     }
-    //fprintf(stderr, "Thread %s:%u-%u: Iterator created, starting read loop\n", targ->chr, targ->start_pos, targ->end_pos);
+    // fprintf(stderr, "Thread %s:%u-%u: Iterator created, starting read loop\n", targ->chr, targ->start_pos, targ->end_pos);
+
     bam1_t *b = bam_init1();
     int read_count = 0;
     while (sam_itr_next(in, iter, b) >= 0)
@@ -693,6 +697,7 @@ void *process_chromosome_region(void *arg)
         int strand = getRealStrand(b);
         if (strand == 0)
             continue;
+        //char cstrand = (strand == 1 || strand == 3) ? '+' : '-';
 
         uint32_t *cigar = bam_get_cigar(b);
         uint32_t pos = b->core.pos;
@@ -709,39 +714,100 @@ void *process_chromosome_region(void *arg)
                 {
                     uint32_t refpos = pos + k;
                     if (refpos < targ->start_pos || refpos >= targ->end_pos)
+                    {
+                        seq_idx++;
                         continue;
+                    }
+
+                    // Check quality score
                     if (qual[seq_idx] < targ->min_phred)
                     {
+                        // fprintf(
+                        //     stderr,
+                        //     "Debug: Low quality score %d at chr %s:%u, seq_idx %d, skipping\n",
+                        //     qual[seq_idx],
+                        //     targ->chr,
+                        //     refpos + 1,
+                        //     seq_idx
+                        // );
                         seq_idx++;
                         continue;
                     }
 
-                    uint64_t key = ((uint64_t)targ->tid << 32) | refpos;
-                    khint_t iter = kh_get(pos, targ->pos_map, key);
-                    if (iter == kh_end(targ->pos_map))
-                    {
-                        seq_idx++;
-                        continue;
-                    }
-                    size_t idx = kh_val(targ->pos_map, iter);
-
+                    // Validate reference base
+                    // char cbase = toupper(targ->chr_seq[refpos]);
                     int base = bam_seqi(seq, seq_idx);
+
+                    // if (((base == 2) && (cbase != 'C')) || ((base == 8) && (cbase != 'G')))
+                    // //if ((cstrand == '+' && cbase != 'C') || (cstrand == '-' && cbase != 'G'))
+                    // {
+                    //     // fprintf(
+                    //     //     stderr, 
+                    //     //     "Debug: Invalid reference base %c at chr %s:%u, strand %c, skipping\n", 
+                    //     //     ref_base, 
+                    //     //     targ->chr, 
+                    //     //     refpos + 1, 
+                    //     //     cstrand
+                    //     // );
+                    //     seq_idx++;
+                    //     continue;
+                    // }
 
                     pthread_mutex_lock(targ->buffer_mutex);
 
-                    if (strand & 1) // Forward strand
+                    if (strand & 1) // Forward strand or cstrand == '+'
                     {
                         if (base == 2) // C
-                            targ->buffer[idx].methylated++;
-                        else if (base == 8) // T    
-                            targ->buffer[idx].unmethylated++;
+                            targ->buffer[seq_idx].methylated++;
+                        else if (base == 8) // T
+                            targ->buffer[seq_idx].unmethylated++;
+                        else if (base == 3) // N (ambiguous)
+                            // fprintf(
+                            //     stderr,
+                            //     "Debug: Ambiguous base (N) at chr %s:%u, strand +, seq_idx %d, skipping\n",
+                            //     targ->chr,
+                            //     refpos + 1,
+                            //     seq_idx
+                            // )
+                            ;
+                        else
+                            // fprintf(
+                            //     stderr,
+                            //     "Debug: Unexpected base (%d) at chr %s:%u, strand +, seq_idx %d, quality %d, skipping\n",
+                            //     base,
+                            //     targ->chr,
+                            //     refpos + 1,
+                            //     seq_idx,
+                            //     qual[seq_idx]
+                            // )
+                            ;
                     }
-                    else // Reverse strand
+                    else // Reverse strand or cstrand == '-'
                     {
                         if (base == 4) // G
-                            targ->buffer[idx].methylated++;
-                        else if (base == 1) // A    
-                            targ->buffer[idx].unmethylated++;
+                            targ->buffer[seq_idx].methylated++;
+                        else if (base == 1) // A
+                            targ->buffer[seq_idx].unmethylated++;
+                        else if (base == 3) // N (ambiguous)
+                            // fprintf(
+                            //     stderr,
+                            //     "Debug: Ambiguous base (N) at chr %s:%u, strand -, seq_idx %d, skipping\n", 
+                            //     targ->chr, 
+                            //     refpos + 1, 
+                            //     seq_idx
+                            // )
+                            ;
+                        else
+                            // fprintf(
+                            //     stderr,
+                            //     "Debug: Unexpected base (%d) at chr %s:%u, strand -, seq_idx %d, quality %d, skipping\n", 
+                            //     base, 
+                            //     targ->chr, 
+                            //     refpos + 1, 
+                            //     seq_idx, 
+                            //     qual[seq_idx]
+                            // )
+                            ;
                     }
 
                     pthread_mutex_unlock(targ->buffer_mutex);
@@ -753,15 +819,30 @@ void *process_chromosome_region(void *arg)
                 seq_idx += len;
             else if (op == BAM_CDEL || op == BAM_CREF_SKIP)
                 pos += len;
+            else if (op == BAM_CHARD_CLIP)
+            {
+                // HARD_CLIP does not consume sequence or reference, no increment needed
+            }
+            else
+            {
+                // fprintf(
+                //     stderr, 
+                //     "Debug: Unhandled CIGAR op %d at chr %s, read %s, seq_idx %d\n",
+                //     op, 
+                //     targ->chr, 
+                //     bam_get_qname(b), 
+                //     seq_idx
+                // );
+            }
         }
     }
-    //fprintf(stderr, "Thread %s:%u-%u: Finished processing %d reads\n", targ->chr, targ->start_pos, targ->end_pos, read_count);
+
     bam_destroy1(b);
     hts_itr_destroy(iter);
     hts_idx_destroy(idx);
     sam_hdr_destroy(header);
     sam_close(in);
-    //fprintf(stderr, "Thread %s:%u-%u: Completed and resources cleaned up\n", targ->chr, targ->start_pos, targ->end_pos);
+    // fprintf(stderr, "Thread %s:%u-%u: Completed and resources cleaned up\n", targ->chr, targ->start_pos, targ->end_pos);
     return NULL;
 }
 
@@ -835,7 +916,8 @@ void process_chromosome(ThreadArg *targ)
     pthread_t threads[n_regions];
     int active_threads = 0;
     int *joined = calloc(n_regions, sizeof(int));
-    if (!joined) {
+    if (!joined)
+    {
         fprintf(stderr, "Failed to allocate memory for joined array\n");
         return;
     }
@@ -847,14 +929,14 @@ void process_chromosome(ThreadArg *targ)
             continue;
         }
         active_threads++;
-        //fprintf(stderr, "Started thread %d for chromosome region %s:%u-%u, active threads: %d\n", i, region_args[i].chr, region_args[i].start_pos, region_args[i].end_pos, active_threads);
+        // fprintf(stderr, "Started thread %d for chromosome region %s:%u-%u, active threads: %d\n", i, region_args[i].chr, region_args[i].start_pos, region_args[i].end_pos, active_threads);
         for (int j = 0; j <= i; j++)
         {
             if (!joined[j] && pthread_join(threads[j], NULL) == 0)
             {
                 joined[j] = 1;
                 active_threads--;
-                //fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
+                // fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
             }
         }
         int max_region_threads = 8;
@@ -866,7 +948,7 @@ void process_chromosome(ThreadArg *targ)
                 {
                     joined[j] = 1;
                     active_threads--;
-                    //fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
+                    // fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
                 }
             }
         }
@@ -876,17 +958,16 @@ void process_chromosome(ThreadArg *targ)
         if (!joined[i] && pthread_join(threads[i], NULL) == 0)
         {
             joined[i] = 1;
-            if (active_threads > 0) 
+            if (active_threads > 0)
                 active_threads--;
             fprintf(
-                stderr, 
-                "Final join: Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", 
-                i, 
-                region_args[i].chr, 
-                region_args[i].start_pos, 
-                region_args[i].end_pos, 
-                active_threads
-            );
+                stderr,
+                "Final join: Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n",
+                i,
+                region_args[i].chr,
+                region_args[i].start_pos,
+                region_args[i].end_pos,
+                active_threads);
         }
     }
     free(joined);
@@ -894,12 +975,11 @@ void process_chromosome(ThreadArg *targ)
 
     char out_path[1024];
     snprintf(
-        out_path, 
-        sizeof(out_path), 
-        "%s/%s.h5", 
-        targ->out_dir, 
-        get_std_chr_name(targ->chr)
-    );
+        out_path,
+        sizeof(out_path),
+        "%s/%s.h5",
+        targ->out_dir,
+        get_std_chr_name(targ->chr));
     flush_buffer_to_hdf5(
         out_path,
         buffer,
@@ -911,8 +991,7 @@ void process_chromosome(ThreadArg *targ)
         targ->max_cov,
         targ->min_meth,
         targ->max_meth,
-        targ->debug_output
-    );
+        targ->debug_output);
 
     kh_destroy(pos, pos_map);
     free(buffer);
@@ -965,11 +1044,12 @@ static inline const char *get_context_string(int context, char strand)
 int main(int argc, char *argv[])
 {
     fprintf(stderr, "Program: MethylExtractor\nParameters:\n");
-    for (int i = 0; i < argc; i++) {
+    for (int i = 0; i < argc; i++)
+    {
         fprintf(stderr, "  Arg %d: %s\n", i, argv[i]);
     }
     fprintf(stderr, "Starting processing...\n");
-    
+
     int max_chr = DEFAULT_MAX_CHR;
     int hdf5_compression = DEFAULT_HDF5_COMPRESSION;
     int hdf5_chunk_size = DEFAULT_HDF5_CHUNK_SIZE;
@@ -1262,13 +1342,13 @@ int main(int argc, char *argv[])
             continue;
         }
         active_threads++;
-        //fprintf(stderr, "Started thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
+        // fprintf(stderr, "Started thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
         for (int j = 0; j <= i; j++)
         {
             if (pthread_join(threads[j], NULL) == 0)
             {
                 active_threads--;
-                //fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
+                // fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
             }
         }
         while (active_threads >= num_threads)
@@ -1278,7 +1358,7 @@ int main(int argc, char *argv[])
                 if (pthread_join(threads[j], NULL) == 0)
                 {
                     active_threads--;
-                    //fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
+                    // fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
                 }
             }
         }
@@ -1287,8 +1367,9 @@ int main(int argc, char *argv[])
     {
         if (pthread_join(threads[i], NULL) == 0)
         {
-            if (active_threads > 0) active_threads--;
-            //fprintf(stderr, "Final join: Completed thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
+            if (active_threads > 0)
+                active_threads--;
+            // fprintf(stderr, "Final join: Completed thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
         }
     }
     cleanup_hdf5();
