@@ -12,6 +12,7 @@
 #include <hdf5/serial/hdf5.h>
 #include <pthread.h>
 #include <sys/sysinfo.h>
+#include <time.h>
 
 #define DEFAULT_MAX_CHR 24
 #define DEFAULT_HDF5_COMPRESSION 6
@@ -37,14 +38,6 @@
 #define CONTEXT_MASK 0x03
 #define MAX_CHR_NAME 2
 #define MAX_REGIONS_PER_CHR 8
-
-// BAM flag constants for strand determination
-#define BAM_FLAG_PAIRED 0x1
-#define BAM_FLAG_FIRST_IN_PAIR 0x40
-#define BAM_FLAG_SECOND_IN_PAIR 0x80
-#define BAM_FLAG_REVERSE_STRAND 0x10
-#define BAM_FLAG_READ1_REVERSE 0x50
-#define BAM_FLAG_READ2_REVERSE 0x90
 
 // Hash table for position-to-buffer-index mapping
 KHASH_MAP_INIT_INT64(pos, size_t)
@@ -93,6 +86,14 @@ typedef struct
     khash_t(pos) * pos_map;
     uint8_t *tnc_array; // New: TriNucleotideContexts[25] array
 } ThreadArg;
+
+typedef struct 
+{
+    samFile *in;
+    hts_itr_t *iter;
+    bam_hdr_t *hdr;
+    ThreadArg *targ;
+} mplp_data_t;
 
 static const char *valid_chromosomes[] = {
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
@@ -366,8 +367,14 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                             int min_cov, int max_cov, int min_meth, int max_meth,
                             int debug_output)
 {
-    // fprintf(stderr, "Starting flush_buffer_to_hdf5 for file %s\n", filename);
-    fprintf(stderr, "\nStarting to write HDF5 file: %s\n", filename);
+    // Add time logging
+    time_t rawtime;
+    struct tm * timeinfo;
+    char time_str[64];
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+    fprintf(stderr, "\n[%s] Starting to write HDF5 file: %s\n", time_str, filename);
     hid_t file = -1, dataset = -1, space = -1, type = -1, mem_type = -1, dcpl = -1;
     herr_t status = -1;
     size_t records_written = 0;
@@ -383,7 +390,6 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         fprintf(stderr, "Failed to %s HDF5 file: %s\n", append_mode ? "open" : "create", filename);
         goto cleanup;
     }
-    // fprintf(stderr, "HDF5 file %s opened/created\n", filename);
     hsize_t dims[1] = {0};
     FILE *debug_fp = NULL;
 
@@ -429,7 +435,10 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                 chr_num);
         }
 
-        fprintf(stderr, "Starting to write debug file: %s\n", debug_filename);
+        time(&rawtime);
+        timeinfo = localtime(&rawtime);
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+        fprintf(stderr, "[%s] Starting to write debug file: %s\n", time_str, debug_filename);
         debug_fp = fopen(debug_filename, "w");
     }
 
@@ -478,7 +487,10 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
 
     if (debug_fp)
     {
-        fprintf(stderr, "Finished writing debug file: %s\n", debug_filename);
+        time(&rawtime);
+        timeinfo = localtime(&rawtime);
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+        fprintf(stderr, "[%s] Finished writing debug file: %s\n", time_str, debug_filename);
         fclose(debug_fp);
     }
 
@@ -564,7 +576,15 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
     if (file >= 0)
         H5Fflush(file, H5F_SCOPE_GLOBAL);
     records_written = dims[0];
-    // fprintf(stderr, "Finished processing records for %s, wrote %llu filtered records\n", filename, (unsigned long long)dims[0]);
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+    fprintf(
+        stderr,
+        "\n[%s] Finished writing HDF5 file: %s, wrote %llu filtered records\n",
+        time_str,
+        filename,
+        (unsigned long long)dims[0]);
 cleanup:
     if (filtered_buffer)
         free(filtered_buffer);
@@ -581,11 +601,6 @@ cleanup:
         H5Fflush(file, H5F_SCOPE_GLOBAL);
         H5Fclose(file);
     }
-    fprintf(
-        stderr,
-        "\nFinished writing HDF5 file: %s, wrote %llu filtered records\n",
-        filename,
-        (unsigned long long)dims[0]);
     return records_written;
 }
 
@@ -596,21 +611,21 @@ int getRealStrand(bam1_t *b)
         XG = NULL;
     if (XG == NULL)
     {
-        if (b->core.flag & BAM_FLAG_PAIRED)
+        if (b->core.flag & BAM_FPAIRED)
         {
-            if ((b->core.flag & BAM_FLAG_READ1_REVERSE) == BAM_FLAG_READ1_REVERSE)
+            if ((b->core.flag & (BAM_FREAD1 | BAM_FREVERSE)) == (BAM_FREAD1 | BAM_FREVERSE))
                 return 2;
-            else if (b->core.flag & BAM_FLAG_FIRST_IN_PAIR)
+            else if (b->core.flag & BAM_FREAD1)
                 return 1;
-            else if ((b->core.flag & BAM_FLAG_READ2_REVERSE) == BAM_FLAG_READ2_REVERSE)
+            else if ((b->core.flag & (BAM_FREAD2 | BAM_FREVERSE)) == (BAM_FREAD2 | BAM_FREVERSE))
                 return 1;
-            else if (b->core.flag & BAM_FLAG_SECOND_IN_PAIR)
+            else if (b->core.flag & BAM_FREAD2)
                 return 2;
             return 0;
         }
         else
         {
-            if (b->core.flag & BAM_FLAG_REVERSE_STRAND)
+            if (b->core.flag & BAM_FREVERSE)
                 return 2;
             return 1;
         }
@@ -619,30 +634,30 @@ int getRealStrand(bam1_t *b)
     {
         if (*(XG + 1) == 'C')
         {
-            if ((b->core.flag & (BAM_FLAG_FIRST_IN_PAIR | BAM_FLAG_REVERSE_STRAND)) == (BAM_FLAG_FIRST_IN_PAIR | BAM_FLAG_REVERSE_STRAND))
+            if ((b->core.flag & (BAM_FREAD1 | BAM_FREVERSE)) == (BAM_FREAD1 | BAM_FREVERSE))
                 return 1;
-            else if ((b->core.flag & BAM_FLAG_READ1_REVERSE) == BAM_FLAG_READ1_REVERSE)
+            else if ((b->core.flag & BAM_FREAD1) == BAM_FREAD1)
                 return 3;
-            else if ((b->core.flag & (BAM_FLAG_SECOND_IN_PAIR | BAM_FLAG_REVERSE_STRAND)) == (BAM_FLAG_SECOND_IN_PAIR | BAM_FLAG_REVERSE_STRAND))
+            else if ((b->core.flag & (BAM_FREAD2 | BAM_FREVERSE)) == (BAM_FREAD2 | BAM_FREVERSE))
                 return 3;
-            else if ((b->core.flag & BAM_FLAG_READ2_REVERSE) == BAM_FLAG_READ2_REVERSE)
+            else if ((b->core.flag & BAM_FREAD2) == BAM_FREAD2)
                 return 1;
-            else if (b->core.flag & BAM_FLAG_REVERSE_STRAND)
+            else if (b->core.flag & BAM_FREVERSE)
                 return 3;
             else
                 return 1;
         }
         else
         {
-            if ((b->core.flag & (BAM_FLAG_FIRST_IN_PAIR | BAM_FLAG_REVERSE_STRAND)) == (BAM_FLAG_FIRST_IN_PAIR | BAM_FLAG_REVERSE_STRAND))
+            if ((b->core.flag & (BAM_FREAD1 | BAM_FREVERSE)) == (BAM_FREAD1 | BAM_FREVERSE))
                 return 4;
-            else if ((b->core.flag & BAM_FLAG_READ1_REVERSE) == BAM_FLAG_READ1_REVERSE)
+            else if ((b->core.flag & BAM_FREAD1) == BAM_FREAD1)
                 return 2;
-            else if ((b->core.flag & (BAM_FLAG_SECOND_IN_PAIR | BAM_FLAG_REVERSE_STRAND)) == (BAM_FLAG_SECOND_IN_PAIR | BAM_FLAG_REVERSE_STRAND))
+            else if ((b->core.flag & (BAM_FREAD2 | BAM_FREVERSE)) == (BAM_FREAD2 | BAM_FREVERSE))
                 return 2;
-            else if ((b->core.flag & BAM_FLAG_READ2_REVERSE) == BAM_FLAG_READ2_REVERSE)
+            else if ((b->core.flag & BAM_FREAD2) == BAM_FREAD2)
                 return 4;
-            else if (b->core.flag & BAM_FLAG_REVERSE_STRAND)
+            else if (b->core.flag & BAM_FREVERSE)
                 return 2;
             else
                 return 4;
@@ -650,17 +665,99 @@ int getRealStrand(bam1_t *b)
     }
 }
 
+static int mplp_fetch(void *data, bam1_t *b) 
+{
+    int rv;
+    mplp_data_t *ldata = (mplp_data_t *)data;
+    uint8_t *p;
+
+    // Debug: Check for NULL pointers
+    if (!ldata) {
+        //fprintf(stderr, "[DEBUG] mplp_fetch: ldata is NULL!\n");
+        return -1;
+    }
+    if (!ldata->in) {
+        //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->in is NULL!\n");
+        return -1;
+    }
+    if (!ldata->hdr) {
+        //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->hdr is NULL!\n");
+        return -1;
+    }
+    if (!b) {
+        //fprintf(stderr, "[DEBUG] mplp_fetch: bam1_t *b is NULL!\n");
+        return -1;
+    }
+    if (ldata->iter == NULL) {
+        //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->iter is NULL (using sam_read1 fallback)\n");
+        return -1;
+    }
+    if (ldata->targ == NULL) {
+        //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->targ is NULL!\n");
+        return -1;
+    }
+    //fprintf(stderr, "[DEBUG] mplp_fetch: ldata=%p, in=%p, hdr=%p, iter=%p, targ=%p, b=%p\n", ldata, ldata->in, ldata->hdr, ldata->iter, ldata->targ, b);
+
+    while (1)
+    {
+        rv = ldata->iter ? sam_itr_next(ldata->in, ldata->iter, b) : sam_read1(ldata->in, ldata->hdr, b);
+
+        if (rv < 0) {
+            //fprintf(stderr, "[DEBUG] mplp_fetch: sam_itr_next/sam_read1 returned %d (EOF or error)\n", rv);
+            return rv;
+        }
+        if (b->core.tid == -1 || b->core.flag & BAM_FUNMAP) {
+            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping unmapped read (tid == -1 or BAM_FUNMAP)\n");
+            continue; // Unmapped
+        }
+        if (b->core.qual < ldata->targ->min_mapq) {
+            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping read with low mapping quality (%d < %d)\n", b->core.qual, ldata->targ->min_mapq);
+            continue; //-q
+        }
+        if (b->core.flag & (BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY)) {
+            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping read with flag 0xF00 (secondary, QC fail, duplicate, supplementary)\n");
+            continue; // By default: secondary alignments, QC failed, PCR duplicates, and supplemental alignments
+        }
+        if (b->core.flag & BAM_FDUP) {
+            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping duplicate read (BAM_FDUP)\n");
+            continue;
+        }
+        p = bam_aux_get(b, "NH");
+        if (p) {
+            int NH = bam_aux2i(p);
+            if (NH > 1) {
+                //fprintf(stderr, "[DEBUG] mplp_fetch: skipping multi-mapper (NH=%d)\n", NH);
+                continue; // Ignore obvious multimappers
+            }
+        }
+        if ((b->core.flag & (BAM_FPAIRED | BAM_FMUNMAP)) == (BAM_FPAIRED | BAM_FMUNMAP)) {
+            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping singleton (flag & (BAM_FPAIRED | BAM_FMUNMAP) == (BAM_FPAIRED | BAM_FMUNMAP))\n");
+            continue; // Singleton
+        }
+        if ((b->core.flag & (BAM_FPAIRED | BAM_FPROPER_PAIR)) == BAM_FPAIRED) {
+            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping discordant (flag & (BAM_FPAIRED | BAM_FMUNMAP) == BAM_FPAIRED)\n");
+            continue; // Discordant
+        }
+        if ((b->core.flag & (BAM_FPAIRED | BAM_FMUNMAP)) == BAM_FPAIRED) {
+            //fprintf(stderr, "[DEBUG] mplp_fetch: marking discordant pair as proper (flag & (BAM_FPAIRED | BAM_FMUNMAP) == BAM_FPAIRED)\n");
+            b->core.flag |= BAM_FPROPER_PAIR; // Discordant pairs can cause double counts
+        }
+        // If we reach here, the read passed all filters
+        //fprintf(stderr, "[DEBUG] mplp_fetch: read passed all filters (qname=%s, tid=%d, pos=%ld, flag=0x%x)\n", bam_get_qname(b), b->core.tid, (long)b->core.pos, b->core.flag);
+        break;
+    }
+    return rv;
+}
+
 void *process_chromosome_region(void *arg)
 {
     ThreadArg *targ = (ThreadArg *)arg;
-    // fprintf(stderr, "Thread %s:%u-%u: Starting processing\n", targ->chr, targ->start_pos, targ->end_pos);
     samFile *in = sam_open(targ->bam_file, "r");
     if (!in)
     {
         fprintf(stderr, "Thread %s:%u-%u: Failed to open BAM file\n", targ->chr, targ->start_pos, targ->end_pos);
         return NULL;
     }
-    // fprintf(stderr, "Thread %s:%u-%u: BAM file opened\n", targ->chr, targ->start_pos, targ->end_pos);
     bam_hdr_t *header = sam_hdr_read(in);
     hts_idx_t *idx = sam_index_load(in, targ->bam_file);
     hts_itr_t *iter = sam_itr_queryi(idx, targ->tid, targ->start_pos, targ->end_pos);
@@ -676,173 +773,93 @@ void *process_chromosome_region(void *arg)
         sam_close(in);
         return NULL;
     }
-    // fprintf(stderr, "Thread %s:%u-%u: Iterator created, starting read loop\n", targ->chr, targ->start_pos, targ->end_pos);
+
+    mplp_data_t *mplp_data = malloc(sizeof(mplp_data_t));
+    mplp_data->targ = targ;
+    mplp_data->in = in;
+    mplp_data->iter = iter;
+    mplp_data->hdr = header;
+
+    bam_mplp_t mplp = bam_mplp_init(1, mplp_fetch, (void **)&mplp_data);
 
     bam1_t *b = bam_init1();
-    int read_count = 0;
-    while (sam_itr_next(in, iter, b) >= 0)
+    int tid, n_plp;
+    hts_pos_t pos;
+    const bam_pileup1_t *pileup;
+
+    while (bam_mplp64_auto(mplp, &tid, &pos, &n_plp, &pileup) > 0)
     {
-        read_count++;
-        // Print '+' to stderr for every 10000 reads as a simple progress bar
-        if (read_count % 10000 == 0)
-            fprintf(stderr, "+");
-
-        if (b->core.flag & DEFAULT_FLAGS || b->core.qual < targ->min_mapq)
+        if (tid != targ->tid) 
+            continue;
+        if (pos < targ->start_pos || pos >= targ->end_pos)
             continue;
 
-        uint8_t *seq = bam_get_seq(b);
-        uint8_t *qual = bam_get_qual(b);
-
-        // Calculate strand for the current read once before processing CIGAR operations
-        int strand = getRealStrand(b);
-        if (strand == 0)
+        uint64_t key = ((uint64_t)targ->tid << 32) | pos;
+        khint_t iter_kh = kh_get(pos, targ->pos_map, key);
+        if (iter_kh == kh_end(targ->pos_map))
             continue;
-        //char cstrand = (strand == 1 || strand == 3) ? '+' : '-';
 
-        uint32_t *cigar = bam_get_cigar(b);
-        uint32_t pos = b->core.pos;
-        int seq_idx = 0;
+        char ref_base = toupper(targ->chr_seq[pos]);
+        if (ref_base != 'C' && ref_base != 'G')
+            continue; // Only process C or G reference sites
 
-        for (int i = 0; i < b->core.n_cigar; i++)
+        size_t idx = kh_val(targ->pos_map, iter_kh);
+        for (int i = 0; i < n_plp; i++)
         {
-            int op = bam_cigar_op(cigar[i]);
-            int len = bam_cigar_oplen(cigar[i]);
+            const bam_pileup1_t *p = &pileup[i];
+            if (p->is_del || p->is_refskip)
+                continue;
 
-            if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF)
+            b = p->b;
+            // Ignore low mapping quality reads
+            if (b->core.qual < targ->min_mapq)
+                continue;
+
+            // Ignore reads with default flags
+            if (b->core.flag & DEFAULT_FLAGS)
+                continue;
+
+            int strand = getRealStrand(b);
+            if (strand == 0)
+                continue;   // Strand not determined
+
+            int seq_idx = p->qpos;
+            uint8_t *seq = bam_get_seq(b);
+            uint8_t *qual = bam_get_qual(b);
+
+            // Ignore low quality bases
+            if (qual[seq_idx] < targ->min_phred)
+                continue;
+
+            int base = bam_seqi(seq, seq_idx);
+
+            pthread_mutex_lock(targ->buffer_mutex);
+
+            // Now, apply MethylDackel's logic:
+            // CpG
+            if ((ref_base == 'C') && (strand == 1 || strand == 3)) 
             {
-                for (int k = 0; k < len; k++)
-                {
-                    uint32_t refpos = pos + k;
-                    if (refpos < targ->start_pos || refpos >= targ->end_pos)
-                    {
-                        seq_idx++;
-                        continue;
-                    }
-
-                    // Check quality score
-                    if (qual[seq_idx] < targ->min_phred)
-                    {
-                        // fprintf(
-                        //     stderr,
-                        //     "Debug: Low quality score %d at chr %s:%u, seq_idx %d, skipping\n",
-                        //     qual[seq_idx],
-                        //     targ->chr,
-                        //     refpos + 1,
-                        //     seq_idx
-                        // );
-                        seq_idx++;
-                        continue;
-                    }
-
-                    // Validate reference base
-                    // char cbase = toupper(targ->chr_seq[refpos]);
-                    int base = bam_seqi(seq, seq_idx);
-
-                    // if (((base == 2) && (cbase != 'C')) || ((base == 8) && (cbase != 'G')))
-                    // //if ((cstrand == '+' && cbase != 'C') || (cstrand == '-' && cbase != 'G'))
-                    // {
-                    //     // fprintf(
-                    //     //     stderr, 
-                    //     //     "Debug: Invalid reference base %c at chr %s:%u, strand %c, skipping\n", 
-                    //     //     ref_base, 
-                    //     //     targ->chr, 
-                    //     //     refpos + 1, 
-                    //     //     cstrand
-                    //     // );
-                    //     seq_idx++;
-                    //     continue;
-                    // }
-
-                    pthread_mutex_lock(targ->buffer_mutex);
-
-                    if (strand & 1) // Forward strand or cstrand == '+'
-                    {
-                        if (base == 2) // C
-                            targ->buffer[seq_idx].methylated++;
-                        else if (base == 8) // T
-                            targ->buffer[seq_idx].unmethylated++;
-                        else if (base == 3) // N (ambiguous)
-                            // fprintf(
-                            //     stderr,
-                            //     "Debug: Ambiguous base (N) at chr %s:%u, strand +, seq_idx %d, skipping\n",
-                            //     targ->chr,
-                            //     refpos + 1,
-                            //     seq_idx
-                            // )
-                            ;
-                        else
-                            // fprintf(
-                            //     stderr,
-                            //     "Debug: Unexpected base (%d) at chr %s:%u, strand +, seq_idx %d, quality %d, skipping\n",
-                            //     base,
-                            //     targ->chr,
-                            //     refpos + 1,
-                            //     seq_idx,
-                            //     qual[seq_idx]
-                            // )
-                            ;
-                    }
-                    else // Reverse strand or cstrand == '-'
-                    {
-                        if (base == 4) // G
-                            targ->buffer[seq_idx].methylated++;
-                        else if (base == 1) // A
-                            targ->buffer[seq_idx].unmethylated++;
-                        else if (base == 3) // N (ambiguous)
-                            // fprintf(
-                            //     stderr,
-                            //     "Debug: Ambiguous base (N) at chr %s:%u, strand -, seq_idx %d, skipping\n", 
-                            //     targ->chr, 
-                            //     refpos + 1, 
-                            //     seq_idx
-                            // )
-                            ;
-                        else
-                            // fprintf(
-                            //     stderr,
-                            //     "Debug: Unexpected base (%d) at chr %s:%u, strand -, seq_idx %d, quality %d, skipping\n", 
-                            //     base, 
-                            //     targ->chr, 
-                            //     refpos + 1, 
-                            //     seq_idx, 
-                            //     qual[seq_idx]
-                            // )
-                            ;
-                    }
-
-                    pthread_mutex_unlock(targ->buffer_mutex);
-                    seq_idx++;
-                }
-                pos += len;
-            }
-            else if (op == BAM_CINS || op == BAM_CSOFT_CLIP)
-                seq_idx += len;
-            else if (op == BAM_CDEL || op == BAM_CREF_SKIP)
-                pos += len;
-            else if (op == BAM_CHARD_CLIP)
+                if (base == 2) // G
+                    targ->buffer[idx].methylated++;
+                else if (base == 8) // T
+                    targ->buffer[idx].unmethylated++;
+            } 
+            else if ((ref_base == 'G') && (strand == 2 || strand == 4)) 
             {
-                // HARD_CLIP does not consume sequence or reference, no increment needed
+                if (base == 4) // C
+                    targ->buffer[idx].methylated++;
+                else if (base == 1) // A
+                    targ->buffer[idx].unmethylated++;
             }
-            else
-            {
-                // fprintf(
-                //     stderr, 
-                //     "Debug: Unhandled CIGAR op %d at chr %s, read %s, seq_idx %d\n",
-                //     op, 
-                //     targ->chr, 
-                //     bam_get_qname(b), 
-                //     seq_idx
-                // );
-            }
+            // Otherwise, ignore
+            pthread_mutex_unlock(targ->buffer_mutex);
         }
     }
-
     bam_destroy1(b);
     hts_itr_destroy(iter);
     hts_idx_destroy(idx);
     sam_hdr_destroy(header);
     sam_close(in);
-    // fprintf(stderr, "Thread %s:%u-%u: Completed and resources cleaned up\n", targ->chr, targ->start_pos, targ->end_pos);
     return NULL;
 }
 
@@ -1033,11 +1050,11 @@ static inline void decode_trinucleotide(uint8_t tnc, char *trinucl)
 static inline const char *get_context_string(int context, char strand)
 {
     if (context == CONTEXT_CPG)
-        return strand == '+' ? "CpG" : "GpC";
+        return "CG"; //strand == '+' ? "CpG" : "GpC";
     else if (context == CONTEXT_CHG)
-        return strand == '+' ? "CHG" : "GHC";
+        return "CHG"; //strand == '+' ? "CHG" : "GHC";
     else if (context == CONTEXT_CHH)
-        return strand == '+' ? "CHH" : "GHH";
+        return "CHH"; //strand == '+' ? "CHH" : "GHH";
     return "???";
 }
 
