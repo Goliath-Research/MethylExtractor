@@ -16,7 +16,7 @@
 
 #define DEFAULT_MAX_CHR 24
 #define DEFAULT_HDF5_COMPRESSION 6
-#define DEFAULT_HDF5_CHUNK_SIZE 10000
+#define DEFAULT_HDF5_CHUNK_SIZE 1000000
 #define DEFAULT_THREADS 16
 #define DEFAULT_CHUNK_SIZE 1000000
 #define DEFAULT_MIN_MAPQ 30
@@ -117,16 +117,6 @@ static const char *get_std_chr_name(const char *chr)
             return valid_chromosomes[i];
     }
     return NULL;
-}
-
-static const char *get_bam_chr_name(const char *chr)
-{
-    static char bam_chr[16];
-    const char *std_name = get_std_chr_name(chr);
-    if (std_name == NULL)
-        return NULL;
-    snprintf(bam_chr, sizeof(bam_chr), "chr%s", std_name);
-    return bam_chr;
 }
 
 int is_valid_chromosome(const char *chr)
@@ -996,7 +986,7 @@ void process_chromosome(ThreadArg *targ)
         sizeof(out_path),
         "%s/%s.h5",
         targ->out_dir,
-        get_std_chr_name(targ->chr));
+        targ->chr);
     flush_buffer_to_hdf5(
         out_path,
         buffer,
@@ -1294,26 +1284,31 @@ int main(int argc, char *argv[])
         if (!std_chr)
             continue;
 
-        int seq_len;
+        int seq_len = 0;
         char *seq = NULL;
 
+        // Try normalized name first
         seq = faidx_fetch_seq(fai, std_chr, 0, header->target_len[tid], &seq_len);
 
-        if (!seq || seq_len <= 0)
-        {
-            const char *bam_chr = get_bam_chr_name(std_chr);
-            if (bam_chr)
-            {
-                if (seq)
-                    free(seq);
-                seq = faidx_fetch_seq(fai, bam_chr, 0, header->target_len[tid], &seq_len);
-            }
+        // If not found, try with 'chr' prefix
+        if (!seq || seq_len <= 0) {
+            char chr_name[32];
+            snprintf(chr_name, sizeof(chr_name), "chr%s", std_chr);
+            if (seq) free(seq);
+            seq = faidx_fetch_seq(fai, chr_name, 0, header->target_len[tid], &seq_len);
+        }
+
+        // If still not found, try the reverse (in case std_chr already has 'chr' prefix)
+        if ((!seq || seq_len <= 0) && strncmp(std_chr, "chr", 3) == 0) {
+            const char *nochr = std_chr + 3;
+            if (seq) free(seq);
+            seq = faidx_fetch_seq(fai, nochr, 0, header->target_len[tid], &seq_len);
         }
 
         if (!seq || seq_len <= 0)
         {
-            fprintf(stderr, "Failed to fetch sequence for %s (tried both %s and chr%s)\n",
-                    chr, std_chr, std_chr);
+            fprintf(stderr, "Failed to fetch sequence for %s (tried %s, chr%s, and possibly %s)\n",
+                    chr, std_chr, std_chr, (strncmp(std_chr, "chr", 3) == 0 ? std_chr + 3 : "N/A"));
             if (seq)
                 free(seq);
             continue;
@@ -1322,7 +1317,7 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].bam_file = bam_file;
         thread_args[valid_chr_count].out_dir = out_dir;
         thread_args[valid_chr_count].tid = tid;
-        thread_args[valid_chr_count].chr = chr;
+        thread_args[valid_chr_count].chr = std_chr;
         thread_args[valid_chr_count].chr_len = header->target_len[tid];
         thread_args[valid_chr_count].min_mapq = min_mapq;
         thread_args[valid_chr_count].min_phred = min_phred;
