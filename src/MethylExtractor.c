@@ -38,6 +38,10 @@
 #define CONTEXT_MASK 0x03
 #define MAX_CHR_NAME 2
 #define MAX_REGIONS_PER_CHR 8
+#define TNC_MASK 0x1F
+#define STRAND_BITS_MASK 0x60
+#define SIGN_MASK 0x80
+
 
 // Hash table for position-to-buffer-index mapping
 KHASH_MAP_INIT_INT64(pos, size_t)
@@ -46,15 +50,22 @@ KHASH_SET_INIT_STR(str)
 // Function prototypes
 static inline char decode_nucleotide(uint8_t n);
 static inline void decode_trinucleotide(uint8_t tnc, char *trinucl);
-static inline const char *get_context_string(int context, char strand);
+static inline const char *get_context_string(int context);
+
+typedef struct 
+{
+    unsigned tnc     : 5;
+    unsigned context : 2;
+    unsigned strand  : 1;
+} tnc_bitfield_t;
 
 typedef struct
 {
-    uint32_t position;
-    uint32_t methylated;
-    uint32_t unmethylated;
-    int8_t strand_ctx;
-    uint8_t tnc; // Now stores MethylDackel-style TNC index (0-24)
+    uint32_t pos;
+    uint16_t mC;
+    uint16_t uC;
+    tnc_bitfield_t tnc; // Now stores strand + context + TNC as bitfield
+    uint8_t _pad[1]; // explicit padding for alignment
 } MethylRecord;
 
 typedef struct
@@ -322,15 +333,17 @@ void initialize_buffer(MethylRecord *buffer, size_t site_count, const char *chr_
     for (uint32_t pos = 0; pos < chr_len && idx < site_count; pos++)
     {
         int8_t strand_ctx;
-        uint8_t tnc;
-        int ctx = get_context(chr_seq, chr_len, pos, &strand_ctx, &tnc, keep_chg, keep_chh);
+        uint8_t tnc_val;
+        int ctx = get_context(chr_seq, chr_len, pos, &strand_ctx, &tnc_val, keep_chg, keep_chh);
         if (ctx)
         {
-            buffer[idx].position = pos + 1;
-            buffer[idx].methylated = 0;
-            buffer[idx].unmethylated = 0;
-            buffer[idx].strand_ctx = strand_ctx;
-            buffer[idx].tnc = tnc;
+            char strand = (strand_ctx > 0) ? '+' : '-';
+            buffer[idx].pos = pos + 1;
+            buffer[idx].mC = 0;
+            buffer[idx].uC = 0;
+            buffer[idx].tnc.tnc = tnc_val;
+            buffer[idx].tnc.context = ctx;
+            buffer[idx].tnc.strand = (strand == '+') ? 0 : 1;
             idx++;
         }
     }
@@ -342,9 +355,9 @@ size_t find_buffer_index(MethylRecord *buffer, size_t offset, size_t size, uint3
     while (left <= right)
     {
         size_t mid = left + (right - left) / 2;
-        if (buffer[mid].position == pos + 1)
+        if (buffer[mid].pos == pos + 1)
             return mid;
-        if (buffer[mid].position < pos + 1)
+        if (buffer[mid].pos < pos + 1)
             left = mid + 1;
         else
             right = mid - 1;
@@ -369,12 +382,13 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
     herr_t status = -1;
     size_t records_written = 0;
     type = H5Tcreate(H5T_COMPOUND, sizeof(MethylRecord));
-    H5Tinsert(type, "position", HOFFSET(MethylRecord, position), H5T_NATIVE_UINT32);
-    H5Tinsert(type, "methylated", HOFFSET(MethylRecord, methylated), H5T_NATIVE_UINT32);
-    H5Tinsert(type, "unmethylated", HOFFSET(MethylRecord, unmethylated), H5T_NATIVE_UINT32);
-    H5Tinsert(type, "strand_ctx", HOFFSET(MethylRecord, strand_ctx), H5T_NATIVE_INT8);
+    H5Tinsert(type, "pos", HOFFSET(MethylRecord, pos), H5T_NATIVE_UINT32);
+    H5Tinsert(type, "mC", HOFFSET(MethylRecord, mC), H5T_NATIVE_UINT16);
+    H5Tinsert(type, "uC", HOFFSET(MethylRecord, uC), H5T_NATIVE_UINT16);
     H5Tinsert(type, "tnc", HOFFSET(MethylRecord, tnc), H5T_NATIVE_UINT8);
-    file = append_mode ? H5Fopen(filename, H5F_ACC_RDWR, H5P_DEFAULT) : H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    file = append_mode ? 
+        H5Fopen(filename, H5F_ACC_RDWR, H5P_DEFAULT) : 
+        H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
     if (file < 0)
     {
         fprintf(stderr, "Failed to %s HDF5 file: %s\n", append_mode ? "open" : "create", filename);
@@ -383,14 +397,21 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
     hsize_t dims[1] = {0};
     FILE *debug_fp = NULL;
 
+    // Calculate the number of records to write (filtered by coverage and methylation level)
+    // and the average coverage
+    double avg_cov = 0.0;
     for (size_t i = 0; i < n_records; i++)
     {
-        int total = buffer[i].methylated + buffer[i].unmethylated;
-        if (total >= min_cov && total <= max_cov)
+        int total = buffer[i].mC + buffer[i].uC;
+        if (total >= min_cov)
         {
-            double meth_level = total > 0 ? 100.0 * ((double)buffer[i].methylated / total) : 0.0;
+            double meth_level = total > 0 ? 100.0 * ((double)buffer[i].mC / total) : 0.0;
             if (meth_level >= min_meth && meth_level <= max_meth)
+            {
                 dims[0]++;
+                // Online mean update using dims[0] as valid_count
+                avg_cov += ((double)total - avg_cov) / dims[0];
+            }
         }
     }
 
@@ -439,36 +460,40 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         goto cleanup;
     }
 
+    // Cap coverage using avg_cov
     size_t j = 0;
-
     for (size_t i = 0; i < n_records; i++)
     {
-        int total = buffer[i].methylated + buffer[i].unmethylated;
-        if (total >= min_cov && total <= max_cov)
+        int total = buffer[i].mC + buffer[i].uC;
+        if (total >= min_cov)
         {
-            double meth_level = total > 0 ? 100.0 * ((double)buffer[i].methylated / total) : 0.0;
+            double meth_level = total > 0 ? 100.0 * ((double)buffer[i].mC / total) : 0.0;
             if (meth_level >= min_meth && meth_level <= max_meth)
             {
-                if (j >= dims[0])
+                // Cap coverage using avg_cov
+                if (total > avg_cov)
                 {
-                    fprintf(stderr, "Error: Attempting to write beyond allocated filtered_buffer size at index %zu\n", j);
-                    break;
+                    double prop = (double)buffer[i].mC / total;
+                    buffer[i].mC = (uint16_t)round((avg_cov * prop));
+                    buffer[i].uC = (uint16_t)(avg_cov - buffer[i].mC);
                 }
+
                 filtered_buffer[j++] = buffer[i];
 
                 if (debug_fp)
                 {
                     char tnc_str[4];
-                    decode_trinucleotide(buffer[i].tnc, tnc_str);
-                    char strand = buffer[i].strand_ctx > 0 ? '+' : '-';
+                    decode_trinucleotide(buffer[i].tnc.tnc, tnc_str);
+                    char strand = buffer[i].tnc.strand ? '-' : '+';
+                    int context = buffer[i].tnc.context;
                     fprintf(
                         debug_fp,
                         "%u\t%c\t%u\t%u\t%s\t%s\n",
-                        buffer[i].position,
+                        buffer[i].pos,
                         strand,
-                        buffer[i].methylated,
-                        buffer[i].unmethylated,
-                        get_context_string(abs(buffer[i].strand_ctx), strand),
+                        buffer[i].mC,
+                        buffer[i].uC,
+                        get_context_string(context),
                         tnc_str);
                 }
             }
@@ -566,12 +591,13 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
     if (file >= 0)
         H5Fflush(file, H5F_SCOPE_GLOBAL);
     records_written = dims[0];
+    // Add time logging
     time(&rawtime);
     timeinfo = localtime(&rawtime);
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
     fprintf(
         stderr,
-        "\n[%s] Finished writing HDF5 file: %s, wrote %llu filtered records\n",
+        "[%s] Finished writing HDF5 file: %s, wrote %llu filtered records\n",
         time_str,
         filename,
         (unsigned long long)dims[0]);
@@ -830,16 +856,16 @@ void *process_chromosome_region(void *arg)
             if ((ref_base == 'C') && (strand == 1 || strand == 3)) 
             {
                 if (base == 2) // G
-                    targ->buffer[idx].methylated++;
+                    targ->buffer[idx].mC++;
                 else if (base == 8) // T
-                    targ->buffer[idx].unmethylated++;
+                    targ->buffer[idx].uC++;
             } 
             else if ((ref_base == 'G') && (strand == 2 || strand == 4)) 
             {
                 if (base == 4) // C
-                    targ->buffer[idx].methylated++;
+                    targ->buffer[idx].mC++;
                 else if (base == 1) // A
-                    targ->buffer[idx].unmethylated++;
+                    targ->buffer[idx].uC++;
             }
             // Otherwise, ignore
             pthread_mutex_unlock(targ->buffer_mutex);
@@ -867,7 +893,7 @@ void process_chromosome(ThreadArg *targ)
     khash_t(pos) *pos_map = kh_init(pos);
     for (size_t i = 0; i < site_count; i++)
     {
-        uint64_t key = ((uint64_t)targ->tid << 32) | (buffer[i].position - 1);
+        uint64_t key = ((uint64_t)targ->tid << 32) | (buffer[i].pos - 1);
         int ret;
         khint_t iter = kh_put(pos, pos_map, key, &ret);
         kh_val(pos_map, iter) = i;
@@ -907,9 +933,9 @@ void process_chromosome(ThreadArg *targ)
         if (end_pos > targ->chr_len)
             end_pos = targ->chr_len;
 
-        if (i > 0 && buffer[region_args[i].buffer_offset].position > 0)
+        if (i > 0 && buffer[region_args[i].buffer_offset].pos > 0)
         {
-            uint32_t buffer_start = buffer[region_args[i].buffer_offset].position - 1;
+            uint32_t buffer_start = buffer[region_args[i].buffer_offset].pos - 1;
             if (buffer_start < end_pos)
                 start_pos = buffer_start;
         }
@@ -1037,14 +1063,14 @@ static inline void decode_trinucleotide(uint8_t tnc, char *trinucl)
     trinucl[3] = '\0';
 }
 
-static inline const char *get_context_string(int context, char strand)
+static inline const char *get_context_string(int context)
 {
     if (context == CONTEXT_CPG)
-        return "CG"; //strand == '+' ? "CpG" : "GpC";
+        return "CG";
     else if (context == CONTEXT_CHG)
-        return "CHG"; //strand == '+' ? "CHG" : "GHC";
+        return "CHG";
     else if (context == CONTEXT_CHH)
-        return "CHH"; //strand == '+' ? "CHH" : "GHH";
+        return "CHH";
     return "???";
 }
 
@@ -1055,7 +1081,18 @@ int main(int argc, char *argv[])
     {
         fprintf(stderr, "  Arg %d: %s\n", i, argv[i]);
     }
-    fprintf(stderr, "Starting processing...\n");
+
+    // Add time logging
+    time_t rawtime;
+    struct tm * timeinfo;
+    char time_str[80];
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+    fprintf(
+        stderr,
+        "\n[%s] Starting processing...\n",
+        time_str);
 
     int max_chr = DEFAULT_MAX_CHR;
     int hdf5_compression = DEFAULT_HDF5_COMPRESSION;
@@ -1391,6 +1428,14 @@ int main(int argc, char *argv[])
     free(thread_args);
     sam_hdr_destroy(header);
     fai_destroy(fai);
-    fprintf(stderr, "\nProcessing complete. MethylExtractor has finished.\n");
+
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+    fprintf(
+        stderr,
+        "\n[%s] Processing complete. MethylExtractor has finished.\n",
+        time_str);
+        
     return 0;
 }
