@@ -94,6 +94,7 @@ typedef struct
     size_t buffer_size;
     pthread_mutex_t *buffer_mutex;
     int debug_output;
+    int split_context_files;
     khash_t(pos) * pos_map;
     uint8_t *tnc_array; // New: TriNucleotideContexts[25] array
 } ThreadArg;
@@ -1047,25 +1048,68 @@ void process_chromosome(ThreadArg *targ)
     free(joined);
     pthread_mutex_destroy(&buffer_mutex);
 
-    char out_path[1024];
-    snprintf(
-        out_path,
-        sizeof(out_path),
-        "%s/%s.h5",
-        targ->out_dir,
-        targ->chr);
-    flush_buffer_to_hdf5(
-        out_path,
-        buffer,
-        site_count,
-        targ->hdf5_compression,
-        targ->hdf5_chunk_size,
-        0,
-        targ->min_cov,
-        targ->cap_cov,
-        targ->min_meth,
-        targ->max_meth,
-        targ->debug_output);
+    if (targ->split_context_files) 
+    {
+        for (int ctx = CONTEXT_CPG; ctx <= CONTEXT_CHH; ++ctx) 
+        {
+            if ((ctx == CONTEXT_CPG) ||
+                (ctx == CONTEXT_CHG && targ->keep_chg) ||
+                (ctx == CONTEXT_CHH && targ->keep_chh)) 
+            {
+
+                // Filter buffer for this context
+                size_t n_ctx_records = 0;
+                for (size_t i = 0; i < site_count; ++i)
+                    if (buffer[i].tnc.context == ctx)
+                        n_ctx_records++;
+
+                if (n_ctx_records == 0)
+                    continue;
+
+                MethylRecord *ctx_buffer = malloc(n_ctx_records * sizeof(MethylRecord));
+                size_t j = 0;
+                for (size_t i = 0; i < site_count; ++i)
+                    if (buffer[i].tnc.context == ctx)
+                        ctx_buffer[j++] = buffer[i];
+
+                // Output file name
+                char out_path[1024];
+                snprintf(out_path, sizeof(out_path), "%s/%s-%s.h5", targ->out_dir, targ->chr, get_context_string(ctx));
+                flush_buffer_to_hdf5(
+                    out_path,
+                    ctx_buffer,
+                    n_ctx_records,
+                    targ->hdf5_compression,
+                    targ->hdf5_chunk_size,
+                    0,
+                    targ->min_cov,
+                    targ->cap_cov,
+                    targ->min_meth,
+                    targ->max_meth,
+                    targ->debug_output);
+
+                free(ctx_buffer);
+            }
+        }
+    } 
+    else 
+    {
+        // Existing logic: write all contexts to one file
+        char out_path[1024];
+        snprintf(out_path, sizeof(out_path), "%s/%s.h5", targ->out_dir, targ->chr);
+        flush_buffer_to_hdf5(
+            out_path,
+            buffer,
+            site_count,
+            targ->hdf5_compression,
+            targ->hdf5_chunk_size,
+            0,
+            targ->min_cov,
+            targ->cap_cov,
+            targ->min_meth,
+            targ->max_meth,
+            targ->debug_output);
+    }
 
     kh_destroy(pos, pos_map);
     free(buffer);
@@ -1111,6 +1155,7 @@ int main(int argc, char *argv[])
     int max_meth = DEFAULT_MAX_METH;
     int debug_output = 0;
     const char *out_dir = NULL;
+    int split_context_files = 0;
     struct option long_options[] = {
         {"max-chr", required_argument, 0, 'n'},
         {"o", required_argument, 0, 'o'},
@@ -1127,9 +1172,10 @@ int main(int argc, char *argv[])
         {"l", required_argument, 0, 'l'},
         {"L", required_argument, 0, 'L'},
         {"debug", no_argument, 0, 'd'},
+        {"split-context-files", no_argument, 0, 'S'},
         {0, 0, 0, 0}};
     int opt;
-    while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:Nl:L:d", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:Nl:L:dS", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -1223,6 +1269,9 @@ int main(int argc, char *argv[])
         case 'd':
             debug_output = 1;
             break;
+        case 'S':
+            split_context_files = 1;
+            break;
         case '?':
         default:
             fprintf(stderr, "Usage: %s [options] <ref.fa> <sorted_alignments.bam>\n", argv[0]);
@@ -1242,6 +1291,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "  --l INT                  Minimum methylation level (default: %d)\n", DEFAULT_MIN_METH);
             fprintf(stderr, "  --L INT                  Maximum methylation level (default: %d)\n", DEFAULT_MAX_METH);
             fprintf(stderr, "  --debug                  Enable debug output (.txt files)\n");
+            fprintf(stderr, "  --split-context-files     Output separate files for each context (CG, CHG, CHH)\n");
             return 1;
         }
     }
@@ -1356,6 +1406,7 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].chunk_size = chunk_size;
         thread_args[valid_chr_count].chr_seq = seq;
         thread_args[valid_chr_count].debug_output = debug_output;
+        thread_args[valid_chr_count].split_context_files = split_context_files;
         valid_chr_count++;
     }
     pthread_t *threads = malloc(valid_chr_count * sizeof(pthread_t));
