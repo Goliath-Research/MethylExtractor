@@ -22,7 +22,7 @@
 #define DEFAULT_MIN_MAPQ 30
 #define DEFAULT_MIN_PHRED 20
 #define DEFAULT_MIN_COV 4
-#define DEFAULT_MAX_COV 100
+#define DEFAULT_CAP_COVERAGE 1
 #define DEFAULT_MIN_METH 0
 #define DEFAULT_MAX_METH 100
 #define DEFAULT_FLAGS (BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY)
@@ -42,13 +42,11 @@
 #define STRAND_BITS_MASK 0x60
 #define SIGN_MASK 0x80
 
-
 // Hash table for position-to-buffer-index mapping
 KHASH_MAP_INIT_INT64(pos, size_t)
 KHASH_SET_INIT_STR(str)
 
 // Function prototypes
-static inline char decode_nucleotide(uint8_t n);
 static inline void decode_trinucleotide(uint8_t tnc, char *trinucl);
 static inline const char *get_context_string(int context);
 
@@ -79,7 +77,7 @@ typedef struct
     int min_mapq;
     int min_phred;
     int min_cov;
-    int max_cov;
+    int cap_cov;
     int min_meth;
     int max_meth;
     int keep_chg;
@@ -158,6 +156,45 @@ static inline uint8_t encode_nucleotide(char n)
     default:
         return TNC_N;
     }
+}
+
+static inline char decode_nucleotide(uint8_t n)
+{
+    switch (n)
+    {
+    case TNC_A:
+        return 'A';
+    case TNC_C:
+        return 'C';
+    case TNC_G:
+        return 'G';
+    case TNC_T:
+        return 'T';
+    default:
+        return 'N';
+    }
+}
+
+static inline void decode_trinucleotide(uint8_t tnc, char *trinucl)
+{
+    // Decode MethylDackel-style TNC index (0-24) to first and second bases (middle base not stored)
+    uint8_t n2 = (tnc / 5) % 4; // Middle base index
+    uint8_t n3 = tnc % 5;       // Last base index
+    trinucl[0] = 'C';           // Central base is always C in MethylDackel naming
+    trinucl[1] = decode_nucleotide(n2);
+    trinucl[2] = decode_nucleotide(n3);
+    trinucl[3] = '\0';
+}
+
+static inline const char *get_context_string(int context)
+{
+    if (context == CONTEXT_CPG)
+        return "CG";
+    else if (context == CONTEXT_CHG)
+        return "CHG";
+    else if (context == CONTEXT_CHH)
+        return "CHH";
+    return "???";
 }
 
 static inline uint8_t encode_trinucleotide_context(const char *chr_seq, int pos, int chr_len, char strand)
@@ -367,7 +404,7 @@ size_t find_buffer_index(MethylRecord *buffer, size_t offset, size_t size, uint3
 
 size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n_records,
                             int compression, int chunk_size, int append_mode,
-                            int min_cov, int max_cov, int min_meth, int max_meth,
+                            int min_cov, int cap_cov, int min_meth, int max_meth,
                             int debug_output)
 {
     // Add time logging
@@ -470,8 +507,8 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
             double meth_level = total > 0 ? 100.0 * ((double)buffer[i].mC / total) : 0.0;
             if (meth_level >= min_meth && meth_level <= max_meth)
             {
-                // Cap coverage using avg_cov
-                if (total > avg_cov)
+                // Only cap coverage if enabled
+                if (cap_cov && total > avg_cov)
                 {
                     double prop = (double)buffer[i].mC / total;
                     buffer[i].mC = (uint16_t)round((avg_cov * prop));
@@ -1021,7 +1058,7 @@ void process_chromosome(ThreadArg *targ)
         targ->hdf5_chunk_size,
         0,
         targ->min_cov,
-        targ->max_cov,
+        targ->cap_cov,
         targ->min_meth,
         targ->max_meth,
         targ->debug_output);
@@ -1033,45 +1070,6 @@ void process_chromosome(ThreadArg *targ)
 void cleanup_hdf5(void)
 {
     H5close();
-}
-
-static inline char decode_nucleotide(uint8_t n)
-{
-    switch (n)
-    {
-    case TNC_A:
-        return 'A';
-    case TNC_C:
-        return 'C';
-    case TNC_G:
-        return 'G';
-    case TNC_T:
-        return 'T';
-    default:
-        return 'N';
-    }
-}
-
-static inline void decode_trinucleotide(uint8_t tnc, char *trinucl)
-{
-    // Decode MethylDackel-style TNC index (0-24) to first and second bases (middle base not stored)
-    uint8_t n2 = (tnc / 5) % 4; // Middle base index
-    uint8_t n3 = tnc % 5;       // Last base index
-    trinucl[0] = 'C';           // Central base is always C in MethylDackel naming
-    trinucl[1] = decode_nucleotide(n2);
-    trinucl[2] = decode_nucleotide(n3);
-    trinucl[3] = '\0';
-}
-
-static inline const char *get_context_string(int context)
-{
-    if (context == CONTEXT_CPG)
-        return "CG";
-    else if (context == CONTEXT_CHG)
-        return "CHG";
-    else if (context == CONTEXT_CHH)
-        return "CHH";
-    return "???";
 }
 
 int main(int argc, char *argv[])
@@ -1104,7 +1102,7 @@ int main(int argc, char *argv[])
     int min_mapq = DEFAULT_MIN_MAPQ;
     int min_phred = DEFAULT_MIN_PHRED;
     int min_cov = DEFAULT_MIN_COV;
-    int max_cov = DEFAULT_MAX_COV;
+    int cap_cov = DEFAULT_CAP_COVERAGE;
     int min_meth = DEFAULT_MIN_METH;
     int max_meth = DEFAULT_MAX_METH;
     int debug_output = 0;
@@ -1121,13 +1119,13 @@ int main(int argc, char *argv[])
         {"q", required_argument, 0, 'q'},
         {"p", required_argument, 0, 'p'},
         {"c", required_argument, 0, 'c'},
-        {"C", required_argument, 0, 'C'},
+        {"no-cap-coverage", no_argument, 0, 'N'},
         {"l", required_argument, 0, 'l'},
         {"L", required_argument, 0, 'L'},
         {"debug", no_argument, 0, 'd'},
         {0, 0, 0, 0}};
     int opt;
-    while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:C:l:L:d", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:Nl:L:d", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -1204,13 +1202,8 @@ int main(int argc, char *argv[])
                 return 1;
             }
             break;
-        case 'C':
-            max_cov = atoi(optarg);
-            if (max_cov < 1)
-            {
-                fprintf(stderr, "Maximum coverage must be positive\n");
-                return 1;
-            }
+        case 'N':
+            cap_cov = 0;
             break;
         case 'l':
             min_meth = atoi(optarg);
@@ -1246,7 +1239,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "  --q INT                  Minimum mapping quality (default: %d)\n", DEFAULT_MIN_MAPQ);
             fprintf(stderr, "  --p INT                  Minimum Phred score (default: %d)\n", DEFAULT_MIN_PHRED);
             fprintf(stderr, "  --c INT                  Minimum coverage (default: %d)\n", DEFAULT_MIN_COV);
-            fprintf(stderr, "  --C INT                  Maximum coverage (default: %d)\n", DEFAULT_MAX_COV);
+            fprintf(stderr, "  --no-cap-coverage        Disable automatic coverage capping\n");
             fprintf(stderr, "  --l INT                  Minimum methylation level (default: %d)\n", DEFAULT_MIN_METH);
             fprintf(stderr, "  --L INT                  Maximum methylation level (default: %d)\n", DEFAULT_MAX_METH);
             fprintf(stderr, "  --debug                  Enable debug output (.txt files)\n");
@@ -1256,11 +1249,6 @@ int main(int argc, char *argv[])
     if (argc - optind < 2)
     {
         fprintf(stderr, "Usage: %s [options] <ref.fa> <sorted_alignments.bam>\n", argv[0]);
-        return 1;
-    }
-    if (min_cov > max_cov)
-    {
-        fprintf(stderr, "Minimum coverage (%d) must not exceed maximum coverage (%d)\n", min_cov, max_cov);
         return 1;
     }
 
@@ -1359,7 +1347,7 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].min_mapq = min_mapq;
         thread_args[valid_chr_count].min_phred = min_phred;
         thread_args[valid_chr_count].min_cov = min_cov;
-        thread_args[valid_chr_count].max_cov = max_cov;
+        thread_args[valid_chr_count].cap_cov = cap_cov;
         thread_args[valid_chr_count].min_meth = min_meth;
         thread_args[valid_chr_count].max_meth = max_meth;
         thread_args[valid_chr_count].keep_chg = keep_chg;
