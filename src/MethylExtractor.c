@@ -46,6 +46,8 @@
 KHASH_MAP_INIT_INT64(pos, size_t)
 KHASH_SET_INIT_STR(str)
 
+#define ZSTD_FILTER 32015  // Zstandard filter ID
+
 // Function prototypes
 static inline void decode_trinucleotide(uint8_t tnc, char *trinucl);
 static inline const char *get_context_string(int context);
@@ -565,14 +567,16 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         fprintf(stderr, "Failed to set chunking\n");
         goto cleanup;
     }
-    if (compression > 0)
+
+    // Set Zstandard compression (level 9 for high compression)
+    unsigned int cd_values[1] = {compression};  // Zstandard compression level
+    status = H5Pset_filter(dcpl, ZSTD_FILTER, H5Z_FLAG_OPTIONAL, 1, cd_values);
+    if (status < 0) 
     {
-        if (H5Pset_deflate(dcpl, compression) < 0)
-        {
-            fprintf(stderr, "Failed to set compression\n");
-            goto cleanup;
-        }
+        fprintf(stderr, "Failed to set Zstandard filter\n");
+        goto cleanup;    
     }
+
     mem_type = H5Tcopy(type);
     if (mem_type < 0)
     {
@@ -1148,11 +1152,6 @@ int main(int argc, char *argv[])
             break;
         case 'z':
             hdf5_compression = atoi(optarg);
-            if (hdf5_compression < 0 || hdf5_compression > 9)
-            {
-                fprintf(stderr, "HDF5 compression level must be 0-9\n");
-                return 1;
-            }
             break;
         case 'k':
             hdf5_chunk_size = atoi(optarg);
