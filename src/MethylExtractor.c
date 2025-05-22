@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <sys/sysinfo.h>
 #include <time.h>
+#include "cjson/cJSON.h"
 
 #define DEFAULT_MAX_CHR 24
 #define DEFAULT_HDF5_COMPRESSION 6
@@ -107,34 +108,12 @@ typedef struct
     ThreadArg *targ;
 } mplp_data_t;
 
-static const char *valid_chromosomes[] = {
-    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-    "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
-    "21", "22", "X", "Y"};
-static const int num_valid_chromosomes = 24;
-
-const char *normalize_chromosome(const char *chr)
-{
-    if (strncmp(chr, "chr", 3) == 0)
-        return chr + 3;
-    return chr;
-}
-
-static const char *get_std_chr_name(const char *chr)
-{
-    const char *norm = normalize_chromosome(chr);
-    for (int i = 0; i < num_valid_chromosomes; i++)
-    {
-        if (strcmp(norm, valid_chromosomes[i]) == 0)
-            return valid_chromosomes[i];
-    }
-    return NULL;
-}
-
-int is_valid_chromosome(const char *chr)
-{
-    return get_std_chr_name(chr) != NULL;
-}
+typedef struct {
+    char fasta[64];
+    char bam[64];
+    char name[64];
+    int extract;
+} ChromMapEntry;
 
 int make_directory(const char *path)
 {
@@ -1120,6 +1099,63 @@ void cleanup_hdf5(void)
     H5close();
 }
 
+int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_entries) 
+{
+    FILE *fp = fopen(filename, "r");
+    if (!fp) 
+        return -1;
+    fseek(fp, 0, SEEK_END);
+    long len = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    char *data = malloc(len + 1);
+    size_t nread = fread(data, 1, len, fp);
+    if (nread != len) {
+        free(data);
+        fclose(fp);
+        return -2; // Error: could not read the expected number of bytes
+    }
+    data[len] = 0;
+    fclose(fp);
+
+    cJSON *json = cJSON_Parse(data);
+    free(data);
+    if (!json) 
+        return -3;
+
+    cJSON *chroms = cJSON_GetObjectItem(json, "chromosomes");
+    if (!chroms || !cJSON_IsArray(chroms)) 
+    {
+        cJSON_Delete(json);
+        return -4;
+    }
+    int count = cJSON_GetArraySize(chroms);
+    *entries = calloc(count, sizeof(ChromMapEntry));
+    *n_entries = 0;
+    for (int i = 0; i < count; ++i) 
+    {
+        cJSON *item = cJSON_GetArrayItem(chroms, i);
+        if (!cJSON_IsObject(item)) 
+            continue;
+        cJSON *extract = cJSON_GetObjectItem(item, "extract");
+        if (!extract || !cJSON_IsBool(extract) || !cJSON_IsTrue(extract)) 
+            continue;
+        ChromMapEntry *e = &(*entries)[*n_entries];
+        cJSON *fasta = cJSON_GetObjectItem(item, "fasta");
+        cJSON *bam = cJSON_GetObjectItem(item, "bam");
+        cJSON *name = cJSON_GetObjectItem(item, "name");
+        if (fasta && cJSON_IsString(fasta)) 
+            strncpy(e->fasta, fasta->valuestring, 63);
+        if (bam && cJSON_IsString(bam)) 
+            strncpy(e->bam, bam->valuestring, 63);
+        if (name && cJSON_IsString(name)) 
+            strncpy(e->name, name->valuestring, 63);
+        e->extract = 1;
+        (*n_entries)++;
+    }
+    cJSON_Delete(json);
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     fprintf(stderr, "Program: MethylExtractor\nParameters:\n");
@@ -1140,7 +1176,6 @@ int main(int argc, char *argv[])
         "\n[%s] Starting processing...\n",
         time_str);
 
-    int max_chr = DEFAULT_MAX_CHR;
     int hdf5_compression = DEFAULT_HDF5_COMPRESSION;
     int hdf5_chunk_size = DEFAULT_HDF5_CHUNK_SIZE;
     uint32_t chunk_size = DEFAULT_CHUNK_SIZE;
@@ -1156,8 +1191,8 @@ int main(int argc, char *argv[])
     int debug_output = 0;
     const char *out_dir = NULL;
     int split_context_files = 0;
+    const char *chrom_mapping_file = NULL;
     struct option long_options[] = {
-        {"max-chr", required_argument, 0, 'n'},
         {"o", required_argument, 0, 'o'},
         {"hdf5-compression", required_argument, 0, 'z'},
         {"hdf5-chunk-size", required_argument, 0, 'k'},
@@ -1173,20 +1208,13 @@ int main(int argc, char *argv[])
         {"L", required_argument, 0, 'L'},
         {"debug", no_argument, 0, 'd'},
         {"split-context-files", no_argument, 0, 'S'},
+        {"chrom-mapping", required_argument, 0, 'M'},
         {0, 0, 0, 0}};
     int opt;
-    while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:Nl:L:dS", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:Nl:L:dS:M:", long_options, NULL)) != -1)
     {
         switch (opt)
         {
-        case 'n':
-            max_chr = atoi(optarg);
-            if (max_chr < 1)
-            {
-                fprintf(stderr, "Maximum chromosomes must be positive\n");
-                return 1;
-            }
-            break;
         case 'G':
             keep_chg = 1;
             break;
@@ -1272,11 +1300,13 @@ int main(int argc, char *argv[])
         case 'S':
             split_context_files = 1;
             break;
+        case 'M':
+            chrom_mapping_file = optarg;
+            break;
         case '?':
         default:
             fprintf(stderr, "Usage: %s [options] <ref.fa> <sorted_alignments.bam>\n", argv[0]);
             fprintf(stderr, "Options:\n");
-            fprintf(stderr, "  --max-chr INT            Maximum number of chromosomes (default: %d)\n", DEFAULT_MAX_CHR);
             fprintf(stderr, "  --o DIR                  Output directory for HDF5 files\n");
             fprintf(stderr, "  --hdf5-compression INT   Compression level (0-9, default: %d)\n", DEFAULT_HDF5_COMPRESSION);
             fprintf(stderr, "  --hdf5-chunk-size INT    Chunk size for HDF5 datasets (default: %d)\n", DEFAULT_HDF5_CHUNK_SIZE);
@@ -1292,6 +1322,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "  --L INT                  Maximum methylation level (default: %d)\n", DEFAULT_MAX_METH);
             fprintf(stderr, "  --debug                  Enable debug output (.txt files)\n");
             fprintf(stderr, "  --split-context-files     Output separate files for each context (CG, CHG, CHH)\n");
+            fprintf(stderr, "  --chrom-mapping FILE      JSON file with chromosome mapping and selection\n");
             return 1;
         }
     }
@@ -1351,47 +1382,37 @@ int main(int argc, char *argv[])
         return 1;
     }
     int valid_chr_count = 0;
-    for (int tid = 0; tid < header->n_targets && valid_chr_count < max_chr; tid++)
+    ChromMapEntry *chroms = NULL;
+    int n_chroms = 0;
+    if (!chrom_mapping_file || load_chrom_mapping(chrom_mapping_file, &chroms, &n_chroms) != 0) 
     {
-        const char *chr = header->target_name[tid];
-        const char *std_chr = get_std_chr_name(chr);
-        if (!std_chr)
-            continue;
-
-        int seq_len = 0;
-        char *seq = NULL;
-
-        // Try normalized name first
-        seq = faidx_fetch_seq(fai, std_chr, 0, header->target_len[tid], &seq_len);
-
-        // If not found, try with 'chr' prefix
-        if (!seq || seq_len <= 0) {
-            char chr_name[32];
-            snprintf(chr_name, sizeof(chr_name), "chr%s", std_chr);
-            if (seq) free(seq);
-            seq = faidx_fetch_seq(fai, chr_name, 0, header->target_len[tid], &seq_len);
-        }
-
-        // If still not found, try the reverse (in case std_chr already has 'chr' prefix)
-        if ((!seq || seq_len <= 0) && strncmp(std_chr, "chr", 3) == 0) {
-            const char *nochr = std_chr + 3;
-            if (seq) free(seq);
-            seq = faidx_fetch_seq(fai, nochr, 0, header->target_len[tid], &seq_len);
-        }
-
-        if (!seq || seq_len <= 0)
+        fprintf(stderr, "Failed to load chromosome mapping from %s\n", chrom_mapping_file);
+        return 1;
+    }
+    for (int i = 0; i < n_chroms; ++i) 
+    {
+        ChromMapEntry *entry = &chroms[i];
+        // Find BAM tid for entry->bam
+        int tid = bam_name2id(header, entry->bam);
+        if (tid < 0) 
         {
-            fprintf(stderr, "Failed to fetch sequence for %s (tried %s, chr%s, and possibly %s)\n",
-                    chr, std_chr, std_chr, (strncmp(std_chr, "chr", 3) == 0 ? std_chr + 3 : "N/A"));
-            if (seq)
-                free(seq);
+            fprintf(stderr, "BAM does not contain chromosome %s\n", entry->bam);
             continue;
         }
-
+        // Fetch sequence for entry->fasta
+        int seq_len = 0;
+        char *seq = faidx_fetch_seq(fai, entry->fasta, 0, header->target_len[tid], &seq_len);
+        if (!seq || seq_len <= 0) 
+        {
+            fprintf(stderr, "Failed to fetch sequence for %s\n", entry->fasta);
+            if (seq) free(seq);
+            continue;
+        }
+        // Set up ThreadArg as before, but use entry->name for output
         thread_args[valid_chr_count].bam_file = bam_file;
         thread_args[valid_chr_count].out_dir = out_dir;
         thread_args[valid_chr_count].tid = tid;
-        thread_args[valid_chr_count].chr = std_chr;
+        thread_args[valid_chr_count].chr = entry->name;
         thread_args[valid_chr_count].chr_len = header->target_len[tid];
         thread_args[valid_chr_count].min_mapq = min_mapq;
         thread_args[valid_chr_count].min_phred = min_phred;
@@ -1409,6 +1430,7 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].split_context_files = split_context_files;
         valid_chr_count++;
     }
+    free(chroms);
     pthread_t *threads = malloc(valid_chr_count * sizeof(pthread_t));
     if (!threads)
     {

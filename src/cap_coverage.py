@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-def cap_coverage(df: pd.DataFrame, target_cov: int = 500, method: str = "median",
+def cap_coverage(df: pd.DataFrame, target_cov: int = 500, method: str = "mean",
                  q: float = 0.5, verbose: bool = True) -> pd.DataFrame:
     """
     Downsample coverage in DataFrame to target level, adjusting mC and uC counts in place.

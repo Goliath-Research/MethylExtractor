@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "methylextractor"
+version = "0.1.0"
+description = "Methylation Extractor is a custom fork of MethylDackel focused on cytosine extraction by chromosome and context with flexible matching between the FASTA reference genome and the BAM file."
+authors = ["David Izada Rodriguez"]
+license = "Copyright by Epimethyl Analytics"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

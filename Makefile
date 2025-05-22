@@ -14,7 +14,7 @@ HTSLIB_LIBS = -lhts
 HDF5_LIBS = -lhdf5 -lhdf5_hl
 
 # Additional libraries for static linking
-STATIC_LIBS = -lz -lm -ldl -lpthread -lbz2 -llzma -lcurl -lcrypto -lssl
+STATIC_LIBS = -lz -lm -ldl -lpthread -lbz2 -llzma -lcurl -lcrypto -lssl -lzstd
 
 # Output directories
 STATIC_DIR = build/static
@@ -35,15 +35,15 @@ debug: $(DEBUG_DIR)/MethylExtractor
 
 $(STATIC_DIR)/MethylExtractor: src/MethylExtractor.c
 	mkdir -p $(STATIC_DIR)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib/x86_64-linux-gnu/hdf5/serial $(HTSLIB_LIBS) $(HDF5_LIBS) $(STATIC_LIBS) -static
+	$(CC) $(CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib/x86_64-linux-gnu/hdf5/serial $(HTSLIB_LIBS) $(HDF5_LIBS) $(STATIC_LIBS) -static
 
 $(DYNAMIC_DIR)/MethylExtractor: src/MethylExtractor.c
 	mkdir -p $(DYNAMIC_DIR)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib/x86_64-linux-gnu/hdf5/serial $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
+	$(CC) $(CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib/x86_64-linux-gnu/hdf5/serial $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
 
 $(DEBUG_DIR)/MethylExtractor: src/MethylExtractor.c
 	mkdir -p $(DEBUG_DIR)
-	$(CC) $(DEBUG_CFLAGS) -o $@ $^ $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib/x86_64-linux-gnu/hdf5/serial $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
+	$(CC) $(DEBUG_CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib/x86_64-linux-gnu/hdf5/serial $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
 
 clean:
 	rm -rf build
