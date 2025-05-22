@@ -1160,9 +1160,7 @@ int main(int argc, char *argv[])
 {
     fprintf(stderr, "Program: MethylExtractor\nParameters:\n");
     for (int i = 0; i < argc; i++)
-    {
         fprintf(stderr, "  Arg %d: %s\n", i, argv[i]);
-    }
 
     // Add time logging
     time_t rawtime;

@@ -24,7 +24,7 @@
       "stopAtEntry": false,
       "externalConsole": false,
       "cwd": "/home/dizada/build/debug",
-      "program": "/home/dizada/build/debug/MethylExtractor",
+      "program": "/home/dizada/MethylExtractor/build/debug/MethylExtractor",
       "MIMode": "gdb",
       "miDebuggerPath": "gdb",
       "setupCommands": [
