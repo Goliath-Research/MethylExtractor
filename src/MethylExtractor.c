@@ -115,6 +115,22 @@ typedef struct {
     int extract;
 } ChromMapEntry;
 
+static void log_time(const char *format, ...) 
+{
+    time_t rawtime;
+    struct tm *timeinfo;
+    char time_str[64];
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+    
+    va_list args;
+    va_start(args, format);
+    fprintf(stderr, "[%s] ", time_str);
+    vfprintf(stderr, format, args);
+    va_end(args);
+}
+
 int make_directory(const char *path)
 {
     struct stat st = {0};
@@ -389,14 +405,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                             int min_cov, int cap_cov, int min_meth, int max_meth,
                             int debug_output)
 {
-    // Add time logging
-    time_t rawtime;
-    struct tm * timeinfo;
-    char time_str[64];
-    time(&rawtime);
-    timeinfo = localtime(&rawtime);
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
-    fprintf(stderr, "\n[%s] Starting to write HDF5 file: %s\n", time_str, filename);
+    log_time("Starting to write HDF5 file: %s\n", filename);
     hid_t file = -1, dataset = -1, space = -1, type = -1, mem_type = -1, dcpl = -1;
     herr_t status = -1;
     size_t records_written = 0;
@@ -465,10 +474,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                 chr_num);
         }
 
-        time(&rawtime);
-        timeinfo = localtime(&rawtime);
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
-        fprintf(stderr, "[%s] Starting to write debug file: %s\n", time_str, debug_filename);
+        log_time("Starting to write debug file: %s\n", debug_filename);
         debug_fp = fopen(debug_filename, "w");
     }
 
@@ -521,10 +527,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
 
     if (debug_fp)
     {
-        time(&rawtime);
-        timeinfo = localtime(&rawtime);
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
-        fprintf(stderr, "[%s] Finished writing debug file: %s\n", time_str, debug_filename);
+        log_time("Finished writing debug file: %s\n", debug_filename);
         fclose(debug_fp);
     }
 
@@ -612,16 +615,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
     if (file >= 0)
         H5Fflush(file, H5F_SCOPE_GLOBAL);
     records_written = dims[0];
-    // Add time logging
-    time(&rawtime);
-    timeinfo = localtime(&rawtime);
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
-    fprintf(
-        stderr,
-        "[%s] Finished writing HDF5 file: %s, wrote %llu filtered records\n",
-        time_str,
-        filename,
-        (unsigned long long)dims[0]);
+    log_time("Finished writing HDF5 file: %s, wrote %llu filtered records\n", filename, (unsigned long long)dims[0]);
 cleanup:
     if (filtered_buffer)
         free(filtered_buffer);
@@ -800,12 +794,7 @@ void *process_chromosome_region(void *arg)
     hts_itr_t *iter = sam_itr_queryi(idx, targ->tid, targ->start_pos, targ->end_pos);
     if (!iter)
     {
-        fprintf(
-            stderr,
-            "\nThread %s:%u-%u: Failed to create iterator\n",
-            targ->chr,
-            targ->start_pos,
-            targ->end_pos);
+        log_time("Thread %s:%u-%u: Failed to create iterator\n", targ->chr, targ->start_pos, targ->end_pos);
         sam_hdr_destroy(header);
         sam_close(in);
         return NULL;
@@ -1165,13 +1154,9 @@ void process_chromosome(ThreadArg *targ)
     free(buffer);
 
     // Clean up region arguments
-    for (int i = 0; i < n_regions; i++) 
-    {
+    for (int i = 0; i < n_regions; i++)
         if (region_args[i].chr) 
-        {
             free(region_args[i].chr);
-        }
-    }
     free(region_args);
 }
 
@@ -1190,7 +1175,8 @@ int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_ent
     fseek(fp, 0, SEEK_SET);
     char *data = malloc(len + 1);
     size_t nread = fread(data, 1, len, fp);
-    if (nread != len) {
+    if (nread != len) 
+    {
         free(data);
         fclose(fp);
         return -2; // Error: could not read the expected number of bytes
@@ -1232,23 +1218,27 @@ int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_ent
         cJSON *name = cJSON_GetObjectItem(item, "name");
         
         // Validate and copy each field
-        if (fasta && cJSON_IsString(fasta) && fasta->valuestring) {
+        if (fasta && cJSON_IsString(fasta) && fasta->valuestring) 
+        {
             strncpy(e->fasta, fasta->valuestring, sizeof(e->fasta) - 1);
             e->fasta[sizeof(e->fasta) - 1] = '\0';
         }
         
-        if (bam && cJSON_IsString(bam) && bam->valuestring) {
+        if (bam && cJSON_IsString(bam) && bam->valuestring) 
+        {
             strncpy(e->bam, bam->valuestring, sizeof(e->bam) - 1);
             e->bam[sizeof(e->bam) - 1] = '\0';
         }
         
-        if (name && cJSON_IsString(name) && name->valuestring) {
+        if (name && cJSON_IsString(name) && name->valuestring) 
+        {
             strncpy(e->name, name->valuestring, sizeof(e->name) - 1);
             e->name[sizeof(e->name) - 1] = '\0';
         }
         
         // Validate that we have all required fields
-        if (e->fasta[0] == '\0' || e->bam[0] == '\0' || e->name[0] == '\0') {
+        if (e->fasta[0] == '\0' || e->bam[0] == '\0' || e->name[0] == '\0') 
+        {
             fprintf(stderr, "Warning: Skipping chromosome entry with missing required fields\n");
             continue;
         }
@@ -1266,17 +1256,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < argc; i++)
         fprintf(stderr, "  Arg %d: %s\n", i, argv[i]);
 
-    // Add time logging
-    time_t rawtime;
-    struct tm * timeinfo;
-    char time_str[80];
-    time(&rawtime);
-    timeinfo = localtime(&rawtime);
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
-    fprintf(
-        stderr,
-        "\n[%s] Starting processing...\n",
-        time_str);
+    log_time("Starting processing...\n");
 
     int hdf5_compression = DEFAULT_HDF5_COMPRESSION;
     int hdf5_chunk_size = DEFAULT_HDF5_CHUNK_SIZE;
@@ -1619,30 +1599,26 @@ int main(int argc, char *argv[])
     }
 
     for (int i = 0; i < valid_chr_count; i++)
-    {
         if (pthread_join(threads[i], NULL) == 0)
-        {
             if (active_threads > 0)
                 active_threads--;
-        }
-    }
 
     cleanup_hdf5();
     
     // Clean up thread argument copies
     for (int i = 0; i < valid_chr_count; i++) 
-    {
         if (thread_args_copies[i]) 
         {
             free(thread_args_copies[i]->chr_seq);
             free(thread_args_copies[i]->chr);
             free(thread_args_copies[i]);
         }
-    }
+
     free(thread_args_copies);
 
     // Clean up original thread arguments
-    for (int i = 0; i < valid_chr_count; i++) {
+    for (int i = 0; i < valid_chr_count; i++)
+    {
         free(thread_args[i].chr_seq);
         free(thread_args[i].chr);  // Free the copied chromosome name
     }
@@ -1651,13 +1627,7 @@ int main(int argc, char *argv[])
     sam_hdr_destroy(header);
     fai_destroy(fai);
 
-    time(&rawtime);
-    timeinfo = localtime(&rawtime);
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
-    fprintf(
-        stderr,
-        "\n[%s] Processing complete. MethylExtractor has finished.\n",
-        time_str);
+    log_time("Processing complete. MethylExtractor has finished.\n");
         
     return 0;
 }
