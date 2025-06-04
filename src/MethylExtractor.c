@@ -49,6 +49,14 @@ KHASH_SET_INIT_STR(str)
 
 #define ZSTD_FILTER 32015  // Zstandard filter ID
 
+// Output format types
+typedef enum {
+    OUTPUT_NONE = 0,
+    OUTPUT_HDF5 = 1,
+    OUTPUT_TXT = 2,
+    OUTPUT_BOTH = 3
+} OutputFormat;
+
 // Function prototypes
 static inline void decode_trinucleotide(uint8_t tnc, char *trinucl);
 static inline const char *get_context_string(int context);
@@ -94,7 +102,7 @@ typedef struct
     size_t buffer_offset;
     size_t buffer_size;
     pthread_mutex_t *buffer_mutex;
-    int debug_output;
+    OutputFormat output_format;  // New: replaces debug_output
     int split_context_files;
     khash_t(pos) * pos_map;
     uint8_t *tnc_array; // New: TriNucleotideContexts[25] array
@@ -400,30 +408,16 @@ size_t find_buffer_index(MethylRecord *buffer, size_t offset, size_t size, uint3
     return -1;
 }
 
-size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n_records,
-                            int compression, int chunk_size, int append_mode,
-                            int min_cov, int cap_cov, int min_meth, int max_meth,
-                            int debug_output)
+size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records,
+                   int compression, int chunk_size, int append_mode,
+                   int min_cov, int cap_cov, int min_meth, int max_meth,
+                   OutputFormat output_format)
 {
-    log_time("Starting to write HDF5 file: %s\n", filename);
+    size_t records_written = 0;
+    hsize_t dims[1] = {0};
+    FILE *txt_fp = NULL;
     hid_t file = -1, dataset = -1, space = -1, type = -1, mem_type = -1, dcpl = -1;
     herr_t status = -1;
-    size_t records_written = 0;
-    type = H5Tcreate(H5T_COMPOUND, sizeof(MethylRecord));
-    H5Tinsert(type, "pos", HOFFSET(MethylRecord, pos), H5T_NATIVE_UINT32);
-    H5Tinsert(type, "mC", HOFFSET(MethylRecord, mC), H5T_NATIVE_UINT16);
-    H5Tinsert(type, "uC", HOFFSET(MethylRecord, uC), H5T_NATIVE_UINT16);
-    H5Tinsert(type, "tnc", HOFFSET(MethylRecord, tnc), H5T_NATIVE_UINT8);
-    file = append_mode ? 
-        H5Fopen(filename, H5F_ACC_RDWR, H5P_DEFAULT) : 
-        H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-    if (file < 0)
-    {
-        fprintf(stderr, "Failed to %s HDF5 file: %s\n", append_mode ? "open" : "create", filename);
-        goto cleanup;
-    }
-    hsize_t dims[1] = {0};
-    FILE *debug_fp = NULL;
 
     // Calculate the number of records to write (filtered by coverage and methylation level)
     // and the average coverage
@@ -443,41 +437,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         }
     }
 
-    char debug_filename[1024];
-    if (debug_output)
-    {
-        const char *chr_num = strrchr(filename, '/');
-        const char *dir_end = chr_num;
-        if (chr_num)
-            chr_num++;
-        else
-            chr_num = filename;
-
-        if (dir_end)
-        {
-            snprintf(
-                debug_filename,
-                sizeof(debug_filename),
-                "%.*s%.*s.txt",
-                (int)(dir_end - filename + 1),
-                filename,
-                (int)(strrchr(chr_num, '.') - chr_num),
-                chr_num);
-        }
-        else
-        {
-            snprintf(
-                debug_filename,
-                sizeof(debug_filename),
-                "%.*s.txt",
-                (int)(strrchr(chr_num, '.') - chr_num),
-                chr_num);
-        }
-
-        log_time("Starting to write debug file: %s\n", debug_filename);
-        debug_fp = fopen(debug_filename, "w");
-    }
-
+    // Prepare filtered buffer
     MethylRecord *filtered_buffer = malloc(dims[0] * sizeof(MethylRecord));
     if (!filtered_buffer)
     {
@@ -485,7 +445,7 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
         goto cleanup;
     }
 
-    // Cap coverage using avg_cov
+    // Cap coverage using avg_cov and fill filtered buffer
     size_t j = 0;
     for (size_t i = 0; i < n_records; i++)
     {
@@ -502,87 +462,153 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
                     buffer[i].mC = (uint16_t)round((avg_cov * prop));
                     buffer[i].uC = (uint16_t)(avg_cov - buffer[i].mC);
                 }
-
                 filtered_buffer[j++] = buffer[i];
-
-                if (debug_fp)
-                {
-                    char tnc_str[4];
-                    decode_trinucleotide(buffer[i].tnc.tnc, tnc_str);
-                    char strand = buffer[i].tnc.strand ? '-' : '+';
-                    int context = buffer[i].tnc.context;
-                    fprintf(
-                        debug_fp,
-                        "%u\t%c\t%u\t%u\t%s\t%s\n",
-                        buffer[i].pos,
-                        strand,
-                        buffer[i].mC,
-                        buffer[i].uC,
-                        get_context_string(context),
-                        tnc_str);
-                }
             }
         }
     }
 
-    if (debug_fp)
+    // Handle TXT output
+    if (output_format == OUTPUT_TXT || output_format == OUTPUT_BOTH)
     {
-        log_time("Finished writing debug file: %s\n", debug_filename);
-        fclose(debug_fp);
-    }
+        char txt_filename[1024];
+        const char *chr_num = strrchr(filename, '/');
+        const char *dir_end = chr_num;
+        if (chr_num)
+            chr_num++;
+        else
+            chr_num = filename;
 
-    hsize_t maxdims[1] = {H5S_UNLIMITED};
-    space = H5Screate_simple(1, dims, maxdims);
-    if (space < 0)
-    {
-        fprintf(stderr, "Failed to create dataspace\n");
-        goto cleanup;
-    }
-    dcpl = H5Pcreate(H5P_DATASET_CREATE);
-    if (dcpl < 0)
-    {
-        fprintf(stderr, "Failed to create dataset creation property list\n");
-        goto cleanup;
-    }
-    hsize_t chunk_dims[1] = {(hsize_t)chunk_size};
-    if (H5Pset_chunk(dcpl, 1, chunk_dims) < 0)
-    {
-        fprintf(stderr, "Failed to set chunking\n");
-        goto cleanup;
-    }
-
-    // Set Zstandard compression (level 9 for high compression)
-    unsigned int cd_values[1] = {compression};  // Zstandard compression level
-    status = H5Pset_filter(dcpl, ZSTD_FILTER, H5Z_FLAG_OPTIONAL, 1, cd_values);
-    if (status < 0) 
-    {
-        fprintf(stderr, "Failed to set Zstandard filter\n");
-        goto cleanup;    
-    }
-
-    mem_type = H5Tcopy(type);
-    if (mem_type < 0)
-    {
-        fprintf(stderr, "Failed to create memory datatype\n");
-        goto cleanup;
-    }
-
-    if (append_mode)
-    {
-        dataset = H5Dopen2(file, "methylation_data", H5P_DEFAULT);
-        if (dataset >= 0)
+        if (dir_end)
         {
-            hsize_t curr_size;
-            hid_t file_space = H5Dget_space(dataset);
-            H5Sget_simple_extent_dims(file_space, &curr_size, NULL);
-            dims[0] += curr_size;
-            H5Dset_extent(dataset, dims);
-            file_space = H5Dget_space(dataset);
-            hsize_t start[1] = {curr_size};
-            hsize_t count[1] = {dims[0] - curr_size};
-            H5Sselect_hyperslab(file_space, H5S_SELECT_SET, start, NULL, count, NULL);
-            status = H5Dwrite(dataset, mem_type, space, file_space, H5P_DEFAULT, filtered_buffer);
-            H5Sclose(file_space);
+            snprintf(
+                txt_filename,
+                sizeof(txt_filename),
+                "%.*s%.*s.txt",
+                (int)(dir_end - filename + 1),
+                filename,
+                (int)(strrchr(chr_num, '.') - chr_num),
+                chr_num);
+        }
+        else
+        {
+            snprintf(
+                txt_filename,
+                sizeof(txt_filename),
+                "%.*s.txt",
+                (int)(strrchr(chr_num, '.') - chr_num),
+                chr_num);
+        }
+
+        log_time("Starting to write text file: %s\n", txt_filename);
+        txt_fp = fopen(txt_filename, "w");
+        if (!txt_fp)
+        {
+            fprintf(stderr, "Failed to open text file for writing: %s\n", txt_filename);
+            goto cleanup;
+        }
+
+        for (size_t i = 0; i < dims[0]; i++)
+        {
+            char tnc_str[4];
+            decode_trinucleotide(filtered_buffer[i].tnc.tnc, tnc_str);
+            char strand = filtered_buffer[i].tnc.strand ? '-' : '+';
+            int context = filtered_buffer[i].tnc.context;
+            fprintf(
+                txt_fp,
+                "%u\t%c\t%u\t%u\t%s\t%s\n",
+                filtered_buffer[i].pos,
+                strand,
+                filtered_buffer[i].mC,
+                filtered_buffer[i].uC,
+                get_context_string(context),
+                tnc_str);
+        }
+
+        log_time("Finished writing text file: %s\n", txt_filename);
+        fclose(txt_fp);
+        txt_fp = NULL;
+    }
+
+    // Handle HDF5 output
+    if (output_format == OUTPUT_HDF5 || output_format == OUTPUT_BOTH)
+    {
+        log_time("Starting to write HDF5 file: %s\n", filename);
+        type = H5Tcreate(H5T_COMPOUND, sizeof(MethylRecord));
+        H5Tinsert(type, "pos", HOFFSET(MethylRecord, pos), H5T_NATIVE_UINT32);
+        H5Tinsert(type, "mC", HOFFSET(MethylRecord, mC), H5T_NATIVE_UINT16);
+        H5Tinsert(type, "uC", HOFFSET(MethylRecord, uC), H5T_NATIVE_UINT16);
+        H5Tinsert(type, "tnc", HOFFSET(MethylRecord, tnc), H5T_NATIVE_UINT8);
+
+        file = append_mode ? 
+            H5Fopen(filename, H5F_ACC_RDWR, H5P_DEFAULT) : 
+            H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+        if (file < 0)
+        {
+            fprintf(stderr, "Failed to %s HDF5 file: %s\n", append_mode ? "open" : "create", filename);
+            goto cleanup;
+        }
+
+        hsize_t maxdims[1] = {H5S_UNLIMITED};
+        space = H5Screate_simple(1, dims, maxdims);
+        if (space < 0)
+        {
+            fprintf(stderr, "Failed to create dataspace\n");
+            goto cleanup;
+        }
+
+        dcpl = H5Pcreate(H5P_DATASET_CREATE);
+        if (dcpl < 0)
+        {
+            fprintf(stderr, "Failed to create dataset creation property list\n");
+            goto cleanup;
+        }
+
+        hsize_t chunk_dims[1] = {(hsize_t)chunk_size};
+        if (H5Pset_chunk(dcpl, 1, chunk_dims) < 0)
+        {
+            fprintf(stderr, "Failed to set chunking\n");
+            goto cleanup;
+        }
+
+        // Set Zstandard compression
+        unsigned int cd_values[1] = {compression};
+        status = H5Pset_filter(dcpl, ZSTD_FILTER, H5Z_FLAG_OPTIONAL, 1, cd_values);
+        if (status < 0) 
+        {
+            fprintf(stderr, "Failed to set Zstandard filter\n");
+            goto cleanup;    
+        }
+
+        mem_type = H5Tcopy(type);
+        if (mem_type < 0)
+        {
+            fprintf(stderr, "Failed to create memory datatype\n");
+            goto cleanup;
+        }
+
+        if (append_mode)
+        {
+            dataset = H5Dopen2(file, "methylation_data", H5P_DEFAULT);
+            if (dataset >= 0)
+            {
+                hsize_t curr_size;
+                hid_t file_space = H5Dget_space(dataset);
+                H5Sget_simple_extent_dims(file_space, &curr_size, NULL);
+                dims[0] += curr_size;
+                H5Dset_extent(dataset, dims);
+                file_space = H5Dget_space(dataset);
+                hsize_t start[1] = {curr_size};
+                hsize_t count[1] = {dims[0] - curr_size};
+                H5Sselect_hyperslab(file_space, H5S_SELECT_SET, start, NULL, count, NULL);
+                status = H5Dwrite(dataset, mem_type, space, file_space, H5P_DEFAULT, filtered_buffer);
+                H5Sclose(file_space);
+            }
+            else
+            {
+                dataset = H5Dcreate2(file, "methylation_data", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+                if (dataset >= 0)
+                    status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
+            }
         }
         else
         {
@@ -590,35 +616,35 @@ size_t flush_buffer_to_hdf5(const char *filename, MethylRecord *buffer, size_t n
             if (dataset >= 0)
                 status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
         }
-    }
-    else
-    {
-        dataset = H5Dcreate2(file, "methylation_data", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+
+        if (dataset < 0)
+        {
+            fprintf(stderr, "Failed to create or open dataset\n");
+            goto cleanup;
+        }
+
+        if (status < 0)
+        {
+            fprintf(stderr, "Failed to write data to HDF5 file\n");
+            goto cleanup;
+        }
+
         if (dataset >= 0)
-            status = H5Dwrite(dataset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, filtered_buffer);
+            H5Dflush(dataset);
+        if (file >= 0)
+            H5Fflush(file, H5F_SCOPE_GLOBAL);
+
+        log_time("Finished writing HDF5 file: %s\n", filename);
     }
 
-    if (dataset < 0)
-    {
-        fprintf(stderr, "Failed to create or open dataset\n");
-        goto cleanup;
-    }
-
-    if (status < 0)
-    {
-        fprintf(stderr, "Failed to write data to HDF5 file\n");
-        goto cleanup;
-    }
-
-    if (dataset >= 0)
-        H5Dflush(dataset);
-    if (file >= 0)
-        H5Fflush(file, H5F_SCOPE_GLOBAL);
     records_written = dims[0];
-    log_time("Finished writing HDF5 file: %s, wrote %llu filtered records\n", filename, (unsigned long long)dims[0]);
+    log_time("Finished writing output files, wrote %llu filtered records\n", (unsigned long long)dims[0]);
+
 cleanup:
     if (filtered_buffer)
         free(filtered_buffer);
+    if (txt_fp)
+        fclose(txt_fp);
     if (mem_type >= 0)
         H5Tclose(mem_type);
     if (dataset >= 0)
@@ -988,7 +1014,7 @@ void process_chromosome(ThreadArg *targ)
         region_args[i].hdf5_compression = targ->hdf5_compression;
         region_args[i].hdf5_chunk_size = targ->hdf5_chunk_size;
         region_args[i].chunk_size = targ->chunk_size;
-        region_args[i].debug_output = targ->debug_output;
+        region_args[i].output_format = targ->output_format;
         region_args[i].split_context_files = targ->split_context_files;
 
         // Set shared resources
@@ -1088,7 +1114,6 @@ void process_chromosome(ThreadArg *targ)
                 (ctx == CONTEXT_CHG && targ->keep_chg) ||
                 (ctx == CONTEXT_CHH && targ->keep_chh)) 
             {
-
                 // Filter buffer for this context
                 size_t n_ctx_records = 0;
                 for (size_t i = 0; i < site_count; ++i)
@@ -1104,17 +1129,19 @@ void process_chromosome(ThreadArg *targ)
                     if (buffer[i].tnc.context == ctx)
                         ctx_buffer[j++] = buffer[i];
 
-                // Output file name
+                // Output file name - use appropriate extension based on output format
                 char out_path[1024];
+                const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5";  // For OUTPUT_BOTH, use .h5
                 snprintf(
                     out_path, 
                     sizeof(out_path), 
-                    "%s/%s-%s.h5", 
+                    "%s/%s-%s%s", 
                     targ->out_dir, 
                     targ->chr, 
-                    get_context_string(ctx)
+                    get_context_string(ctx),
+                    ext
                 );
-                flush_buffer_to_hdf5(
+                flush_buffer(
                     out_path,
                     ctx_buffer,
                     n_ctx_records,
@@ -1125,7 +1152,7 @@ void process_chromosome(ThreadArg *targ)
                     targ->cap_cov,
                     targ->min_meth,
                     targ->max_meth,
-                    targ->debug_output);
+                    targ->output_format);
 
                 free(ctx_buffer);
             }
@@ -1133,10 +1160,11 @@ void process_chromosome(ThreadArg *targ)
     } 
     else 
     {
-        // Existing logic: write all contexts to one file
+        // Output file name - use appropriate extension based on output format
         char out_path[1024];
-        snprintf(out_path, sizeof(out_path), "%s/%s.h5", targ->out_dir, targ->chr);
-        flush_buffer_to_hdf5(
+        const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5";  // For OUTPUT_BOTH, use .h5
+        snprintf(out_path, sizeof(out_path), "%s/%s%s", targ->out_dir, targ->chr, ext);
+        flush_buffer(
             out_path,
             buffer,
             site_count,
@@ -1147,7 +1175,7 @@ void process_chromosome(ThreadArg *targ)
             targ->cap_cov,
             targ->min_meth,
             targ->max_meth,
-            targ->debug_output);
+            targ->output_format);
     }
 
     kh_destroy(pos, pos_map);
@@ -1270,7 +1298,7 @@ int main(int argc, char *argv[])
     int cap_cov = DEFAULT_CAP_COVERAGE;
     int min_meth = DEFAULT_MIN_METH;
     int max_meth = DEFAULT_MAX_METH;
-    int debug_output = 0;
+    OutputFormat output_format = OUTPUT_HDF5;  // Default to HDF5 output
     const char *out_dir = NULL;
     int split_context_files = 0;
     const char *chrom_mapping_file = NULL;
@@ -1288,12 +1316,12 @@ int main(int argc, char *argv[])
         {"no-cap-coverage", no_argument, 0, 'N'},
         {"l", required_argument, 0, 'l'},
         {"L", required_argument, 0, 'L'},
-        {"debug", no_argument, 0, 'd'},
+        {"output-format", required_argument, 0, 'x'},  // New option
         {"split-context-files", no_argument, 0, 'S'},
         {"chrom-mapping", required_argument, 0, 'M'},
         {0, 0, 0, 0}};
     int opt;
-    while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:Nl:L:dS:M:", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:Nl:L:x:S:M:", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -1376,8 +1404,18 @@ int main(int argc, char *argv[])
                 return 1;
             }
             break;
-        case 'd':
-            debug_output = 1;
+        case 'x':
+            if (strcmp(optarg, "hdf5") == 0)
+                output_format = OUTPUT_HDF5;
+            else if (strcmp(optarg, "txt") == 0)
+                output_format = OUTPUT_TXT;
+            else if (strcmp(optarg, "both") == 0)
+                output_format = OUTPUT_BOTH;
+            else
+            {
+                fprintf(stderr, "Invalid output format. Must be one of: hdf5, txt, both\n");
+                return 1;
+            }
             break;
         case 'S':
             split_context_files = 1;
@@ -1389,7 +1427,8 @@ int main(int argc, char *argv[])
         default:
             fprintf(stderr, "Usage: %s [options] <ref.fa> <sorted_alignments.bam>\n", argv[0]);
             fprintf(stderr, "Options:\n");
-            fprintf(stderr, "  --o DIR                  Output directory for HDF5 files\n");
+            fprintf(stderr, "  --o DIR                  Output directory for output files\n");
+            fprintf(stderr, "  --output-format FORMAT   Output format (hdf5, txt, or both, default: hdf5)\n");
             fprintf(stderr, "  --hdf5-compression INT   Compression level (0-9, default: %d)\n", DEFAULT_HDF5_COMPRESSION);
             fprintf(stderr, "  --hdf5-chunk-size INT    Chunk size for HDF5 datasets (default: %d)\n", DEFAULT_HDF5_CHUNK_SIZE);
             fprintf(stderr, "  --chunk-size INT         Genomic chunk size for threading (default: %d)\n", DEFAULT_CHUNK_SIZE);
@@ -1402,7 +1441,6 @@ int main(int argc, char *argv[])
             fprintf(stderr, "  --no-cap-coverage        Disable automatic coverage capping\n");
             fprintf(stderr, "  --l INT                  Minimum methylation level (default: %d)\n", DEFAULT_MIN_METH);
             fprintf(stderr, "  --L INT                  Maximum methylation level (default: %d)\n", DEFAULT_MAX_METH);
-            fprintf(stderr, "  --debug                  Enable debug output (.txt files)\n");
             fprintf(stderr, "  --split-context-files     Output separate files for each context (CG, CHG, CHH)\n");
             fprintf(stderr, "  --chrom-mapping FILE      JSON file with chromosome mapping and selection\n");
             return 1;
@@ -1508,7 +1546,7 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].hdf5_chunk_size = hdf5_chunk_size;
         thread_args[valid_chr_count].chunk_size = chunk_size;
         thread_args[valid_chr_count].chr_seq = seq;
-        thread_args[valid_chr_count].debug_output = debug_output;
+        thread_args[valid_chr_count].output_format = output_format;
         thread_args[valid_chr_count].split_context_files = split_context_files;
         valid_chr_count++;
     }
@@ -1576,7 +1614,7 @@ int main(int argc, char *argv[])
         thread_args_copies[i]->hdf5_compression = thread_args[i].hdf5_compression;
         thread_args_copies[i]->hdf5_chunk_size = thread_args[i].hdf5_chunk_size;
         thread_args_copies[i]->chunk_size = thread_args[i].chunk_size;
-        thread_args_copies[i]->debug_output = thread_args[i].debug_output;
+        thread_args_copies[i]->output_format = thread_args[i].output_format;
         thread_args_copies[i]->split_context_files = thread_args[i].split_context_files;
 
         if (pthread_create(&threads[i], NULL, (void *(*)(void *))process_chromosome, thread_args_copies[i]) != 0)
