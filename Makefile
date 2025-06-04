@@ -22,7 +22,22 @@ DYNAMIC_DIR = build/dynamic
 DEBUG_DIR = build/debug
 
 # Targets
-all: dynamic
+all: deps dynamic
+
+deps:
+	@echo "Installing required dependencies..."
+	sudo apt-get update
+	sudo apt-get install -y \
+		build-essential \
+		libhdf5-dev \
+		libhts-dev \
+		zlib1g-dev \
+		libbz2-dev \
+		liblzma-dev \
+		libcurl4-gnutls-dev \
+		libssl-dev \
+		libzstd-dev
+	@echo "Dependencies installed successfully"
 
 # Note: Static linking is challenging due to missing static libraries for HTSlib and HDF5 dependencies
 # (like libdeflate, rans, arith, fqz, tok3, and szip). Consider using dynamic linking instead.
@@ -52,4 +67,4 @@ install: dynamic
 clean:
 	rm -rf build
 
-.PHONY: all static dynamic debug install clean 
+.PHONY: all deps static dynamic debug install clean 

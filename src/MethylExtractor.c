@@ -1159,7 +1159,7 @@ int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_ent
 int main(int argc, char *argv[])
 {
     fprintf(stderr, "Program: MethylExtractor\nParameters:\n");
-    for (int i = 0; i < argc; i++)
+m    for (int i = 0; i < argc; i++)
         fprintf(stderr, "  Arg %d: %s\n", i, argv[i]);
 
     // Add time logging
