@@ -74,7 +74,7 @@ typedef struct
     const char *bam_file;
     const char *out_dir;
     int tid;
-    const char *chr;
+    char *chr;
     uint32_t chr_len;
     char *chr_seq;
     int min_mapq;
@@ -933,15 +933,76 @@ void process_chromosome(ThreadArg *targ)
     if (n_regions < 1)
         n_regions = 1;
 
-    ThreadArg region_args[n_regions];
+    // Allocate thread arguments array
+    ThreadArg *region_args = malloc(n_regions * sizeof(ThreadArg));
+    if (!region_args) 
+    {
+        fprintf(stderr, "Failed to allocate region arguments\n");
+        free(buffer);
+        kh_destroy(pos, pos_map);
+        return;
+    }
+
     pthread_mutex_t buffer_mutex;
     pthread_mutex_init(&buffer_mutex, NULL);
 
     size_t sites_per_region = (site_count + n_regions - 1) / n_regions;
 
+    // First, validate the chromosome name
+    if (!targ->chr || strlen(targ->chr) == 0) 
+    {
+        fprintf(stderr, "Invalid chromosome name\n");
+        free(region_args);
+        pthread_mutex_destroy(&buffer_mutex);
+        free(buffer);
+        kh_destroy(pos, pos_map);
+        return;
+    }
+
     for (int i = 0; i < n_regions; i++)
     {
-        region_args[i] = *targ;
+        // Initialize each thread argument structure
+        memset(&region_args[i], 0, sizeof(ThreadArg));
+        
+        // Copy all non-pointer fields
+        region_args[i].bam_file = targ->bam_file;
+        region_args[i].out_dir = targ->out_dir;
+        region_args[i].tid = targ->tid;
+        
+        // Make a deep copy of the chromosome name and validate it
+        region_args[i].chr = strdup(targ->chr);
+        if (!region_args[i].chr || strlen(region_args[i].chr) == 0) 
+        {
+            fprintf(stderr, "Failed to allocate or validate chromosome name copy for region %d\n", i);
+            // Clean up previously allocated regions
+            for (int j = 0; j < i; j++) 
+            {
+                free(region_args[j].chr);
+            }
+            free(region_args);
+            pthread_mutex_destroy(&buffer_mutex);
+            free(buffer);
+            kh_destroy(pos, pos_map);
+            return;
+        }
+
+        region_args[i].chr_len = targ->chr_len;
+        region_args[i].chr_seq = targ->chr_seq;
+        region_args[i].min_mapq = targ->min_mapq;
+        region_args[i].min_phred = targ->min_phred;
+        region_args[i].min_cov = targ->min_cov;
+        region_args[i].cap_cov = targ->cap_cov;
+        region_args[i].min_meth = targ->min_meth;
+        region_args[i].max_meth = targ->max_meth;
+        region_args[i].keep_chg = targ->keep_chg;
+        region_args[i].keep_chh = targ->keep_chh;
+        region_args[i].hdf5_compression = targ->hdf5_compression;
+        region_args[i].hdf5_chunk_size = targ->hdf5_chunk_size;
+        region_args[i].chunk_size = targ->chunk_size;
+        region_args[i].debug_output = targ->debug_output;
+        region_args[i].split_context_files = targ->split_context_files;
+
+        // Set shared resources
         region_args[i].buffer = buffer;
         region_args[i].buffer_mutex = &buffer_mutex;
         region_args[i].pos_map = pos_map;
@@ -973,8 +1034,18 @@ void process_chromosome(ThreadArg *targ)
     if (!joined)
     {
         fprintf(stderr, "Failed to allocate memory for joined array\n");
+        // Clean up region arguments
+        for (int i = 0; i < n_regions; i++) 
+        {
+            free(region_args[i].chr);
+        }
+        free(region_args);
+        pthread_mutex_destroy(&buffer_mutex);
+        free(buffer);
+        kh_destroy(pos, pos_map);
         return;
     }
+
     for (int i = 0; i < n_regions; i++)
     {
         if (pthread_create(&threads[i], NULL, process_chromosome_region, &region_args[i]) != 0)
@@ -983,29 +1054,22 @@ void process_chromosome(ThreadArg *targ)
             continue;
         }
         active_threads++;
-        // fprintf(stderr, "Started thread %d for chromosome region %s:%u-%u, active threads: %d\n", i, region_args[i].chr, region_args[i].start_pos, region_args[i].end_pos, active_threads);
         for (int j = 0; j <= i; j++)
-        {
             if (!joined[j] && pthread_join(threads[j], NULL) == 0)
             {
                 joined[j] = 1;
                 active_threads--;
-                // fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
             }
-        }
+        
         int max_region_threads = 8;
         while (active_threads >= max_region_threads)
-        {
             for (int j = 0; j <= i; j++)
-            {
                 if (!joined[j] && pthread_join(threads[j], NULL) == 0)
                 {
                     joined[j] = 1;
                     active_threads--;
-                    // fprintf(stderr, "Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n", j, region_args[j].chr, region_args[j].start_pos, region_args[j].end_pos, active_threads);
                 }
-            }
-        }
+
     }
     for (int i = 0; i < n_regions; i++)
     {
@@ -1053,7 +1117,14 @@ void process_chromosome(ThreadArg *targ)
 
                 // Output file name
                 char out_path[1024];
-                snprintf(out_path, sizeof(out_path), "%s/%s-%s.h5", targ->out_dir, targ->chr, get_context_string(ctx));
+                snprintf(
+                    out_path, 
+                    sizeof(out_path), 
+                    "%s/%s-%s.h5", 
+                    targ->out_dir, 
+                    targ->chr, 
+                    get_context_string(ctx)
+                );
                 flush_buffer_to_hdf5(
                     out_path,
                     ctx_buffer,
@@ -1092,6 +1163,16 @@ void process_chromosome(ThreadArg *targ)
 
     kh_destroy(pos, pos_map);
     free(buffer);
+
+    // Clean up region arguments
+    for (int i = 0; i < n_regions; i++) 
+    {
+        if (region_args[i].chr) 
+        {
+            free(region_args[i].chr);
+        }
+    }
+    free(region_args);
 }
 
 void cleanup_hdf5(void)
@@ -1140,15 +1221,38 @@ int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_ent
         if (!extract || !cJSON_IsBool(extract) || !cJSON_IsTrue(extract)) 
             continue;
         ChromMapEntry *e = &(*entries)[*n_entries];
+        
+        // Initialize all strings to empty
+        e->fasta[0] = '\0';
+        e->bam[0] = '\0';
+        e->name[0] = '\0';
+        
         cJSON *fasta = cJSON_GetObjectItem(item, "fasta");
         cJSON *bam = cJSON_GetObjectItem(item, "bam");
         cJSON *name = cJSON_GetObjectItem(item, "name");
-        if (fasta && cJSON_IsString(fasta)) 
-            strncpy(e->fasta, fasta->valuestring, 63);
-        if (bam && cJSON_IsString(bam)) 
-            strncpy(e->bam, bam->valuestring, 63);
-        if (name && cJSON_IsString(name)) 
-            strncpy(e->name, name->valuestring, 63);
+        
+        // Validate and copy each field
+        if (fasta && cJSON_IsString(fasta) && fasta->valuestring) {
+            strncpy(e->fasta, fasta->valuestring, sizeof(e->fasta) - 1);
+            e->fasta[sizeof(e->fasta) - 1] = '\0';
+        }
+        
+        if (bam && cJSON_IsString(bam) && bam->valuestring) {
+            strncpy(e->bam, bam->valuestring, sizeof(e->bam) - 1);
+            e->bam[sizeof(e->bam) - 1] = '\0';
+        }
+        
+        if (name && cJSON_IsString(name) && name->valuestring) {
+            strncpy(e->name, name->valuestring, sizeof(e->name) - 1);
+            e->name[sizeof(e->name) - 1] = '\0';
+        }
+        
+        // Validate that we have all required fields
+        if (e->fasta[0] == '\0' || e->bam[0] == '\0' || e->name[0] == '\0') {
+            fprintf(stderr, "Warning: Skipping chromosome entry with missing required fields\n");
+            continue;
+        }
+        
         e->extract = 1;
         (*n_entries)++;
     }
@@ -1410,7 +1514,7 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].bam_file = bam_file;
         thread_args[valid_chr_count].out_dir = out_dir;
         thread_args[valid_chr_count].tid = tid;
-        thread_args[valid_chr_count].chr = entry->name;
+        thread_args[valid_chr_count].chr = strdup(entry->name);  // Make a copy of the name
         thread_args[valid_chr_count].chr_len = header->target_len[tid];
         thread_args[valid_chr_count].min_mapq = min_mapq;
         thread_args[valid_chr_count].min_phred = min_phred;
@@ -1440,48 +1544,108 @@ int main(int argc, char *argv[])
         fai_destroy(fai);
         return 1;
     }
+
+    // Create a copy of thread arguments for each thread
+    ThreadArg **thread_args_copies = malloc(valid_chr_count * sizeof(ThreadArg *));
+    if (!thread_args_copies) 
+    {
+        fprintf(stderr, "Failed to allocate thread argument copies\n");
+        free(threads);
+        for (int i = 0; i < valid_chr_count; i++)
+            free(thread_args[i].chr_seq);
+        free(thread_args);
+        sam_hdr_destroy(header);
+        fai_destroy(fai);
+        return 1;
+    }
+
     int active_threads = 0;
     for (int i = 0; i < valid_chr_count; i++)
     {
-        if (pthread_create(&threads[i], NULL, (void *(*)(void *))process_chromosome, &thread_args[i]) != 0)
+        // Create a deep copy of the thread arguments
+        thread_args_copies[i] = malloc(sizeof(ThreadArg));
+        if (!thread_args_copies[i]) 
+        {
+            fprintf(stderr, "Failed to allocate thread argument copy %d\n", i);
+            continue;
+        }
+
+        // Initialize the structure to zero
+        memset(thread_args_copies[i], 0, sizeof(ThreadArg));
+        
+        // Make deep copies of all string fields
+        thread_args_copies[i]->bam_file = strdup(thread_args[i].bam_file);
+        thread_args_copies[i]->out_dir = strdup(thread_args[i].out_dir);
+        thread_args_copies[i]->chr = strdup(thread_args[i].chr);
+        
+        // Make a deep copy of the chromosome sequence
+        thread_args_copies[i]->chr_seq = malloc(thread_args[i].chr_len + 1);
+        memcpy(thread_args_copies[i]->chr_seq, thread_args[i].chr_seq, thread_args[i].chr_len + 1);
+
+        // Copy all non-pointer fields
+        thread_args_copies[i]->tid = thread_args[i].tid;
+        thread_args_copies[i]->chr_len = thread_args[i].chr_len;
+        thread_args_copies[i]->min_mapq = thread_args[i].min_mapq;
+        thread_args_copies[i]->min_phred = thread_args[i].min_phred;
+        thread_args_copies[i]->min_cov = thread_args[i].min_cov;
+        thread_args_copies[i]->cap_cov = thread_args[i].cap_cov;
+        thread_args_copies[i]->min_meth = thread_args[i].min_meth;
+        thread_args_copies[i]->max_meth = thread_args[i].max_meth;
+        thread_args_copies[i]->keep_chg = thread_args[i].keep_chg;
+        thread_args_copies[i]->keep_chh = thread_args[i].keep_chh;
+        thread_args_copies[i]->hdf5_compression = thread_args[i].hdf5_compression;
+        thread_args_copies[i]->hdf5_chunk_size = thread_args[i].hdf5_chunk_size;
+        thread_args_copies[i]->chunk_size = thread_args[i].chunk_size;
+        thread_args_copies[i]->debug_output = thread_args[i].debug_output;
+        thread_args_copies[i]->split_context_files = thread_args[i].split_context_files;
+
+        if (pthread_create(&threads[i], NULL, (void *(*)(void *))process_chromosome, thread_args_copies[i]) != 0)
         {
             fprintf(stderr, "Failed to create thread for %s\n", thread_args[i].chr);
+            free(thread_args_copies[i]->chr_seq);
+            free(thread_args_copies[i]->chr);
+            free(thread_args_copies[i]);
             continue;
         }
         active_threads++;
-        // fprintf(stderr, "Started thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
         for (int j = 0; j <= i; j++)
-        {
             if (pthread_join(threads[j], NULL) == 0)
-            {
                 active_threads--;
-                // fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
-            }
-        }
+
         while (active_threads >= num_threads)
-        {
             for (int j = 0; j <= i; j++)
-            {
                 if (pthread_join(threads[j], NULL) == 0)
-                {
                     active_threads--;
-                    // fprintf(stderr, "Completed thread %d for chromosome %s, active threads: %d\n", j, thread_args[j].chr, active_threads);
-                }
-            }
-        }
     }
+
     for (int i = 0; i < valid_chr_count; i++)
     {
         if (pthread_join(threads[i], NULL) == 0)
         {
             if (active_threads > 0)
                 active_threads--;
-            // fprintf(stderr, "Final join: Completed thread %d for chromosome %s, active threads: %d\n", i, thread_args[i].chr, active_threads);
         }
     }
+
     cleanup_hdf5();
-    for (int i = 0; i < valid_chr_count; i++)
+    
+    // Clean up thread argument copies
+    for (int i = 0; i < valid_chr_count; i++) 
+    {
+        if (thread_args_copies[i]) 
+        {
+            free(thread_args_copies[i]->chr_seq);
+            free(thread_args_copies[i]->chr);
+            free(thread_args_copies[i]);
+        }
+    }
+    free(thread_args_copies);
+
+    // Clean up original thread arguments
+    for (int i = 0; i < valid_chr_count; i++) {
         free(thread_args[i].chr_seq);
+        free(thread_args[i].chr);  // Free the copied chromosome name
+    }
     free(threads);
     free(thread_args);
     sam_hdr_destroy(header);

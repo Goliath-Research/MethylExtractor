@@ -6,9 +6,9 @@
       "type": "cppdbg",
       "request": "launch",
       "args": [
-        "--chrom-mapping", "/home/dizada/chrom_mapping.json",
+        "--chrom-mapping", "/home/ubuntu/Work/HRA006113/chrom_mapping.json",
         "--@", "16",
-        "--o", "/home/dizada/Esophagus/HRR1458903", 
+        "--o", "/home/ubuntu/Work/HRA006113/HRR1458903", 
         "--hdf5-compression", "9", 
         "--q", "30", 
         "--p", "20", 
@@ -18,8 +18,8 @@
         "--chunk-size", "1000000",
         "--no-cap-coverage",
         "--split-context-files",
-        "/home/dizada/Homo_sapiens.GRCh38.dna.primary_assembly.fa", 
-        "/home/dizada/HRR1458903/HRR1458903.bam"
+        "/home/ubuntu/Work/genomes/human_genome/release-113/Homo_sapiens.GRCh38.dna.primary_assembly.fa", 
+        "/home/ubuntu/Work/HRA006113/HRR1458903/HRR1458903.bam"
       ],
       "stopAtEntry": false,
       "externalConsole": false,
@@ -49,8 +49,8 @@
         "--CHH", 
         "--c", "4",
         "--C", "100",
-        "Homo_sapiens.GRCh38.dna.primary_assembly.fa", 
-        "sample30x.clara_parabrics.duplicates_marked.bam"
+        "/home/ubuntu/Work/genomes/human_genome/release-113/Homo_sapiens.GRCh38.dna.primary_assembly.fa", 
+        "/home/ubuntu/Work/HRA006113/HRR1458904/HRR1458904.bam"
       ],
       "stopAtEntry": false,
       "externalConsole": false,
