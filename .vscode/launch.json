@@ -23,8 +23,8 @@
       ],
       "stopAtEntry": false,
       "externalConsole": false,
-      "cwd": "/home/dizada/build/debug",
-      "program": "/home/dizada/MethylExtractor/build/debug/MethylExtractor",
+      "cwd": "/home/ubuntu/MethylExtractor/build/debug",
+      "program": "/home/ubuntu/MethylExtractor/build/debug/MethylExtractor",
       "MIMode": "gdb",
       "miDebuggerPath": "gdb",
       "setupCommands": [
@@ -54,8 +54,8 @@
       ],
       "stopAtEntry": false,
       "externalConsole": false,
-      "cwd": "./build/dynamic",
-      "program": "MethylExtractor",
+      "cwd": "/home/ubuntu/MethylExtractor/build/dynamic",
+      "program": "/home/ubuntu/MethylExtractor/build/dynamic/MethylExtractor",
       "MIMode": "gdb",
       "miDebuggerPath": "gdb",
       "setupCommands": [
