@@ -200,6 +200,9 @@ typedef struct {
     int has_coverage_info;
 } BamStats;
 
+// Add global memory requirements
+static MemoryRequirements global_mem_req = {0};
+
 static void log_time(const char *format, ...) 
 {
     time_t rawtime;
@@ -1124,17 +1127,8 @@ void process_chromosome(ThreadArg *targ)
 {
     log_time("Starting processing of chromosome %s\n", targ->chr);
     
-    // Calculate memory requirements once for the entire chromosome
-    MemoryRequirements mem_req = calculate_memory_requirements(
-        targ->bam_file,
-        targ->chr,
-        targ->chr_len,
-        targ->min_mapq,
-        targ->min_phred
-    );
-    
-    // Use the calculated chunk size
-    targ->chunk_size = mem_req.chunk_size;
+    // Use the global memory requirements
+    targ->chunk_size = global_mem_req.chunk_size;
     
     // Pre-calculate sites for each context
     size_t sites_per_context[4] = {0}; // Index 0 unused, 1=CPG, 2=CHG, 3=CHH
@@ -1207,9 +1201,9 @@ void process_chromosome(ThreadArg *targ)
         chunk_size = targ->chr_len;
 
     int n_regions = (int)ceil((double)targ->chr_len / chunk_size);
-    if (n_regions > mem_req.region_count)
+    if (n_regions > global_mem_req.region_count)
     {
-        n_regions = mem_req.region_count;
+        n_regions = global_mem_req.region_count;
         chunk_size = (targ->chr_len + n_regions - 1) / n_regions;
     }
     if (n_regions < 1)
@@ -1764,6 +1758,30 @@ int main(int argc, char *argv[])
         return 1;
     }
     sam_close(in);
+
+    // Calculate memory requirements once using the first chromosome
+    if (n_chroms > 0) 
+    {
+        ChromMapEntry *first_chrom = &chroms[0];
+        int tid = bam_name2id(header, first_chrom->bam);
+        if (tid >= 0) 
+        {
+            global_mem_req = calculate_memory_requirements(
+                bam_file,
+                first_chrom->bam,
+                header->target_len[tid],
+                min_mapq,
+                min_phred
+            );
+            fprintf(stderr, "Global memory settings (will be used for all chromosomes):\n");
+            fprintf(stderr, "  Min buffer size: %.2f GB\n", (double)global_mem_req.min_buffer_size / GB);
+            fprintf(stderr, "  Optimal buffer size: %.2f GB\n", (double)global_mem_req.optimal_buffer_size / GB);
+            fprintf(stderr, "  Max buffer size: %.2f GB\n", (double)global_mem_req.max_buffer_size / GB);
+            fprintf(stderr, "  Chunk size: %.2f GB\n", (double)global_mem_req.chunk_size / GB);
+            fprintf(stderr, "  Region count: %d\n", global_mem_req.region_count);
+        }
+    }
+
     ThreadArg *thread_args = malloc(header->n_targets * sizeof(ThreadArg));
     if (!thread_args)
     {
