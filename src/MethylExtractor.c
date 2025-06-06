@@ -23,9 +23,11 @@
 #define TB (GB * 1024ULL)
 
 // Memory allocation constants
-#define MIN_BUFFER_SIZE (1ULL * GB)
-#define MAX_BUFFER_PERCENT 0.5
-#define OPTIMAL_BUFFER_PERCENT 0.25
+#define MIN_BUFFER_SIZE (1ULL * MB)      // Initial buffer size
+#define MAX_BUFFER_SIZE (1ULL * GB)      // Maximum buffer size
+#define BUFFER_GROWTH_FACTOR 2           // Buffer growth multiplier
+
+// Memory allocation constants
 #define MIN_BUFFER_PERCENT 0.001
 #define SAMPLE_READ_COUNT 100000
 
@@ -148,7 +150,7 @@ typedef struct
     int min_meth;
     int max_meth;
     int compression;
-    int chunk_size;
+    size_t chunk_size;
     int append_mode;
     OutputFormat output_format;
     int split_context_files;
@@ -841,9 +843,11 @@ static void *process_chromosome_region(void *arg)
     int ret;
     hts_itr_t *iter = NULL;  // Initialize to NULL
     samFile *fp = NULL;      // Local BAM file pointer
+    bam_hdr_t *header = NULL; // Local header pointer
     
-    // Allocate larger initial buffers to reduce reallocations
-    size_t initial_size = targ->chunk_size;
+    // Start with a reasonable initial size
+    size_t initial_size = MIN_BUFFER_SIZE;
+    
     uint8_t *seq = malloc(initial_size);
     uint8_t *qual = malloc(initial_size);
     int *strands = malloc(initial_size * sizeof(int));
@@ -860,6 +864,14 @@ static void *process_chromosome_region(void *arg)
     if (!fp) 
     {
         fprintf(stderr, "Failed to open BAM file: %s\n", targ->bam_file);
+        goto cleanup;
+    }
+
+    // Load BAM header
+    header = sam_hdr_read(fp);
+    if (!header) 
+    {
+        fprintf(stderr, "Failed to read BAM header\n");
         goto cleanup;
     }
 
@@ -896,8 +908,11 @@ static void *process_chromosome_region(void *arg)
         // Check if we need to resize buffers
         if (n_records + len > initial_size) 
         {
-            // Double the size
-            size_t new_size = initial_size * 2;
+            // Simple doubling strategy with a reasonable maximum
+            size_t new_size = initial_size * BUFFER_GROWTH_FACTOR;
+            if (new_size > MAX_BUFFER_SIZE)
+                new_size = MAX_BUFFER_SIZE;
+            
             uint8_t *new_seq = realloc(seq, new_size);
             uint8_t *new_qual = realloc(qual, new_size);
             int *new_strands = realloc(strands, new_size * sizeof(int));
@@ -963,6 +978,7 @@ cleanup:
     if (qual) free(qual);
     if (strands) free(strands);
     if (positions) free(positions);
+    if (header) bam_hdr_destroy(header);
     if (fp) sam_close(fp);
     if (iter) hts_itr_destroy(iter);
     return NULL;
