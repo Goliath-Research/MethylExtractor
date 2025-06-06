@@ -493,20 +493,31 @@ static void process_methylation_cpu(
     const uint32_t start_pos
 ) 
 {
+    // Pre-compute position keys for faster lookup
+    uint64_t *keys = malloc(n_records * sizeof(uint64_t));
+    if (!keys) return;
+    
     for (size_t i = 0; i < n_records; i++) 
     {
-        if (qual[i] >= min_phred) 
+        keys[i] = ((uint64_t)positions[i] << 32) | (positions[i] - 1);
+    }
+
+    // Process records in batches for better cache utilization
+    const size_t BATCH_SIZE = 1024;
+    for (size_t batch_start = 0; batch_start < n_records; batch_start += BATCH_SIZE) 
+    {
+        size_t batch_end = (batch_start + BATCH_SIZE < n_records) ? batch_start + BATCH_SIZE : n_records;
+        
+        for (size_t i = batch_start; i < batch_end; i++) 
         {
-            uint32_t pos = positions[i];
-            uint64_t key = ((uint64_t)pos << 32) | (pos - 1);
-            
-            // Try each context
+            if (qual[i] < min_phred) continue;
+
+            // Try each context in order of likelihood (CPG most common)
             for (int ctx = 1; ctx <= 3; ctx++) 
             {
-                if (!context_buffers[ctx] || !context_pos_maps[ctx])
-                    continue;
-                    
-                khint_t iter = kh_get(pos, context_pos_maps[ctx], key);
+                if (!context_buffers[ctx] || !context_pos_maps[ctx]) continue;
+                
+                khint_t iter = kh_get(pos, context_pos_maps[ctx], keys[i]);
                 if (iter != kh_end(context_pos_maps[ctx])) 
                 {
                     size_t idx = kh_val(context_pos_maps[ctx], iter);
@@ -521,6 +532,8 @@ static void process_methylation_cpu(
             }
         }
     }
+    
+    free(keys);
 }
 
 // CPU version of filtering and coverage calculation
@@ -819,18 +832,28 @@ static MemoryRequirements calculate_memory_requirements(
     return req;
 }
 
-// Update process_chromosome_region to use adaptive memory allocation
+// Update process_chromosome_region to use more efficient memory allocation
 static void *process_chromosome_region(void *arg) 
 {
     ThreadArg *targ = (ThreadArg *)arg;
     bam1_t *b = bam_init1();
     size_t n_records = 0;
     int ret;
-    uint8_t *seq = NULL;
-    uint8_t *qual = NULL;
-    int *strands = NULL;
-    uint32_t *positions = NULL;
+    hts_itr_t *iter = NULL;  // Initialize to NULL
     
+    // Allocate larger initial buffers to reduce reallocations
+    size_t initial_size = targ->chunk_size;
+    uint8_t *seq = malloc(initial_size);
+    uint8_t *qual = malloc(initial_size);
+    int *strands = malloc(initial_size * sizeof(int));
+    uint32_t *positions = malloc(initial_size * sizeof(uint32_t));
+    
+    if (!seq || !qual || !strands || !positions) 
+    {
+        fprintf(stderr, "Failed to allocate sequence data buffers\n");
+        goto cleanup;
+    }
+
     // Open BAM file for this region
     targ->fp = sam_open(targ->bam_file, "r");
     if (!targ->fp) 
@@ -848,7 +871,7 @@ static void *process_chromosome_region(void *arg)
     }
 
     // Create iterator for this region
-    hts_itr_t *iter = sam_itr_queryi(idx, targ->tid, targ->start_pos, targ->end_pos);
+    iter = sam_itr_queryi(idx, targ->tid, targ->start_pos, targ->end_pos);
     hts_idx_destroy(idx);
     if (!iter) 
     {
@@ -856,24 +879,6 @@ static void *process_chromosome_region(void *arg)
                 targ->chr, targ->start_pos, targ->end_pos);
         goto cleanup;
     }
-
-    // Allocate initial memory for sequence data with a reasonable size
-    size_t initial_size = 1024 * 1024;  // Start with 1MB
-    seq = malloc(initial_size);
-    qual = malloc(initial_size);
-    strands = malloc(initial_size * sizeof(int));
-    positions = malloc(initial_size * sizeof(uint32_t));
-    
-    if (!seq || !qual || !strands || !positions) 
-    {
-        fprintf(stderr, "Failed to allocate initial sequence data buffers\n");
-        goto cleanup;
-    }
-
-    size_t seq_size = initial_size;
-    size_t qual_size = initial_size;
-    size_t strands_size = initial_size;
-    size_t positions_size = initial_size;
 
     // Process reads using iterator
     while ((ret = sam_itr_next(targ->fp, iter, b)) >= 0) 
@@ -888,14 +893,10 @@ static void *process_chromosome_region(void *arg)
         int len = b->core.l_qseq;
 
         // Check if we need to resize buffers
-        if (n_records + len > seq_size) 
+        if (n_records + len > initial_size) 
         {
-            // Calculate new size (double current size or use chunk size, whichever is larger)
-            size_t new_size = seq_size * 2;
-            if (new_size < targ->chunk_size)
-                new_size = targ->chunk_size;
-            
-            // Try to resize buffers
+            // Double the size
+            size_t new_size = initial_size * 2;
             uint8_t *new_seq = realloc(seq, new_size);
             uint8_t *new_qual = realloc(qual, new_size);
             int *new_strands = realloc(strands, new_size * sizeof(int));
@@ -903,13 +904,7 @@ static void *process_chromosome_region(void *arg)
             
             if (!new_seq || !new_qual || !new_strands || !new_positions) 
             {
-                // If realloc fails, free the new pointers and process what we have
-                if (new_seq) free(new_seq);
-                if (new_qual) free(new_qual);
-                if (new_strands) free(new_strands);
-                if (new_positions) free(new_positions);
-                
-                // Process existing records before continuing
+                // If realloc fails, process what we have and continue
                 if (n_records > 0) 
                 {
                     process_methylation_cpu(
@@ -922,12 +917,11 @@ static void *process_chromosome_region(void *arg)
                 continue;
             }
             
-            // Update pointers and sizes
             seq = new_seq;
             qual = new_qual;
             strands = new_strands;
             positions = new_positions;
-            seq_size = qual_size = strands_size = positions_size = new_size;
+            initial_size = new_size;
         }
 
         // Copy sequence and quality data
@@ -1200,17 +1194,17 @@ void process_chromosome(ThreadArg *targ)
     if (chunk_size > targ->chr_len)
         chunk_size = targ->chr_len;
 
-    int n_regions = (int)ceil((double)targ->chr_len / chunk_size);
+    int n_regions = 1;  // Initialize to 1 as minimum value
+    n_regions = (int)ceil((double)targ->chr_len / chunk_size);
     if (n_regions > global_mem_req.region_count)
     {
         n_regions = global_mem_req.region_count;
         chunk_size = (targ->chr_len + n_regions - 1) / n_regions;
     }
-    if (n_regions < 1)
-        n_regions = 1;
 
     // Allocate thread arguments array
-    ThreadArg *region_args = malloc(n_regions * sizeof(ThreadArg));
+    ThreadArg *region_args = NULL;  // Initialize to NULL
+    region_args = malloc(n_regions * sizeof(ThreadArg));
     if (!region_args) 
     {
         fprintf(stderr, "Failed to allocate region arguments\n");
@@ -1285,7 +1279,8 @@ void process_chromosome(ThreadArg *targ)
         region_args[i].end_pos = end_pos;
     }
 
-    pthread_t *threads = malloc(n_regions * sizeof(pthread_t));
+    pthread_t *threads = NULL;  // Initialize to NULL
+    threads = malloc(n_regions * sizeof(pthread_t));
     if (!threads)
     {
         fprintf(stderr, "Failed to allocate threads\n");
@@ -1367,11 +1362,13 @@ void process_chromosome(ThreadArg *targ)
 
 cleanup:
     // Clean up region arguments
-    for (int i = 0; i < n_regions; i++)
-        if (region_args[i].chr) 
-            free(region_args[i].chr);
-    free(region_args);
-    free(threads);
+    if (region_args) {
+        for (int i = 0; i < n_regions; i++)
+            if (region_args[i].chr) 
+                free(region_args[i].chr);
+        free(region_args);
+    }
+    if (threads) free(threads);
     
     // Clean up context buffers and position maps
     for (int ctx = 1; ctx <= 3; ctx++) 
