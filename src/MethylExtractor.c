@@ -840,6 +840,7 @@ static void *process_chromosome_region(void *arg)
     size_t n_records = 0;
     int ret;
     hts_itr_t *iter = NULL;  // Initialize to NULL
+    samFile *fp = NULL;      // Local BAM file pointer
     
     // Allocate larger initial buffers to reduce reallocations
     size_t initial_size = targ->chunk_size;
@@ -855,15 +856,15 @@ static void *process_chromosome_region(void *arg)
     }
 
     // Open BAM file for this region
-    targ->fp = sam_open(targ->bam_file, "r");
-    if (!targ->fp) 
+    fp = sam_open(targ->bam_file, "r");
+    if (!fp) 
     {
         fprintf(stderr, "Failed to open BAM file: %s\n", targ->bam_file);
         goto cleanup;
     }
 
     // Create index for BAM file
-    hts_idx_t *idx = sam_index_load(targ->fp, targ->bam_file);
+    hts_idx_t *idx = sam_index_load(fp, targ->bam_file);
     if (!idx) 
     {
         fprintf(stderr, "Failed to load BAM index\n");
@@ -881,7 +882,7 @@ static void *process_chromosome_region(void *arg)
     }
 
     // Process reads using iterator
-    while ((ret = sam_itr_next(targ->fp, iter, b)) >= 0) 
+    while ((ret = sam_itr_next(fp, iter, b)) >= 0) 
     {
         // Check if read is mapped and passes quality filters
         if (b->core.flag & BAM_FUNMAP || b->core.qual < targ->min_mapq)
@@ -962,7 +963,7 @@ cleanup:
     if (qual) free(qual);
     if (strands) free(strands);
     if (positions) free(positions);
-    if (targ->fp) sam_close(targ->fp);
+    if (fp) sam_close(fp);
     if (iter) hts_itr_destroy(iter);
     return NULL;
 }

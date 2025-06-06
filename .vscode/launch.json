@@ -7,7 +7,7 @@
       "request": "launch",
       "args": [
         "-x", "/home/ubuntu/Work/HRA006113/human2014.json",
-        "-O", "/home/ubuntu/Work/HRA006113/HRR1458935", 
+        "-O", "/home/ubuntu/Work/HRA006113/HRR1458910", 
         "-z", "9", 
         "-q", "30", 
         "-p", "20", 
@@ -17,7 +17,7 @@
         "-k", "1000000",
         "-S",
         "/home/ubuntu/Work/genomes/human_genome/release-113/Homo_sapiens.GRCh38.dna.primary_assembly.fa", 
-        "/home/ubuntu/Work/HRA006113/HRR1458935/HRR1458935.bam"
+        "/home/ubuntu/Work/HRA006113/HRR1458910/HRR1458910.bam"
       ],
       "stopAtEntry": false,
       "externalConsole": false,
