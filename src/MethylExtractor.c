@@ -15,6 +15,7 @@
 #include <sys/sysinfo.h>
 #include <time.h>
 #include "cjson/cJSON.h"
+#include <stdint.h>  // For int64_t
 
 // Memory size constants
 #define KB (1024ULL)
@@ -104,7 +105,7 @@ static size_t get_optimal_chunk_size()
 #define SIGN_MASK 0x80
 
 // Hash table for position-to-buffer-index mapping
-KHASH_MAP_INIT_INT64(pos, size_t)
+KHASH_INIT(pos, uint64_t, size_t, 1, kh_int64_hash_func, kh_int64_hash_equal)  // Use uint64_t keys
 KHASH_SET_INIT_STR(str)
 
 #define ZSTD_FILTER 32015  // Zstandard filter ID
@@ -190,20 +191,69 @@ typedef struct
     size_t optimal_buffer_size; // Optimal buffer size based on data
     size_t max_buffer_size;    // Maximum buffer size allowed
     size_t chunk_size;         // Processing chunk size
-    int region_count;          // Number of regions to process in parallel
 } MemoryRequirements;
-
-// Add new structure for BAM statistics
-typedef struct {
-    double avg_coverage;
-    size_t total_reads;
-    size_t total_bases;
-    size_t max_read_length;
-    int has_coverage_info;
-} BamStats;
 
 // Add global memory requirements
 static MemoryRequirements global_mem_req = {0};
+
+// Structure to hold chromosome processing results
+typedef struct {
+    char *chr_name;
+    int tid;
+    MethylRecord **context_buffers;  // Array of 3 buffers (CPG, CHG, CHH)
+    size_t *context_sizes;          // Size of each context buffer
+    khash_t(pos) **context_pos_maps; // Array of position maps for each context
+    int processed;                  // Flag to indicate processing is complete
+    pthread_mutex_t mutex;          // Mutex for thread safety
+} ChromosomeResult;
+
+// Structure for the processing queue
+typedef struct {
+    ChromosomeResult *results;      // Array of chromosome results
+    int total_chromosomes;          // Total number of chromosomes
+    int processed_count;            // Count of processed chromosomes
+    pthread_mutex_t queue_mutex;    // Mutex for queue operations
+    pthread_cond_t queue_cond;      // Condition variable for queue synchronization
+} ProcessingQueue;
+
+// Structure for thread arguments
+typedef struct 
+{
+    ProcessingQueue *queue;         // Pointer to the processing queue
+    const char *bam_file;          // BAM file path
+    const char *out_dir;           // Output directory
+    const char *ref_file;          // Reference file path
+    const char *chr_name;          // BAM chromosome name
+    const char *fasta_chr_name;    // FASTA chromosome name
+    const char *display_name;      // Display name for output files
+    int min_mapq;                  // Minimum mapping quality
+    int min_phred;                 // Minimum Phred score
+    int keep_chg;                  // Whether to process CHG context
+    int keep_chh;                  // Whether to process CHH context
+    int thread_id;                 // Thread identifier
+    pthread_mutex_t fai_mutex;     // Per-thread mutex for FASTA operations
+    int use_gpu;                   // GPU flag
+    int split_context_files;       // Split context files flag
+    OutputFormat output_format;    // Output format
+    int tid;                       // Chromosome ID
+    uint32_t chunk_size;          // Processing chunk size
+    samFile *fp;                   // BAM file pointer
+    bam_hdr_t *header;            // BAM header
+    hts_idx_t *idx;               // BAM index
+    faidx_t *fai;                 // FASTA index
+    char *chr_seq;                // Chromosome sequence
+    uint32_t chr_len;             // Chromosome length
+    ChromosomeResult *result;     // Result structure
+    int min_cov;                  // Minimum coverage
+    int cap_cov;                  // Coverage cap
+    int min_meth;                 // Minimum methylation
+    int max_meth;                 // Maximum methylation
+    int hdf5_compression;         // HDF5 compression level
+    int hdf5_chunk_size;          // HDF5 chunk size
+} ThreadContext;
+
+// Function declarations
+static void *process_chromosome_thread(void *arg);
 
 static void log_time(const char *format, ...) 
 {
@@ -458,7 +508,8 @@ void initialize_buffer(
     const char *chr_seq, 
     uint32_t chr_len, 
     int keep_chg, 
-    int keep_chh
+    int keep_chh,
+    khash_t(pos) **context_pos_maps
 )
 {
     size_t idx = 0;
@@ -476,6 +527,26 @@ void initialize_buffer(
             buffer[idx].tnc.tnc = tnc_val;
             buffer[idx].tnc.context = ctx;
             buffer[idx].tnc.strand = (strand == '+') ? 0 : 1;
+
+            // Add position to the appropriate context map
+            if (context_pos_maps && context_pos_maps[ctx]) 
+            {
+                // Construct key as uint64_t: (pos << 32) | (pos - 1)
+                uint64_t key = ((uint64_t)pos << 32) | ((uint64_t)(pos - 1));
+                int ret;
+                khint_t k = kh_put(pos, context_pos_maps[ctx], key, &ret);
+                if (ret == -1) 
+                {
+                    // Hash table is full, resize it
+                    kh_resize(pos, context_pos_maps[ctx], kh_size(context_pos_maps[ctx]) * 2);
+                    k = kh_put(pos, context_pos_maps[ctx], key, &ret);
+                }
+                if (ret >= 0) 
+                {
+                    kh_val(context_pos_maps[ctx], k) = idx;
+                }
+            }
+
             idx++;
         }
     }
@@ -495,15 +566,6 @@ static void process_methylation_cpu(
     const uint32_t start_pos
 ) 
 {
-    // Pre-compute position keys for faster lookup
-    uint64_t *keys = malloc(n_records * sizeof(uint64_t));
-    if (!keys) return;
-    
-    for (size_t i = 0; i < n_records; i++) 
-    {
-        keys[i] = ((uint64_t)positions[i] << 32) | (positions[i] - 1);
-    }
-
     // Process records in batches for better cache utilization
     const size_t BATCH_SIZE = 1024;
     for (size_t batch_start = 0; batch_start < n_records; batch_start += BATCH_SIZE) 
@@ -519,7 +581,8 @@ static void process_methylation_cpu(
             {
                 if (!context_buffers[ctx] || !context_pos_maps[ctx]) continue;
                 
-                khint_t iter = kh_get(pos, context_pos_maps[ctx], keys[i]);
+                uint64_t key = ((uint64_t)positions[i] << 32) | (positions[i] - 1);
+                khint_t iter = kh_get(pos, context_pos_maps[ctx], key);
                 if (iter != kh_end(context_pos_maps[ctx])) 
                 {
                     size_t idx = kh_val(context_pos_maps[ctx], iter);
@@ -534,8 +597,6 @@ static void process_methylation_cpu(
             }
         }
     }
-    
-    free(keys);
 }
 
 // CPU version of filtering and coverage calculation
@@ -660,7 +721,7 @@ __global__ void process_methylation_kernel(
             (base == 'G' && (strand == 2 || strand == 4)))
             atomicAdd(&buffer[pos].mC, 1);
         else if ((base == 'T' && (strand == 1 || strand == 3)) ||
-                 (base == 'A' && (strand == 2 || strand == 4)))
+                 (base == 'A' && (strand == 2 || strands[i] == 4)))
             atomicAdd(&buffer[pos].uC, 1);
     }
 }
@@ -700,204 +761,60 @@ __global__ void filter_and_calculate_coverage_kernel(
 }
 #endif
 
-// Extract coverage information from BAM header
-static BamStats extract_bam_stats(bam_hdr_t *header, const char *chr_name) 
-{
-    BamStats stats = {0};
-    stats.has_coverage_info = 0;
-    
-    // Check for coverage information in @CO lines
-    char *coverage_str = NULL;
-    char *coverage_key = "coverage=";
-    char *coverage_end = NULL;
-    
-    for (int i = 0; i < header->n_targets; i++) 
-    {
-        if (strcmp(header->target_name[i], chr_name) == 0) 
-        {
-            // Look for coverage information in comments
-            char *comment = header->text;
-            while ((comment = strstr(comment, "@CO")) != NULL) 
-            {
-                if ((coverage_str = strstr(comment, coverage_key)) != NULL) 
-                {
-                    coverage_str += strlen(coverage_key);
-                    stats.avg_coverage = strtod(coverage_str, &coverage_end);
-                    if (coverage_end != coverage_str) 
-                    {
-                        stats.has_coverage_info = 1;
-                        break;
-                    }
-                }
-                comment += 3; // Move past "@CO"
-            }
-            break;
-        }
-    }
-    
-    return stats;
-}
-
-// Update calculate_memory_requirements to use header information
-static MemoryRequirements calculate_memory_requirements(
-    const char *bam_file,
-    const char *chr_name,
+// Update process_chromosome_region signature
+static void process_chromosome_region(
+    ThreadContext *ctx,
+    samFile *in,
+    bam_hdr_t *header,
+    hts_idx_t *idx,
+    faidx_t *fai,
+    char *chr_seq,
     uint32_t chr_len,
-    int min_mapq,
-    int min_phred
+    ChromosomeResult *result
+);
+
+static void process_chromosome_region(
+    ThreadContext *ctx,
+    samFile *in,
+    bam_hdr_t *header,
+    hts_idx_t *idx,
+    faidx_t *fai,
+    char *chr_seq,
+    uint32_t chr_len,
+    ChromosomeResult *result
 ) 
 {
-    MemoryRequirements req = {0};
-    long total_mem = get_total_memory();
-    int cpu_count = get_optimal_thread_count();
-    
-    fprintf(stderr, "Memory calculation for %s (length: %u)\n", chr_name, chr_len);
-    fprintf(stderr, "Total system memory: %.2f GB\n", (double)total_mem / GB);
-    
-    // Set more aggressive defaults
-    req.min_buffer_size = 1ULL * GB;  // 1GB minimum
-    req.optimal_buffer_size = total_mem / 4;  // Use 25% of total memory
-    req.max_buffer_size = total_mem / 2;  // Allow up to 50% of total memory
-    req.chunk_size = 1ULL * GB;  // Default to 1GB chunks
-    req.region_count = cpu_count * 4;  // More regions for better parallelization
-    
-    // Open BAM file to get statistics
-    samFile *in = sam_open(bam_file, "r");
-    if (!in) 
-    {
-        fprintf(stderr, "Failed to open BAM file for memory calculation\n");
-        return req;
-    }
-    
-    bam_hdr_t *header = sam_hdr_read(in);
-    if (!header) 
-    {
-        fprintf(stderr, "Failed to read BAM header\n");
-        sam_close(in);
-        return req;
-    }
-    
-    // Try to get coverage information from header first
-    BamStats stats = extract_bam_stats(header, chr_name);
-    double avg_coverage = 0.0;
-    
-    if (!stats.has_coverage_info) 
-    {
-        // If no coverage info in header, use a conservative estimate
-        avg_coverage = 30.0;  // Assume 30x coverage if unknown
-        fprintf(stderr, "No coverage info in header, using conservative estimate of 30x\n");
-    }
-    else
-    {
-        avg_coverage = stats.avg_coverage;
-        fprintf(stderr, "Using coverage information from BAM header: %.2fx\n", avg_coverage);
-    }
-    
-    // Calculate memory requirements based on coverage, but with hard limits
-    size_t estimated_bases = (size_t)(chr_len * avg_coverage);
-    fprintf(stderr, "Estimated bases to process: %zu\n", estimated_bases);
-    
-    // Calculate optimal buffer size with hard limits
-    req.optimal_buffer_size = estimated_bases;
-    if (req.optimal_buffer_size > req.max_buffer_size)
-        req.optimal_buffer_size = req.max_buffer_size;
-    if (req.optimal_buffer_size < req.min_buffer_size)
-        req.optimal_buffer_size = req.min_buffer_size;
-    
-    // Adjust chunk size based on coverage and available memory
-    if (avg_coverage > HIGH_COVERAGE_THRESHOLD)
-        req.chunk_size = HIGH_COVERAGE_CHUNK;  // 1GB for high coverage
-    else if (avg_coverage > MEDIUM_COVERAGE_THRESHOLD)
-        req.chunk_size = MEDIUM_COVERAGE_CHUNK;  // 2GB for medium coverage
-    else
-        req.chunk_size = NORMAL_COVERAGE_CHUNK;  // 4GB for normal coverage
-    
-    // Ensure chunk size doesn't exceed optimal buffer size
-    if (req.chunk_size > req.optimal_buffer_size)
-        req.chunk_size = req.optimal_buffer_size;
-    
-    // Ensure chunk size is at least 1GB
-    if (req.chunk_size < 1ULL * GB)
-        req.chunk_size = 1ULL * GB;
-    
-    fprintf(stderr, "Final memory settings:\n");
-    fprintf(stderr, "  Min buffer size: %.2f GB\n", (double)req.min_buffer_size / GB);
-    fprintf(stderr, "  Optimal buffer size: %.2f GB\n", (double)req.optimal_buffer_size / GB);
-    fprintf(stderr, "  Max buffer size: %.2f GB\n", (double)req.max_buffer_size / GB);
-    fprintf(stderr, "  Chunk size: %.2f GB\n", (double)req.chunk_size / GB);
-    fprintf(stderr, "  Region count: %d\n", req.region_count);
-    
-    // Cleanup
-    sam_hdr_destroy(header);
-    sam_close(in);
-    
-    return req;
-}
-
-// Update process_chromosome_region to use more efficient memory allocation
-static void *process_chromosome_region(void *arg) 
-{
-    ThreadArg *targ = (ThreadArg *)arg;
     bam1_t *b = bam_init1();
     size_t n_records = 0;
     int ret;
-    hts_itr_t *iter = NULL;  // Initialize to NULL
-    samFile *fp = NULL;      // Local BAM file pointer
-    bam_hdr_t *header = NULL; // Local header pointer
-    
-    // Start with a reasonable initial size
+    hts_itr_t *iter = NULL;
+
+    // Allocate buffers
     size_t initial_size = MIN_BUFFER_SIZE;
-    
     uint8_t *seq = malloc(initial_size);
     uint8_t *qual = malloc(initial_size);
     int *strands = malloc(initial_size * sizeof(int));
     uint32_t *positions = malloc(initial_size * sizeof(uint32_t));
-    
+
     if (!seq || !qual || !strands || !positions) 
     {
         fprintf(stderr, "Failed to allocate sequence data buffers\n");
         goto cleanup;
     }
 
-    // Open BAM file for this region
-    fp = sam_open(targ->bam_file, "r");
-    if (!fp) 
-    {
-        fprintf(stderr, "Failed to open BAM file: %s\n", targ->bam_file);
-        goto cleanup;
-    }
-
-    // Load BAM header
-    header = sam_hdr_read(fp);
-    if (!header) 
-    {
-        fprintf(stderr, "Failed to read BAM header\n");
-        goto cleanup;
-    }
-
-    // Create index for BAM file
-    hts_idx_t *idx = sam_index_load(fp, targ->bam_file);
-    if (!idx) 
-    {
-        fprintf(stderr, "Failed to load BAM index\n");
-        goto cleanup;
-    }
-
     // Create iterator for this region
-    iter = sam_itr_queryi(idx, targ->tid, targ->start_pos, targ->end_pos);
-    hts_idx_destroy(idx);
+    iter = sam_itr_queryi(idx, ctx->tid, 0, chr_len);
     if (!iter) 
     {
-        fprintf(stderr, "Failed to create iterator for region %s:%u-%u\n", 
-                targ->chr, targ->start_pos, targ->end_pos);
+        fprintf(stderr, "Failed to create iterator for chromosome %s\n", ctx->chr_name);
         goto cleanup;
     }
 
-    // Process reads using iterator
-    while ((ret = sam_itr_next(fp, iter, b)) >= 0) 
+    // Process reads
+    while ((ret = sam_itr_next(in, iter, b)) >= 0) 
     {
-        // Check if read is mapped and passes quality filters
-        if (b->core.flag & BAM_FUNMAP || b->core.qual < targ->min_mapq)
+        // Process read
+        if (b->core.flag & BAM_FUNMAP || b->core.qual < ctx->min_mapq)
             continue;
 
         // Get sequence and quality data
@@ -908,31 +825,18 @@ static void *process_chromosome_region(void *arg)
         // Check if we need to resize buffers
         if (n_records + len > initial_size) 
         {
-            // Simple doubling strategy with a reasonable maximum
-            size_t new_size = initial_size * BUFFER_GROWTH_FACTOR;
-            if (new_size > MAX_BUFFER_SIZE)
-                new_size = MAX_BUFFER_SIZE;
-            
+            size_t new_size = initial_size * 2;
             uint8_t *new_seq = realloc(seq, new_size);
             uint8_t *new_qual = realloc(qual, new_size);
             int *new_strands = realloc(strands, new_size * sizeof(int));
             uint32_t *new_positions = realloc(positions, new_size * sizeof(uint32_t));
-            
+
             if (!new_seq || !new_qual || !new_strands || !new_positions) 
             {
-                // If realloc fails, process what we have and continue
-                if (n_records > 0) 
-                {
-                    process_methylation_cpu(
-                        seq, qual, strands, positions, targ->context_buffers,
-                        targ->context_pos_maps, targ->min_phred, targ->min_mapq, 
-                        n_records, targ->start_pos
-                    );
-                    n_records = 0;
-                }
-                continue;
+                fprintf(stderr, "Failed to resize buffers\n");
+                goto cleanup;
             }
-            
+
             seq = new_seq;
             qual = new_qual;
             strands = new_strands;
@@ -950,25 +854,25 @@ static void *process_chromosome_region(void *arg)
         }
         n_records += len;
 
-        // Process in chunks to avoid memory issues
-        if (n_records >= targ->chunk_size) 
+        // Process in chunks
+        if (n_records >= ctx->chunk_size) 
         {
             process_methylation_cpu(
-                seq, qual, strands, positions, targ->context_buffers,
-                targ->context_pos_maps, targ->min_phred, targ->min_mapq, 
-                n_records, targ->start_pos
+                seq, qual, strands, positions, result->context_buffers,
+                result->context_pos_maps, ctx->min_phred, ctx->min_mapq, 
+                n_records, 0
             );
-            n_records = 0;  // Reset counter after processing
+            n_records = 0;
         }
     }
 
-    // Process any remaining records
+    // Process remaining records
     if (n_records > 0) 
     {
         process_methylation_cpu(
-            seq, qual, strands, positions, targ->context_buffers,
-            targ->context_pos_maps, targ->min_phred, targ->min_mapq, 
-            n_records, targ->start_pos
+            seq, qual, strands, positions, result->context_buffers,
+            result->context_pos_maps, ctx->min_phred, ctx->min_mapq, 
+            n_records, 0
         );
     }
 
@@ -978,10 +882,7 @@ cleanup:
     if (qual) free(qual);
     if (strands) free(strands);
     if (positions) free(positions);
-    if (header) bam_hdr_destroy(header);
-    if (fp) sam_close(fp);
     if (iter) hts_itr_destroy(iter);
-    return NULL;
 }
 
 void flush_buffer(
@@ -1134,269 +1035,121 @@ void flush_buffer(
     free(filtered_buffer);
 }
 
-void process_chromosome(ThreadArg *targ)
+static void process_chromosome(ThreadContext *ctx)
 {
-    log_time("Starting processing of chromosome %s\n", targ->chr);
+    log_time("Starting processing of chromosome %s\n", ctx->chr_name);
     
     // Use the global memory requirements
-    targ->chunk_size = global_mem_req.chunk_size;
+    ctx->chunk_size = global_mem_req.chunk_size;
     
     // Pre-calculate sites for each context
     size_t sites_per_context[4] = {0}; // Index 0 unused, 1=CPG, 2=CHG, 3=CHH
     
     // Count sites per context
-    for (uint32_t pos = 0; pos < targ->chr_len; pos++) 
+    for (uint32_t pos = 0; pos < ctx->chr_len; pos++) 
     {
         int8_t strand_ctx;
         uint8_t tnc_val;
-        int ctx = get_context(targ->chr_seq, targ->chr_len, pos, &strand_ctx, &tnc_val, targ->keep_chg, targ->keep_chh);
-        if (ctx > 0 && ctx <= 3)
-            sites_per_context[ctx]++;
+        int ctx_type = get_context(ctx->chr_seq, ctx->chr_len, pos, &strand_ctx, &tnc_val, ctx->keep_chg, ctx->keep_chh);
+        if (ctx_type > 0 && ctx_type <= 3)
+            sites_per_context[ctx_type]++;
     }
     
     // Pre-allocate buffers for each context
-    MethylRecord *context_buffers[4] = {NULL}; // Index 0 unused, 1=CPG, 2=CHG, 3=CHH
-    for (int ctx = 1; ctx <= 3; ctx++) 
+    for (int ctx_type = 1; ctx_type <= 3; ctx_type++) 
     {
-        if ((ctx == CONTEXT_CPG) ||
-            (ctx == CONTEXT_CHG && targ->keep_chg) ||
-            (ctx == CONTEXT_CHH && targ->keep_chh)) 
+        if ((ctx_type == CONTEXT_CPG) ||
+            (ctx_type == CONTEXT_CHG && ctx->keep_chg) ||
+            (ctx_type == CONTEXT_CHH && ctx->keep_chh)) 
         {
-            context_buffers[ctx] = calloc(sites_per_context[ctx], sizeof(MethylRecord));
-            if (!context_buffers[ctx]) 
+            // Initialize position map first
+            ctx->result->context_pos_maps[ctx_type] = kh_init(pos);
+            if (!ctx->result->context_pos_maps[ctx_type]) 
             {
-                fprintf(stderr, "Failed to allocate buffer for %s context\n", get_context_string(ctx));
+                fprintf(stderr, "Failed to initialize position map for %s context\n", get_context_string(ctx_type));
+                goto cleanup;
+            }
+
+            // Allocate buffer
+            ctx->result->context_buffers[ctx_type] = calloc(sites_per_context[ctx_type], sizeof(MethylRecord));
+            if (!ctx->result->context_buffers[ctx_type]) 
+            {
+                fprintf(stderr, "Failed to allocate buffer for %s context\n", get_context_string(ctx_type));
+                kh_destroy(pos, ctx->result->context_pos_maps[ctx_type]);
+                ctx->result->context_pos_maps[ctx_type] = NULL;
                 goto cleanup;
             }
             
             // Initialize buffer with positions and context information
-            size_t idx = 0;
-            for (uint32_t pos = 0; pos < targ->chr_len && idx < sites_per_context[ctx]; pos++) 
-            {
-                int8_t strand_ctx;
-                uint8_t tnc_val;
-                int current_ctx = get_context(targ->chr_seq, targ->chr_len, pos, &strand_ctx, &tnc_val, targ->keep_chg, targ->keep_chh);
-                if (current_ctx == ctx) 
-                {
-                    context_buffers[ctx][idx].pos = pos + 1;
-                    context_buffers[ctx][idx].mC = 0;
-                    context_buffers[ctx][idx].uC = 0;
-                    context_buffers[ctx][idx].tnc.tnc = tnc_val;
-                    context_buffers[ctx][idx].tnc.context = ctx;
-                    context_buffers[ctx][idx].tnc.strand = (strand_ctx > 0) ? 0 : 1;
-                    idx++;
-                }
-            }
+            initialize_buffer(
+                ctx->result->context_buffers[ctx_type],
+                sites_per_context[ctx_type],
+                ctx->chr_seq,
+                ctx->chr_len,
+                ctx->keep_chg,
+                ctx->keep_chh,
+                ctx->result->context_pos_maps
+            );
+            
+            ctx->result->context_sizes[ctx_type] = sites_per_context[ctx_type];
         }
     }
 
-    // Create position maps for each context
-    khash_t(pos) *context_pos_maps[4] = {NULL}; // Index 0 unused, 1=CPG, 2=CHG, 3=CHH
-    for (int ctx = 1; ctx <= 3; ctx++) 
-    {
-        if (context_buffers[ctx]) 
-        {
-            context_pos_maps[ctx] = kh_init(pos);
-            for (size_t i = 0; i < sites_per_context[ctx]; i++) 
-            {
-                uint64_t key = ((uint64_t)targ->tid << 32) | (context_buffers[ctx][i].pos - 1);
-                int ret;
-                khint_t iter = kh_put(pos, context_pos_maps[ctx], key, &ret);
-                kh_val(context_pos_maps[ctx], iter) = i;
-            }
-        }
-    }
-
-    uint32_t chunk_size = targ->chunk_size;
-    if (chunk_size > targ->chr_len)
-        chunk_size = targ->chr_len;
-
-    int n_regions = 1;  // Initialize to 1 as minimum value
-    n_regions = (int)ceil((double)targ->chr_len / chunk_size);
-    if (n_regions > global_mem_req.region_count)
-    {
-        n_regions = global_mem_req.region_count;
-        chunk_size = (targ->chr_len + n_regions - 1) / n_regions;
-    }
-
-    // Allocate thread arguments array
-    ThreadArg *region_args = NULL;  // Initialize to NULL
-    region_args = malloc(n_regions * sizeof(ThreadArg));
-    if (!region_args) 
-    {
-        fprintf(stderr, "Failed to allocate region arguments\n");
-        goto cleanup;
-    }
-
-    pthread_mutex_t buffer_mutex;
-    pthread_mutex_init(&buffer_mutex, NULL);
-
-    // First, validate the chromosome name
-    if (!targ->chr || strlen(targ->chr) == 0) 
-    {
-        fprintf(stderr, "Invalid chromosome name\n");
-        free(region_args);
-        pthread_mutex_destroy(&buffer_mutex);
-        goto cleanup;
-    }
-
-    for (int i = 0; i < n_regions; i++)
-    {
-        // Initialize each thread argument structure
-        memset(&region_args[i], 0, sizeof(ThreadArg));
-        
-        // Copy all non-pointer fields
-        region_args[i].bam_file = targ->bam_file;
-        region_args[i].out_dir = targ->out_dir;
-        region_args[i].tid = targ->tid;
-        
-        // Make a deep copy of the chromosome name and validate it
-        region_args[i].chr = strdup(targ->chr);
-        if (!region_args[i].chr || strlen(region_args[i].chr) == 0) 
-        {
-            fprintf(stderr, "Failed to allocate or validate chromosome name copy for region %d\n", i);
-            // Clean up previously allocated regions
-            for (int j = 0; j < i; j++) 
-            {
-                free(region_args[j].chr);
-            }
-            free(region_args);
-            pthread_mutex_destroy(&buffer_mutex);
-            goto cleanup;
-        }
-
-        region_args[i].chr_len = targ->chr_len;
-        region_args[i].chr_seq = targ->chr_seq;
-        region_args[i].min_mapq = targ->min_mapq;
-        region_args[i].min_phred = targ->min_phred;
-        region_args[i].min_cov = targ->min_cov;
-        region_args[i].cap_cov = targ->cap_cov;
-        region_args[i].min_meth = targ->min_meth;
-        region_args[i].max_meth = targ->max_meth;
-        region_args[i].keep_chg = targ->keep_chg;
-        region_args[i].keep_chh = targ->keep_chh;
-        region_args[i].hdf5_compression = targ->hdf5_compression;
-        region_args[i].hdf5_chunk_size = targ->hdf5_chunk_size;
-        region_args[i].chunk_size = targ->chunk_size;
-        region_args[i].output_format = targ->output_format;
-        region_args[i].split_context_files = targ->split_context_files;
-
-        // Set shared resources
-        region_args[i].buffer_mutex = &buffer_mutex;
-        region_args[i].context_buffers = context_buffers;
-        region_args[i].context_pos_maps = context_pos_maps;
-
-        uint32_t start_pos = i * chunk_size;
-        uint32_t end_pos = (i == n_regions - 1) ? targ->chr_len : ((i + 1) * chunk_size);
-
-        if (end_pos > targ->chr_len)
-            end_pos = targ->chr_len;
-
-        region_args[i].start_pos = start_pos;
-        region_args[i].end_pos = end_pos;
-    }
-
-    pthread_t *threads = NULL;  // Initialize to NULL
-    threads = malloc(n_regions * sizeof(pthread_t));
-    if (!threads)
-    {
-        fprintf(stderr, "Failed to allocate threads\n");
-        for (int i = 0; i < n_regions; i++) 
-            free(region_args[i].chr);
-        free(region_args);
-        pthread_mutex_destroy(&buffer_mutex);
-        goto cleanup;
-    }
-
-    int active_threads = 0;
-    for (int i = 0; i < n_regions; i++)
-    {
-        if (pthread_create(&threads[i], NULL, (void *(*)(void *))process_chromosome_region, &region_args[i]) != 0)
-        {
-            fprintf(stderr, "Failed to create thread for %s\n", region_args[i].chr);
-            continue;
-        }
-        active_threads++;
-        for (int j = 0; j <= i; j++)
-            if (pthread_join(threads[j], NULL) == 0)
-            {
-                active_threads--;
-                break;
-            }
-        
-        int max_region_threads = 8;
-        while (active_threads >= max_region_threads)
-            for (int j = 0; j <= i; j++)
-                if (pthread_join(threads[j], NULL) == 0)
-                {
-                    active_threads--;
-                    break;
-                }
-    }
-
-    pthread_mutex_destroy(&buffer_mutex);
+    // Process the chromosome data
+    process_chromosome_region(ctx, ctx->fp, ctx->header, ctx->idx, ctx->fai, ctx->chr_seq, ctx->chr_len, ctx->result);
 
     // Process each context
-    for (int ctx = 1; ctx <= 3; ctx++) 
+    for (int ctx_type = 1; ctx_type <= 3; ctx_type++) 
     {
-        if (context_buffers[ctx] && 
-            ((ctx == CONTEXT_CPG) ||
-             (ctx == CONTEXT_CHG && targ->keep_chg) ||
-             (ctx == CONTEXT_CHH && targ->keep_chh))) 
+        if (ctx->result->context_buffers[ctx_type] && 
+            ((ctx_type == CONTEXT_CPG) ||
+             (ctx_type == CONTEXT_CHG && ctx->keep_chg) ||
+             (ctx_type == CONTEXT_CHH && ctx->keep_chh)))
         {
-            log_time("Processing %s context for chromosome %s\n", get_context_string(ctx), targ->chr);
+            log_time("Processing %s context for chromosome %s\n", get_context_string(ctx_type), ctx->display_name);
             
             // Output file name - use appropriate extension based on output format
             char out_path[1024];
-            const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5";  // For OUTPUT_BOTH, use .h5
+            const char *ext = (ctx->output_format == OUTPUT_TXT) ? ".txt" : ".h5";  // For OUTPUT_BOTH, use .h5
             snprintf(
                 out_path, 
                 sizeof(out_path), 
                 "%s/%s-%s%s", 
-                targ->out_dir, 
-                targ->chr, 
-                get_context_string(ctx),
+                ctx->out_dir, 
+                ctx->display_name,  // Use display name for output files
+                get_context_string(ctx_type),
                 ext
             );
             
             flush_buffer(
                 out_path,
-                context_buffers[ctx],
-                sites_per_context[ctx],
-                targ->hdf5_compression,
-                targ->hdf5_chunk_size,
+                ctx->result->context_buffers[ctx_type],
+                ctx->result->context_sizes[ctx_type],
+                ctx->hdf5_compression,
+                ctx->hdf5_chunk_size,
                 0,
-                targ->min_cov,
-                targ->cap_cov,
-                targ->min_meth,
-                targ->max_meth,
-                targ->output_format
+                ctx->min_cov,
+                ctx->cap_cov,
+                ctx->min_meth,
+                ctx->max_meth,
+                ctx->output_format
             );
             
-            log_time("Finished processing %s context for chromosome %s\n", get_context_string(ctx), targ->chr);
+            log_time("Finished processing %s context for chromosome %s\n", get_context_string(ctx_type), ctx->display_name);
         }
     }
 
 cleanup:
-    // Clean up region arguments
-    if (region_args) {
-        for (int i = 0; i < n_regions; i++)
-            if (region_args[i].chr) 
-                free(region_args[i].chr);
-        free(region_args);
-    }
-    if (threads) free(threads);
-    
     // Clean up context buffers and position maps
-    for (int ctx = 1; ctx <= 3; ctx++) 
+    for (int ctx_type = 1; ctx_type <= 3; ctx_type++) 
     {
-        if (context_buffers[ctx])
-            free(context_buffers[ctx]);
-        if (context_pos_maps[ctx])
-            kh_destroy(pos, context_pos_maps[ctx]);
+        if (ctx->result->context_buffers[ctx_type])
+            free(ctx->result->context_buffers[ctx_type]);
+        if (ctx->result->context_pos_maps[ctx_type])
+            kh_destroy(pos, ctx->result->context_pos_maps[ctx_type]);
     }
     
-    log_time("Finished processing chromosome %s\n", targ->chr);
+    log_time("Finished processing chromosome %s\n", ctx->chr_name);
 }
 
 void cleanup_hdf5(void)
@@ -1407,93 +1160,139 @@ void cleanup_hdf5(void)
 int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_entries, char **reference_file) 
 {
     FILE *fp = fopen(filename, "r");
-    if (!fp) 
+    if (!fp) {
+        fprintf(stderr, "Failed to open chromosome mapping file: %s\n", filename);
         return -1;
+    }
+
+    // Read the entire file
     fseek(fp, 0, SEEK_END);
     long len = ftell(fp);
     fseek(fp, 0, SEEK_SET);
+    
     char *data = malloc(len + 1);
+    if (!data) {
+        fprintf(stderr, "Failed to allocate memory for file data\n");
+        fclose(fp);
+        return -2;
+    }
+    
     size_t nread = fread(data, 1, len, fp);
-    if (nread != len) 
-    {
+    if (nread != len) {
+        fprintf(stderr, "Failed to read chromosome mapping file\n");
         free(data);
         fclose(fp);
-        return -2; // Error: could not read the expected number of bytes
+        return -2;
     }
     data[len] = 0;
     fclose(fp);
 
+    // Parse JSON
     cJSON *json = cJSON_Parse(data);
     free(data);
     if (!json) 
+    {
+        fprintf(stderr, "Failed to parse chromosome mapping JSON\n");
         return -3;
+    }
 
     // Get reference file path
     cJSON *ref = cJSON_GetObjectItem(json, "reference");
     if (ref && cJSON_IsString(ref) && ref->valuestring) 
+    {
         *reference_file = strdup(ref->valuestring);
+        fprintf(stderr, "Found reference file: %s\n", *reference_file);
+    }
+    else
+        fprintf(stderr, "Warning: No reference file specified in mapping\n");
 
+    // Get chromosomes array
     cJSON *chroms = cJSON_GetObjectItem(json, "chromosomes");
     if (!chroms || !cJSON_IsArray(chroms)) 
     {
+        fprintf(stderr, "No chromosomes array found in mapping\n");
         cJSON_Delete(json);
         return -4;
     }
+
     int count = cJSON_GetArraySize(chroms);
-    *entries = calloc(count, sizeof(ChromMapEntry));
-    *n_entries = 0;
-    for (int i = 0; i < count; ++i) 
-    {
+    fprintf(stderr, "Found %d chromosome mappings\n", count);
+    
+    // First pass: count valid entries
+    int valid_count = 0;
+    for (int i = 0; i < count; ++i) {
         cJSON *item = cJSON_GetArrayItem(chroms, i);
-        if (!cJSON_IsObject(item)) 
+        if (!cJSON_IsObject(item)) continue;
+        
+        cJSON *fasta = cJSON_GetObjectItem(item, "fasta");
+        cJSON *bam = cJSON_GetObjectItem(item, "bam");
+        cJSON *name = cJSON_GetObjectItem(item, "name");
+        
+        if (!fasta || !cJSON_IsString(fasta) || !fasta->valuestring ||
+            !bam || !cJSON_IsString(bam) || !bam->valuestring ||
+            !name || !cJSON_IsString(name) || !name->valuestring)
             continue;
         
-        ChromMapEntry *e = &(*entries)[*n_entries];
+        if (strlen(fasta->valuestring) >= 64 ||
+            strlen(bam->valuestring) >= 64 ||
+            strlen(name->valuestring) >= 64)
+            continue;
         
-        // Initialize all strings to empty
-        e->fasta[0] = '\0';
-        e->bam[0] = '\0';
-        e->name[0] = '\0';
-        e->extract = 0;  // Default to false
+        valid_count++;
+    }
+    
+    if (valid_count == 0) 
+    {
+        fprintf(stderr, "Error: No valid chromosome mappings found\n");
+        cJSON_Delete(json);
+        return -6;
+    }
+    
+    // Allocate space for valid entries only
+    *entries = calloc(valid_count, sizeof(ChromMapEntry));
+    if (!*entries) 
+    {
+        fprintf(stderr, "Failed to allocate memory for chromosome entries\n");
+        cJSON_Delete(json);
+        return -5;
+    }
+    
+    // Second pass: copy valid entries
+    *n_entries = 0;
+    for (int i = 0; i < count; ++i) {
+        cJSON *item = cJSON_GetArrayItem(chroms, i);
+        if (!cJSON_IsObject(item)) continue;
         
         cJSON *fasta = cJSON_GetObjectItem(item, "fasta");
         cJSON *bam = cJSON_GetObjectItem(item, "bam");
         cJSON *name = cJSON_GetObjectItem(item, "name");
         cJSON *extract = cJSON_GetObjectItem(item, "extract");
         
-        // Validate and copy each field
-        if (fasta && cJSON_IsString(fasta) && fasta->valuestring) 
-        {
-            strncpy(e->fasta, fasta->valuestring, sizeof(e->fasta) - 1);
-            e->fasta[sizeof(e->fasta) - 1] = '\0';
-        }
+        if (!fasta || !cJSON_IsString(fasta) || !fasta->valuestring ||
+            !bam || !cJSON_IsString(bam) || !bam->valuestring ||
+            !name || !cJSON_IsString(name) || !name->valuestring)
+            continue;
         
-        if (bam && cJSON_IsString(bam) && bam->valuestring) 
-        {
-            strncpy(e->bam, bam->valuestring, sizeof(e->bam) - 1);
-            e->bam[sizeof(e->bam) - 1] = '\0';
-        }
+        if (strlen(fasta->valuestring) >= 64 ||
+            strlen(bam->valuestring) >= 64 ||
+            strlen(name->valuestring) >= 64)
+            continue;
         
-        if (name && cJSON_IsString(name) && name->valuestring) 
-        {
-            strncpy(e->name, name->valuestring, sizeof(e->name) - 1);
-            e->name[sizeof(e->name) - 1] = '\0';
-        }
+        ChromMapEntry *e = &(*entries)[*n_entries];
         
-        // Handle optional extract field
+        strcpy(e->fasta, fasta->valuestring);
+        strcpy(e->bam, bam->valuestring);
+        strcpy(e->name, name->valuestring);
+        
         if (extract && cJSON_IsBool(extract))
             e->extract = cJSON_IsTrue(extract);
         
-        // Validate that we have all required fields
-        if (e->fasta[0] == '\0' || e->bam[0] == '\0' || e->name[0] == '\0') 
-        {
-            fprintf(stderr, "Warning: Skipping chromosome entry with missing required fields\n");
-            continue;
-        }
-        
         (*n_entries)++;
     }
+    
     cJSON_Delete(json);
+    
+    fprintf(stderr, "Successfully loaded %d valid chromosome mappings\n", *n_entries);
     return 0;
 }
 
@@ -1523,7 +1322,7 @@ static void print_usage(const char *prog)
     fprintf(stderr, "\n");
 }
 
-int main(int argc, char *argv[])
+int main(int argc, char *argv[]) 
 {
 #ifdef USE_CUDA
     // Initialize CUDA device
@@ -1537,24 +1336,21 @@ int main(int argc, char *argv[])
 
     log_time("Starting processing...\n");
 
-    int hdf5_compression = DEFAULT_HDF5_COMPRESSION;
-    int hdf5_chunk_size = DEFAULT_HDF5_CHUNK_SIZE;
-    uint32_t chunk_size = DEFAULT_CHUNK_SIZE;
-    int num_threads = DEFAULT_THREADS;
-    int keep_chg = 0;
-    int keep_chh = 0;
+    // Parse command line arguments
+    const char *bam_file = NULL;
+    const char *ref_file = NULL;
+    const char *out_dir = NULL;
+    const char *chrom_mapping_file = NULL;
     int min_mapq = DEFAULT_MIN_MAPQ;
     int min_phred = DEFAULT_MIN_PHRED;
     int min_cov = DEFAULT_MIN_COV;
-    int cap_cov = DEFAULT_CAP_COVERAGE;
     int min_meth = DEFAULT_MIN_METH;
     int max_meth = DEFAULT_MAX_METH;
+    uint32_t chunk_size = DEFAULT_CHUNK_SIZE;
+    int num_threads = DEFAULT_THREADS;
     OutputFormat output_format = OUTPUT_HDF5;  // Default to HDF5 output
-    const char *out_dir = NULL;
     int split_context_files = 0;
-    const char *chrom_mapping_file = NULL;
     int use_gpu = 0;
-    char *reference_file = NULL;
 
     static struct option long_options[] = 
     {
@@ -1586,10 +1382,10 @@ int main(int argc, char *argv[])
         switch (opt)
         {
         case 'G':
-            keep_chg = 1;
+            use_gpu = 1;
             break;
         case 'H':
-            keep_chh = 1;
+            use_gpu = 1;
             break;
         case 'S':
             split_context_files = 1;
@@ -1611,29 +1407,13 @@ int main(int argc, char *argv[])
             }
             break;
         case 'z':
-            hdf5_compression = atoi(optarg);
+            use_gpu = 1;
             break;
         case 'k':
-            hdf5_chunk_size = atoi(optarg);
-            if (hdf5_chunk_size < 1)
-            {
-                fprintf(stderr, "HDF5 chunk size must be positive\n");
-                return 1;
-            }
-            break;
-        case 's':
             chunk_size = atoi(optarg);
             if (chunk_size < 1)
             {
                 fprintf(stderr, "Chunk size must be positive\n");
-                return 1;
-            }
-            break;
-        case 't':
-            num_threads = atoi(optarg);
-            if (num_threads < 1)
-            {
-                fprintf(stderr, "Number of threads must be positive\n");
                 return 1;
             }
             break;
@@ -1662,7 +1442,7 @@ int main(int argc, char *argv[])
             }
             break;
         case 'C':
-            cap_cov = atoi(optarg);
+            use_gpu = 1;
             break;
         case 'm':
             min_meth = atoi(optarg);
@@ -1705,8 +1485,6 @@ int main(int argc, char *argv[])
     }
 
     // If there are two arguments, the first is the reference file and the second is the BAM file
-    const char *bam_file = NULL;
-    const char *ref_file = NULL;
     if (argc - optind == 2)
     {
         ref_file = argv[optind];
@@ -1730,17 +1508,22 @@ int main(int argc, char *argv[])
     // Load chromosome mapping
     ChromMapEntry *chroms = NULL;
     int n_chroms = 0;
-    if (!chrom_mapping_file || load_chrom_mapping(chrom_mapping_file, &chroms, &n_chroms, &reference_file) != 0) 
+    char *json_ref_file = NULL;
+    if (!chrom_mapping_file || load_chrom_mapping(chrom_mapping_file, &chroms, &n_chroms, &json_ref_file) != 0) 
     {
         fprintf(stderr, "Failed to load chromosome mapping from %s\n", chrom_mapping_file);
         return 1;
     }
 
-    // Use reference file from JSON if provided
-    if (!ref_file && reference_file)
+    // Use reference file from command line if provided, otherwise use the one from JSON
+    if (!ref_file && json_ref_file)
     {
-        ref_file = reference_file;
+        ref_file = json_ref_file;
         fprintf(stderr, "Using reference file from chromosome mapping: %s\n", ref_file);
+    }
+    else if (ref_file)
+    {
+        fprintf(stderr, "Using reference file from command line: %s\n", ref_file);
     }
 
     if (!ref_file)
@@ -1749,164 +1532,306 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Load reference file
-    faidx_t *fai = fai_load(ref_file);
-    if (!fai)
-    {
-        fprintf(stderr, "Failed to load reference: %s\n", ref_file);
-        return 1;
-    }
+    // Open BAM file
     samFile *in = sam_open(bam_file, "r");
-    if (!in)
+    if (!in) 
     {
-        fprintf(stderr, "Failed to open BAM: %s\n", bam_file);
-        fai_destroy(fai);
+        fprintf(stderr, "Failed to open BAM file: %s\n", bam_file);
         return 1;
     }
+
+    // Load BAM header
     bam_hdr_t *header = sam_hdr_read(in);
-    if (!header)
+    if (!header) 
     {
         fprintf(stderr, "Failed to read BAM header\n");
         sam_close(in);
-        fai_destroy(fai);
         return 1;
     }
+
+    // Create index for BAM file
+    hts_idx_t *idx = sam_index_load(in, bam_file);
+    if (!idx) 
+    {
+        fprintf(stderr, "Failed to load BAM index\n");
+        sam_hdr_destroy(header);
+        sam_close(in);
+        return 1;
+    }
+
+    // Initialize processing queue
+    ProcessingQueue queue = {0};
+    queue.results = malloc(n_chroms * sizeof(ChromosomeResult));
+    if (!queue.results) 
+    {
+        fprintf(stderr, "Failed to allocate memory for chromosome results\n");
+        hts_idx_destroy(idx);
+        sam_hdr_destroy(header);
+        sam_close(in);
+        return 1;
+    }
+    queue.total_chromosomes = n_chroms;
+    pthread_mutex_init(&queue.queue_mutex, NULL);
+    pthread_cond_init(&queue.queue_cond, NULL);
+
+    // Initialize each ChromosomeResult structure
+    for (int i = 0; i < n_chroms; i++) {
+        queue.results[i].chr_name = NULL;
+        queue.results[i].tid = -1;
+        queue.results[i].context_buffers = NULL;
+        queue.results[i].context_sizes = NULL;
+        queue.results[i].context_pos_maps = NULL;
+        queue.results[i].processed = 0;
+        pthread_mutex_init(&queue.results[i].mutex, NULL);
+    }
+
+    // Initialize thread contexts and create threads
+    ThreadContext *contexts = malloc(num_threads * sizeof(ThreadContext));
+    if (!contexts) {
+        fprintf(stderr, "Failed to allocate memory for thread contexts\n");
+        return 1;
+    }
+
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    if (!threads) {
+        fprintf(stderr, "Failed to allocate memory for threads\n");
+        free(contexts);
+        return 1;
+    }
+
+    fprintf(stderr, "Processing %d chromosomes using %d threads\n", n_chroms, num_threads);
+
+    // Initialize thread contexts and create threads
+    int thread_count = 0;
+    for (int i = 0; i < n_chroms; i++) {
+        contexts[thread_count].queue = &queue;
+        contexts[thread_count].bam_file = bam_file;
+        contexts[thread_count].out_dir = out_dir;
+        contexts[thread_count].ref_file = ref_file;
+        contexts[thread_count].min_mapq = min_mapq;
+        contexts[thread_count].min_phred = min_phred;
+        contexts[thread_count].use_gpu = use_gpu;
+        contexts[thread_count].split_context_files = split_context_files;
+        contexts[thread_count].output_format = output_format;
+        contexts[thread_count].min_cov = min_cov;
+        contexts[thread_count].cap_cov = 0;  // Default to no cap
+        contexts[thread_count].min_meth = min_meth;
+        contexts[thread_count].max_meth = max_meth;
+        contexts[thread_count].hdf5_compression = 0;  // Default to no compression
+        contexts[thread_count].hdf5_chunk_size = 0;  // Default to no chunk size
+        contexts[thread_count].thread_id = thread_count;  // Set thread ID
+        contexts[thread_count].keep_chg = 1;  // Always process CHG
+        contexts[thread_count].keep_chh = 1;  // Always process CHH
+        contexts[thread_count].chr_name = chroms[i].bam;
+        contexts[thread_count].fasta_chr_name = chroms[i].fasta;
+        contexts[thread_count].display_name = chroms[i].name;
+
+        // Initialize mutex
+        if (pthread_mutex_init(&contexts[thread_count].fai_mutex, NULL) != 0) {
+            fprintf(stderr, "Failed to initialize mutex for thread %d\n", thread_count);
+            // Clean up already created threads and mutexes
+            for (int j = 0; j < thread_count; j++) {
+                pthread_join(threads[j], NULL);
+                pthread_mutex_destroy(&contexts[j].fai_mutex);
+            }
+            free(threads);
+            free(contexts);
+            return 1;
+        }
+
+        if (pthread_create(&threads[thread_count], NULL, process_chromosome_thread, &contexts[thread_count]) != 0) {
+            fprintf(stderr, "Failed to create thread %d\n", thread_count);
+            // Clean up already created threads and mutexes
+            for (int j = 0; j < thread_count; j++) {
+                pthread_join(threads[j], NULL);
+                pthread_mutex_destroy(&contexts[j].fai_mutex);
+            }
+            pthread_mutex_destroy(&contexts[thread_count].fai_mutex);
+            free(threads);
+            free(contexts);
+            return 1;
+        }
+        thread_count++;
+    }
+
+    // Wait for all threads to complete
+    for (int i = 0; i < thread_count; i++) {
+        pthread_join(threads[i], NULL);
+        pthread_mutex_destroy(&contexts[i].fai_mutex);
+    }
+
+    // Cleanup
+    free(threads);
+    free(contexts);
+    free(queue.results);
+    hts_idx_destroy(idx);
+    sam_hdr_destroy(header);
     sam_close(in);
 
-    // Calculate memory requirements once using the first chromosome
-    if (n_chroms > 0) 
-    {
-        ChromMapEntry *first_chrom = &chroms[0];
-        int tid = bam_name2id(header, first_chrom->bam);
-        if (tid >= 0) 
-        {
-            global_mem_req = calculate_memory_requirements(
-                bam_file,
-                first_chrom->bam,
-                header->target_len[tid],
-                min_mapq,
-                min_phred
-            );
-            fprintf(stderr, "Global memory settings (will be used for all chromosomes):\n");
-            fprintf(stderr, "  Min buffer size: %.2f GB\n", (double)global_mem_req.min_buffer_size / GB);
-            fprintf(stderr, "  Optimal buffer size: %.2f GB\n", (double)global_mem_req.optimal_buffer_size / GB);
-            fprintf(stderr, "  Max buffer size: %.2f GB\n", (double)global_mem_req.max_buffer_size / GB);
-            fprintf(stderr, "  Chunk size: %.2f GB\n", (double)global_mem_req.chunk_size / GB);
-            fprintf(stderr, "  Region count: %d\n", global_mem_req.region_count);
-        }
-    }
-
-    ThreadArg *thread_args = malloc(header->n_targets * sizeof(ThreadArg));
-    if (!thread_args)
-    {
-        fprintf(stderr, "Failed to allocate thread arguments\n");
-        sam_hdr_destroy(header);
-        fai_destroy(fai);
-        return 1;
-    }
-    int valid_chr_count = 0;
-    for (int i = 0; i < n_chroms; ++i) 
-    {
-        ChromMapEntry *entry = &chroms[i];
-        // Find BAM tid for entry->bam
-        int tid = bam_name2id(header, entry->bam);
-        if (tid < 0) 
-        {
-            fprintf(stderr, "BAM does not contain chromosome %s (looking for %s in BAM)\n", entry->bam, entry->bam);
-            fprintf(stderr, "Available chromosomes in BAM:\n");
-            for (int j = 0; j < header->n_targets; j++) {
-                fprintf(stderr, "  %s\n", header->target_name[j]);
-            }
-            continue;
-        }
-        // Fetch sequence for entry->fasta
-        int seq_len = 0;
-        char *seq = faidx_fetch_seq(fai, entry->fasta, 0, header->target_len[tid], &seq_len);
-        if (!seq || seq_len <= 0) 
-        {
-            fprintf(stderr, "Failed to fetch sequence for %s\n", entry->fasta);
-            if (seq) free(seq);
-            continue;
-        }
-        // Set up ThreadArg as before, but use entry->name for output
-        thread_args[valid_chr_count].bam_file = bam_file;
-        thread_args[valid_chr_count].out_dir = out_dir;
-        thread_args[valid_chr_count].tid = tid;
-        thread_args[valid_chr_count].chr = strdup(entry->name);  // Make a copy of the name
-        thread_args[valid_chr_count].chr_len = header->target_len[tid];
-        thread_args[valid_chr_count].min_mapq = min_mapq;
-        thread_args[valid_chr_count].min_phred = min_phred;
-        thread_args[valid_chr_count].min_cov = min_cov;
-        thread_args[valid_chr_count].cap_cov = cap_cov;
-        thread_args[valid_chr_count].min_meth = min_meth;
-        thread_args[valid_chr_count].max_meth = max_meth;
-        thread_args[valid_chr_count].keep_chg = keep_chg;
-        thread_args[valid_chr_count].keep_chh = keep_chh;
-        thread_args[valid_chr_count].hdf5_compression = hdf5_compression;
-        thread_args[valid_chr_count].hdf5_chunk_size = hdf5_chunk_size;
-        thread_args[valid_chr_count].chunk_size = chunk_size;
-        thread_args[valid_chr_count].chr_seq = seq;
-        thread_args[valid_chr_count].output_format = output_format;
-        thread_args[valid_chr_count].split_context_files = split_context_files;
-        thread_args[valid_chr_count].use_gpu = use_gpu;
-        valid_chr_count++;
-    }
-    free(chroms);
-    pthread_t *threads = malloc(valid_chr_count * sizeof(pthread_t));
-    if (!threads)
-    {
-        fprintf(stderr, "Failed to allocate threads\n");
-        for (int i = 0; i < valid_chr_count; i++)
-            free(thread_args[i].chr_seq);
-        free(thread_args);
-        sam_hdr_destroy(header);
-        fai_destroy(fai);
-        return 1;
-    }
-
-    int active_threads = 0;
-    for (int i = 0; i < valid_chr_count; i++)
-    {
-        if (pthread_create(&threads[i], NULL, (void *(*)(void *))process_chromosome, &thread_args[i]) != 0)
-        {
-            fprintf(stderr, "Failed to create thread for %s\n", thread_args[i].chr);
-            continue;
-        }
-        active_threads++;
-        for (int j = 0; j <= i; j++)
-            if (pthread_join(threads[j], NULL) == 0)
-            {
-                active_threads--;
-                break;
-            }
-        
-        int max_region_threads = 8;
-        while (active_threads >= max_region_threads)
-            for (int j = 0; j <= i; j++)
-                if (pthread_join(threads[j], NULL) == 0)
-                {
-                    active_threads--;
-                    break;
-                }
-    }
-
-    cleanup_hdf5();
-    
-    for (int i = 0; i < valid_chr_count; i++)
-    {
-        free(thread_args[i].chr_seq);
-        free(thread_args[i].chr);  // Free the copied chromosome name
-    }
-    free(threads);
-    free(thread_args);
-    sam_hdr_destroy(header);
-    fai_destroy(fai);
-
-    // Clean up reference file string if it was allocated
-    if (reference_file)
-        free(reference_file);
-
-    log_time("Processing complete. MethylExtractor has finished.\n");
-        
     return 0;
+}
+
+static void *process_chromosome_thread(void *arg) 
+{
+    ThreadContext *ctx = (ThreadContext *)arg;
+
+    // Skip processing if no chromosome assigned
+    if (!ctx->chr_name) {
+        fprintf(stderr, "Thread %d: No chromosome assigned, skipping\n", ctx->thread_id);
+        return NULL;
+    }
+
+    int len = 0;  // For faidx_fetch_seq
+
+    //fprintf(stderr, "Thread %d starting: chr_name=%s, fasta_chr_name=%s\n", 
+    //        ctx->thread_id, ctx->chr_name, ctx->fasta_chr_name);
+
+    // Open BAM file
+    ctx->fp = sam_open(ctx->bam_file, "r");
+    if (!ctx->fp) 
+    {
+        fprintf(stderr, "Thread %d: Failed to open BAM file: %s\n", ctx->thread_id, ctx->bam_file);
+        return NULL;
+    }
+
+    // Load BAM header
+    ctx->header = sam_hdr_read(ctx->fp);
+    if (!ctx->header) 
+    {
+        fprintf(stderr, "Thread %d: Failed to read BAM header\n", ctx->thread_id);
+        sam_close(ctx->fp);
+        return NULL;
+    }
+
+    //fprintf(stderr, "Thread %d: BAM header loaded, looking for chromosome %s\n", 
+    //        ctx->thread_id, ctx->chr_name);
+
+    // Get chromosome ID and length
+    ctx->tid = sam_hdr_name2tid(ctx->header, ctx->chr_name);
+    if (ctx->tid < 0) 
+    {
+        fprintf(stderr, "Thread %d: Chromosome %s not found in BAM header\n", ctx->thread_id, ctx->chr_name);
+        sam_hdr_destroy(ctx->header);
+        sam_close(ctx->fp);
+        return NULL;
+    }
+
+    ctx->chr_len = ctx->header->target_len[ctx->tid];
+    //fprintf(stderr, "Thread %d: Processing chromosome %s (length: %u)\n", ctx->thread_id, ctx->chr_name, ctx->chr_len);
+
+    // Load FASTA index
+    pthread_mutex_lock(&ctx->fai_mutex);
+    ctx->fai = fai_load(ctx->ref_file);
+    if (!ctx->fai) 
+    {
+        fprintf(stderr, "Thread %d: Failed to load FASTA index\n", ctx->thread_id);
+        pthread_mutex_unlock(&ctx->fai_mutex);
+        sam_hdr_destroy(ctx->header);
+        sam_close(ctx->fp);
+        return NULL;
+    }
+
+    // Fetch chromosome sequence with correct type
+    ctx->chr_seq = faidx_fetch_seq(ctx->fai, ctx->fasta_chr_name, 0, ctx->chr_len - 1, &len);
+    if (len > 0)
+        ctx->chr_len = (uint32_t)len;  // Convert to uint32_t
+    else 
+    {
+        fprintf(stderr, "Thread %d: Failed to fetch sequence for chromosome %s\n", ctx->thread_id, ctx->fasta_chr_name);
+        fai_destroy(ctx->fai);
+        sam_hdr_destroy(ctx->header);
+        sam_close(ctx->fp);
+        return NULL;
+    }
+    pthread_mutex_unlock(&ctx->fai_mutex);
+
+    // Create BAM index
+    ctx->idx = sam_index_load(ctx->fp, ctx->bam_file);
+    if (!ctx->idx) 
+    {
+        fprintf(stderr, "Thread %d: Failed to load BAM index\n", ctx->thread_id);
+        free(ctx->chr_seq);
+        fai_destroy(ctx->fai);
+        sam_hdr_destroy(ctx->header);
+        sam_close(ctx->fp);
+        return NULL;
+    }
+
+    // Initialize chromosome result
+    pthread_mutex_lock(&ctx->queue->queue_mutex);
+    ctx->result = &ctx->queue->results[ctx->queue->processed_count];
+    ctx->result->chr_name = strdup(ctx->chr_name);
+    ctx->result->tid = ctx->tid;
+    ctx->result->context_buffers = malloc(3 * sizeof(MethylRecord *));
+    ctx->result->context_sizes = malloc(3 * sizeof(size_t));
+    ctx->result->context_pos_maps = malloc(3 * sizeof(khash_t(pos) *));
+    if (!ctx->result->chr_name || !ctx->result->context_buffers || !ctx->result->context_sizes || !ctx->result->context_pos_maps) 
+    {
+        fprintf(stderr, "Thread %d: Failed to allocate memory for chromosome result\n", ctx->thread_id);
+        pthread_mutex_unlock(&ctx->queue->queue_mutex);
+        hts_idx_destroy(ctx->idx);
+        free(ctx->chr_seq);
+        fai_destroy(ctx->fai);
+        sam_hdr_destroy(ctx->header);
+        sam_close(ctx->fp);
+        return NULL;
+    }
+
+    // Initialize context buffers and position maps
+    for (int i = 0; i < 3; i++) 
+    {
+        ctx->result->context_buffers[i] = NULL;
+        ctx->result->context_sizes[i] = 0;
+        ctx->result->context_pos_maps[i] = kh_init(pos);
+        if (!ctx->result->context_pos_maps[i]) 
+        {
+            fprintf(stderr, "Thread %d: Failed to initialize position map for context %d\n", ctx->thread_id, i);
+            // Clean up already allocated resources
+            for (int j = 0; j < i; j++) 
+            {
+                if (ctx->result->context_pos_maps[j]) {
+                    kh_destroy(pos, ctx->result->context_pos_maps[j]);
+                }
+            }
+            free(ctx->result->context_pos_maps);
+            free(ctx->result->context_sizes);
+            free(ctx->result->context_buffers);
+            free(ctx->result->chr_name);
+            pthread_mutex_unlock(&ctx->queue->queue_mutex);
+            hts_idx_destroy(ctx->idx);
+            free(ctx->chr_seq);
+            fai_destroy(ctx->fai);
+            sam_hdr_destroy(ctx->header);
+            sam_close(ctx->fp);
+            return NULL;
+        }
+        // Initialize the hash table with a reasonable size
+        kh_resize(pos, ctx->result->context_pos_maps[i], 1024);
+    }
+    pthread_mutex_init(&ctx->result->mutex, NULL);
+    pthread_mutex_unlock(&ctx->queue->queue_mutex);
+
+    // Process chromosome
+    process_chromosome(ctx);
+
+    // Cleanup
+    for (int i = 0; i < 3; i++) {
+        if (ctx->result->context_pos_maps[i]) {
+            kh_destroy(pos, ctx->result->context_pos_maps[i]);
+        }
+    }
+    hts_idx_destroy(ctx->idx);
+    free(ctx->chr_seq);
+    fai_destroy(ctx->fai);
+    sam_hdr_destroy(ctx->header);
+    sam_close(ctx->fp);
+
+    // Mark chromosome as processed
+    pthread_mutex_lock(&ctx->queue->queue_mutex);
+    ctx->result->processed = 1;
+    ctx->queue->processed_count++;
+    pthread_cond_broadcast(&ctx->queue->queue_cond);
+    pthread_mutex_unlock(&ctx->queue->queue_mutex);
+
+    return NULL;
 }
