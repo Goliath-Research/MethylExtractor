@@ -152,7 +152,8 @@ typedef struct
     int append_mode;
     OutputFormat output_format;
     int split_context_files;
-    MethylRecord *buffer;
+    MethylRecord **context_buffers;  // Array of context buffers
+    khash_t(pos) **context_pos_maps; // Array of position maps for each context
     samFile *fp;
     bam_hdr_t *header;
     int use_gpu;
@@ -162,9 +163,6 @@ typedef struct
     int hdf5_compression;
     int hdf5_chunk_size;
     pthread_mutex_t *buffer_mutex;
-    khash_t(pos) *pos_map;
-    size_t buffer_offset;
-    size_t buffer_size;
 } ThreadArg;
 
 typedef struct 
@@ -484,27 +482,39 @@ static void process_methylation_cpu(
     const uint8_t *qual,
     const int *strands,
     const uint32_t *positions,
-    MethylRecord *buffer,
+    MethylRecord **context_buffers,
+    khash_t(pos) **context_pos_maps,
     const int min_phred,
     const int min_mapq,
     const size_t n_records,
-    const uint32_t start_pos,
-    const size_t buffer_size
+    const uint32_t start_pos
 ) 
 {
     for (size_t i = 0; i < n_records; i++) 
     {
         if (qual[i] >= min_phred) 
         {
-            uint32_t pos = positions[i] - start_pos;  // Adjust position relative to region start
-            if (pos < buffer_size)  // Ensure we don't write past buffer end
+            uint32_t pos = positions[i];
+            uint64_t key = ((uint64_t)pos << 32) | (pos - 1);
+            
+            // Try each context
+            for (int ctx = 1; ctx <= 3; ctx++) 
             {
-                if ((seq[i] == 'C' && (strands[i] == 1 || strands[i] == 3)) ||
-                    (seq[i] == 'G' && (strands[i] == 2 || strands[i] == 4)))
-                    buffer[pos].mC++;
-                else if ((seq[i] == 'T' && (strands[i] == 1 || strands[i] == 3)) ||
-                         (seq[i] == 'A' && (strands[i] == 2 || strands[i] == 4)))
-                    buffer[pos].uC++;
+                if (!context_buffers[ctx] || !context_pos_maps[ctx])
+                    continue;
+                    
+                khint_t iter = kh_get(pos, context_pos_maps[ctx], key);
+                if (iter != kh_end(context_pos_maps[ctx])) 
+                {
+                    size_t idx = kh_val(context_pos_maps[ctx], iter);
+                    if ((seq[i] == 'C' && (strands[i] == 1 || strands[i] == 3)) ||
+                        (seq[i] == 'G' && (strands[i] == 2 || strands[i] == 4)))
+                        context_buffers[ctx][idx].mC++;
+                    else if ((seq[i] == 'T' && (strands[i] == 1 || strands[i] == 3)) ||
+                             (seq[i] == 'A' && (strands[i] == 2 || strands[i] == 4)))
+                        context_buffers[ctx][idx].uC++;
+                    break;  // Found the correct context, no need to check others
+                }
             }
         }
     }
@@ -811,7 +821,6 @@ static void *process_chromosome_region(void *arg)
 {
     ThreadArg *targ = (ThreadArg *)arg;
     bam1_t *b = bam_init1();
-    MethylRecord *buffer = NULL;
     size_t n_records = 0;
     int ret;
     uint8_t *seq = NULL;
@@ -842,15 +851,6 @@ static void *process_chromosome_region(void *arg)
     {
         fprintf(stderr, "Failed to create iterator for region %s:%u-%u\n", 
                 targ->chr, targ->start_pos, targ->end_pos);
-        goto cleanup;
-    }
-
-    // Initialize methylation buffer
-    size_t buffer_size = targ->end_pos - targ->start_pos;
-    buffer = calloc(buffer_size, sizeof(MethylRecord));
-    if (!buffer) 
-    {
-        fprintf(stderr, "Failed to allocate methylation buffer of size %zu\n", buffer_size);
         goto cleanup;
     }
 
@@ -910,9 +910,9 @@ static void *process_chromosome_region(void *arg)
                 if (n_records > 0) 
                 {
                     process_methylation_cpu(
-                        seq, qual, strands, positions, buffer,
-                        targ->min_phred, targ->min_mapq, n_records,
-                        targ->start_pos, buffer_size
+                        seq, qual, strands, positions, targ->context_buffers,
+                        targ->context_pos_maps, targ->min_phred, targ->min_mapq, 
+                        n_records, targ->start_pos
                     );
                     n_records = 0;
                 }
@@ -941,9 +941,9 @@ static void *process_chromosome_region(void *arg)
         if (n_records >= targ->chunk_size) 
         {
             process_methylation_cpu(
-                seq, qual, strands, positions, buffer,
-                targ->min_phred, targ->min_mapq, n_records,
-                targ->start_pos, buffer_size
+                seq, qual, strands, positions, targ->context_buffers,
+                targ->context_pos_maps, targ->min_phred, targ->min_mapq, 
+                n_records, targ->start_pos
             );
             n_records = 0;  // Reset counter after processing
         }
@@ -953,9 +953,9 @@ static void *process_chromosome_region(void *arg)
     if (n_records > 0) 
     {
         process_methylation_cpu(
-            seq, qual, strands, positions, buffer,
-            targ->min_phred, targ->min_mapq, n_records,
-            targ->start_pos, buffer_size
+            seq, qual, strands, positions, targ->context_buffers,
+            targ->context_pos_maps, targ->min_phred, targ->min_mapq, 
+            n_records, targ->start_pos
         );
     }
 
@@ -965,7 +965,6 @@ cleanup:
     if (qual) free(qual);
     if (strands) free(strands);
     if (positions) free(positions);
-    if (buffer) free(buffer);
     if (targ->fp) sam_close(targ->fp);
     if (iter) hts_itr_destroy(iter);
     return NULL;
@@ -1056,7 +1055,15 @@ void flush_buffer(
         H5Tinsert(type_id, "tnc", HOFFSET(MethylRecord, tnc), H5T_NATIVE_UINT8);
 
         // Create dataset and write data
-        hid_t dset_id = H5Dcreate(file_id, "methylation", type_id, space_id, H5P_DEFAULT, plist_id, H5P_DEFAULT);
+        hid_t dset_id = H5Dcreate(
+            file_id, 
+            "methylation_data", 
+            type_id, 
+            space_id, 
+            H5P_DEFAULT, 
+            plist_id, 
+            H5P_DEFAULT
+        );
         if (dset_id < 0)
         {
             fprintf(stderr, "Failed to create dataset in HDF5 file\n");
@@ -1129,22 +1136,70 @@ void process_chromosome(ThreadArg *targ)
     // Use the calculated chunk size
     targ->chunk_size = mem_req.chunk_size;
     
-    size_t site_count = count_methylation_sites(targ->chr_seq, targ->chr_len, targ->keep_chg, targ->keep_chh);
-    MethylRecord *buffer = calloc(site_count, sizeof(MethylRecord));
-    if (!buffer)
+    // Pre-calculate sites for each context
+    size_t sites_per_context[4] = {0}; // Index 0 unused, 1=CPG, 2=CHG, 3=CHH
+    
+    // Count sites per context
+    for (uint32_t pos = 0; pos < targ->chr_len; pos++) 
     {
-        fprintf(stderr, "Failed to allocate buffer for %s\n", targ->chr);
-        return;
+        int8_t strand_ctx;
+        uint8_t tnc_val;
+        int ctx = get_context(targ->chr_seq, targ->chr_len, pos, &strand_ctx, &tnc_val, targ->keep_chg, targ->keep_chh);
+        if (ctx > 0 && ctx <= 3)
+            sites_per_context[ctx]++;
     }
-    initialize_buffer(buffer, site_count, targ->chr_seq, targ->chr_len, targ->keep_chg, targ->keep_chh);
-
-    khash_t(pos) *pos_map = kh_init(pos);
-    for (size_t i = 0; i < site_count; i++)
+    
+    // Pre-allocate buffers for each context
+    MethylRecord *context_buffers[4] = {NULL}; // Index 0 unused, 1=CPG, 2=CHG, 3=CHH
+    for (int ctx = 1; ctx <= 3; ctx++) 
     {
-        uint64_t key = ((uint64_t)targ->tid << 32) | (buffer[i].pos - 1);
-        int ret;
-        khint_t iter = kh_put(pos, pos_map, key, &ret);
-        kh_val(pos_map, iter) = i;
+        if ((ctx == CONTEXT_CPG) ||
+            (ctx == CONTEXT_CHG && targ->keep_chg) ||
+            (ctx == CONTEXT_CHH && targ->keep_chh)) 
+        {
+            context_buffers[ctx] = calloc(sites_per_context[ctx], sizeof(MethylRecord));
+            if (!context_buffers[ctx]) 
+            {
+                fprintf(stderr, "Failed to allocate buffer for %s context\n", get_context_string(ctx));
+                goto cleanup;
+            }
+            
+            // Initialize buffer with positions and context information
+            size_t idx = 0;
+            for (uint32_t pos = 0; pos < targ->chr_len && idx < sites_per_context[ctx]; pos++) 
+            {
+                int8_t strand_ctx;
+                uint8_t tnc_val;
+                int current_ctx = get_context(targ->chr_seq, targ->chr_len, pos, &strand_ctx, &tnc_val, targ->keep_chg, targ->keep_chh);
+                if (current_ctx == ctx) 
+                {
+                    context_buffers[ctx][idx].pos = pos + 1;
+                    context_buffers[ctx][idx].mC = 0;
+                    context_buffers[ctx][idx].uC = 0;
+                    context_buffers[ctx][idx].tnc.tnc = tnc_val;
+                    context_buffers[ctx][idx].tnc.context = ctx;
+                    context_buffers[ctx][idx].tnc.strand = (strand_ctx > 0) ? 0 : 1;
+                    idx++;
+                }
+            }
+        }
+    }
+
+    // Create position maps for each context
+    khash_t(pos) *context_pos_maps[4] = {NULL}; // Index 0 unused, 1=CPG, 2=CHG, 3=CHH
+    for (int ctx = 1; ctx <= 3; ctx++) 
+    {
+        if (context_buffers[ctx]) 
+        {
+            context_pos_maps[ctx] = kh_init(pos);
+            for (size_t i = 0; i < sites_per_context[ctx]; i++) 
+            {
+                uint64_t key = ((uint64_t)targ->tid << 32) | (context_buffers[ctx][i].pos - 1);
+                int ret;
+                khint_t iter = kh_put(pos, context_pos_maps[ctx], key, &ret);
+                kh_val(context_pos_maps[ctx], iter) = i;
+            }
+        }
     }
 
     uint32_t chunk_size = targ->chunk_size;
@@ -1165,15 +1220,11 @@ void process_chromosome(ThreadArg *targ)
     if (!region_args) 
     {
         fprintf(stderr, "Failed to allocate region arguments\n");
-        free(buffer);
-        kh_destroy(pos, pos_map);
-        return;
+        goto cleanup;
     }
 
     pthread_mutex_t buffer_mutex;
     pthread_mutex_init(&buffer_mutex, NULL);
-
-    size_t sites_per_region = (site_count + n_regions - 1) / n_regions;
 
     // First, validate the chromosome name
     if (!targ->chr || strlen(targ->chr) == 0) 
@@ -1181,9 +1232,7 @@ void process_chromosome(ThreadArg *targ)
         fprintf(stderr, "Invalid chromosome name\n");
         free(region_args);
         pthread_mutex_destroy(&buffer_mutex);
-        free(buffer);
-        kh_destroy(pos, pos_map);
-        return;
+        goto cleanup;
     }
 
     for (int i = 0; i < n_regions; i++)
@@ -1208,9 +1257,7 @@ void process_chromosome(ThreadArg *targ)
             }
             free(region_args);
             pthread_mutex_destroy(&buffer_mutex);
-            free(buffer);
-            kh_destroy(pos, pos_map);
-            return;
+            goto cleanup;
         }
 
         region_args[i].chr_len = targ->chr_len;
@@ -1230,26 +1277,15 @@ void process_chromosome(ThreadArg *targ)
         region_args[i].split_context_files = targ->split_context_files;
 
         // Set shared resources
-        region_args[i].buffer = buffer;
         region_args[i].buffer_mutex = &buffer_mutex;
-        region_args[i].pos_map = pos_map;
-        region_args[i].buffer_offset = i * sites_per_region;
-        region_args[i].buffer_size = (i == n_regions - 1) ? site_count - i * sites_per_region : sites_per_region;
+        region_args[i].context_buffers = context_buffers;
+        region_args[i].context_pos_maps = context_pos_maps;
 
         uint32_t start_pos = i * chunk_size;
         uint32_t end_pos = (i == n_regions - 1) ? targ->chr_len : ((i + 1) * chunk_size);
 
         if (end_pos > targ->chr_len)
             end_pos = targ->chr_len;
-
-        if (i > 0 && buffer[region_args[i].buffer_offset].pos > 0)
-        {
-            uint32_t buffer_start = buffer[region_args[i].buffer_offset].pos - 1;
-            if (buffer_start < end_pos)
-                start_pos = buffer_start;
-        }
-        if (start_pos >= end_pos)
-            start_pos = (end_pos > chunk_size) ? end_pos - chunk_size : 0;
 
         region_args[i].start_pos = start_pos;
         region_args[i].end_pos = end_pos;
@@ -1259,13 +1295,11 @@ void process_chromosome(ThreadArg *targ)
     if (!threads)
     {
         fprintf(stderr, "Failed to allocate threads\n");
-        for (int i = 0; i < n_regions; i++)
+        for (int i = 0; i < n_regions; i++) 
             free(region_args[i].chr);
         free(region_args);
         pthread_mutex_destroy(&buffer_mutex);
-        free(buffer);
-        kh_destroy(pos, pos_map);
-        return;
+        goto cleanup;
     }
 
     int active_threads = 0;
@@ -1296,89 +1330,63 @@ void process_chromosome(ThreadArg *targ)
 
     pthread_mutex_destroy(&buffer_mutex);
 
-    if (targ->split_context_files) 
+    // Process each context
+    for (int ctx = 1; ctx <= 3; ctx++) 
     {
-        for (int ctx = CONTEXT_CPG; ctx <= CONTEXT_CHH; ++ctx) 
+        if (context_buffers[ctx] && 
+            ((ctx == CONTEXT_CPG) ||
+             (ctx == CONTEXT_CHG && targ->keep_chg) ||
+             (ctx == CONTEXT_CHH && targ->keep_chh))) 
         {
-            if ((ctx == CONTEXT_CPG) ||
-                (ctx == CONTEXT_CHG && targ->keep_chg) ||
-                (ctx == CONTEXT_CHH && targ->keep_chh)) 
-            {
-                log_time("Processing %s context for chromosome %s\n", get_context_string(ctx), targ->chr);
-                // Filter buffer for this context
-                size_t n_ctx_records = 0;
-                for (size_t i = 0; i < site_count; ++i)
-                    if (buffer[i].tnc.context == ctx)
-                        n_ctx_records++;
-
-                if (n_ctx_records == 0)
-                    continue;
-
-                MethylRecord *ctx_buffer = malloc(n_ctx_records * sizeof(MethylRecord));
-                size_t j = 0;
-                for (size_t i = 0; i < site_count; ++i)
-                    if (buffer[i].tnc.context == ctx)
-                        ctx_buffer[j++] = buffer[i];
-
-                // Output file name - use appropriate extension based on output format
-                char out_path[1024];
-                const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5";  // For OUTPUT_BOTH, use .h5
-                snprintf(
-                    out_path, 
-                    sizeof(out_path), 
-                    "%s/%s-%s%s", 
-                    targ->out_dir, 
-                    targ->chr, 
-                    get_context_string(ctx),
-                    ext
-                );
-                flush_buffer(
-                    out_path,
-                    ctx_buffer,
-                    n_ctx_records,
-                    targ->hdf5_compression,
-                    targ->hdf5_chunk_size,
-                    0,
-                    targ->min_cov,
-                    targ->cap_cov,
-                    targ->min_meth,
-                    targ->max_meth,
-                    targ->output_format);
-
-                free(ctx_buffer);
-                log_time("Finished processing %s context for chromosome %s\n", get_context_string(ctx), targ->chr);
-            }
+            log_time("Processing %s context for chromosome %s\n", get_context_string(ctx), targ->chr);
+            
+            // Output file name - use appropriate extension based on output format
+            char out_path[1024];
+            const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5";  // For OUTPUT_BOTH, use .h5
+            snprintf(
+                out_path, 
+                sizeof(out_path), 
+                "%s/%s-%s%s", 
+                targ->out_dir, 
+                targ->chr, 
+                get_context_string(ctx),
+                ext
+            );
+            
+            flush_buffer(
+                out_path,
+                context_buffers[ctx],
+                sites_per_context[ctx],
+                targ->hdf5_compression,
+                targ->hdf5_chunk_size,
+                0,
+                targ->min_cov,
+                targ->cap_cov,
+                targ->min_meth,
+                targ->max_meth,
+                targ->output_format
+            );
+            
+            log_time("Finished processing %s context for chromosome %s\n", get_context_string(ctx), targ->chr);
         }
-    } 
-    else 
-    {
-        // Output file name - use appropriate extension based on output format
-        char out_path[1024];
-        const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5";  // For OUTPUT_BOTH, use .h5
-        snprintf(out_path, sizeof(out_path), "%s/%s%s", targ->out_dir, targ->chr, ext);
-        flush_buffer(
-            out_path,
-            buffer,
-            site_count,
-            targ->hdf5_compression,
-            targ->hdf5_chunk_size,
-            0,
-            targ->min_cov,
-            targ->cap_cov,
-            targ->min_meth,
-            targ->max_meth,
-            targ->output_format);
     }
 
-    kh_destroy(pos, pos_map);
-    free(buffer);
-
+cleanup:
     // Clean up region arguments
     for (int i = 0; i < n_regions; i++)
         if (region_args[i].chr) 
             free(region_args[i].chr);
     free(region_args);
     free(threads);
+    
+    // Clean up context buffers and position maps
+    for (int ctx = 1; ctx <= 3; ctx++) 
+    {
+        if (context_buffers[ctx])
+            free(context_buffers[ctx]);
+        if (context_pos_maps[ctx])
+            kh_destroy(pos, context_pos_maps[ctx]);
+    }
     
     log_time("Finished processing chromosome %s\n", targ->chr);
 }
@@ -1839,7 +1847,7 @@ int main(int argc, char *argv[])
                 active_threads--;
                 break;
             }
-
+        
         int max_region_threads = 8;
         while (active_threads >= max_region_threads)
             for (int j = 0; j <= i; j++)
