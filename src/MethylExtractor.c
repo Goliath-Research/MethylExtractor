@@ -62,7 +62,7 @@ static long get_total_memory()
 static int get_optimal_thread_count() 
 {
     int cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
-    return cpu_count > 0 ? cpu_count : 64; // Default to 64 if detection fails
+    return cpu_count > 0 ? cpu_count : 24; // Default to 64 if detection fails
 }
 
 static size_t get_optimal_chunk_size() 
