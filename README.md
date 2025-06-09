@@ -26,30 +26,69 @@ MethylExtractor/
 
 ### Prerequisites
 
+The Makefile can automatically install all required dependencies:
+
+```bash
+make install-deps
+```
+
+This will install:
 - GCC compiler
 - Make
 - HDF5 library and development headers
 - HTSlib library and development headers
+- Other build dependencies
 
 ### Build Instructions
 
-1. **Static Build**:
+The Makefile supports multiple build configurations:
+
+1. **Install Dependencies**:
+   ```bash
+   make install-deps
+   ```
+
+2. **Static Build**:
    ```bash
    make static
    ```
    This will create a statically linked binary at `build/static/MethylExtractor`.
 
-2. **Dynamic Build**:
+3. **Dynamic Build**:
    ```bash
    make dynamic
    ```
    This will create a dynamically linked binary at `build/dynamic/MethylExtractor`.
 
-3. **Containerized Build**:
+4. **Debug Build**:
    ```bash
-   docker build -t MethylExtractor:latest .
+   make debug
+   ```
+   This will create a debug version with additional debugging information.
+
+5. **Containerized Build**:
+   ```bash
+   make docker
    ```
    This will build a Docker image named `MethylExtractor:latest`.
+
+6. **Install to System**:
+   ```bash
+   sudo make install
+   ```
+   This will install the binary to `/usr/bin/MethylExtractor`.
+
+7. **Clean Build Files**:
+   ```bash
+   make clean
+   ```
+   This will remove all build artifacts.
+
+8. **Build All Configurations**:
+   ```bash
+   make all
+   ```
+   This will build all configurations (static, dynamic, and debug).
 
 ## Usage
 
