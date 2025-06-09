@@ -18,14 +18,13 @@
 #define DEFAULT_MAX_CHR 24
 #define DEFAULT_HDF5_COMPRESSION 6
 #define DEFAULT_HDF5_CHUNK_SIZE 1000000
+#define DEFAULT_HDF5_CHUNK_SIZE_INT 1000000
 #define DEFAULT_THREADS 16
 #define DEFAULT_CHUNK_SIZE 1000000
 #define DEFAULT_MIN_MAPQ 30
 #define DEFAULT_MIN_PHRED 20
 #define DEFAULT_MIN_COV 4
 #define DEFAULT_CAP_COVERAGE 1
-#define DEFAULT_MIN_METH 0
-#define DEFAULT_MAX_METH 100
 #define DEFAULT_FLAGS (BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY)
 #define TNC_A 0
 #define TNC_C 1
@@ -87,8 +86,6 @@ typedef struct
     int min_phred;
     int min_cov;
     int cap_cov;
-    int min_meth;
-    int max_meth;
     int keep_chg;
     int keep_chh;
     int hdf5_compression;
@@ -409,7 +406,7 @@ size_t find_buffer_index(MethylRecord *buffer, size_t offset, size_t size, uint3
 
 size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records,
                    int compression, int chunk_size, int append_mode,
-                   int min_cov, int cap_cov, int min_meth, int max_meth,
+                   int min_cov, int cap_cov,
                    OutputFormat output_format)
 {
     size_t records_written = 0;
@@ -418,7 +415,7 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records
     hid_t file = -1, dataset = -1, space = -1, type = -1, mem_type = -1, dcpl = -1;
     herr_t status = -1;
 
-    // Calculate the number of records to write (filtered by coverage and methylation level)
+    // Calculate the number of records to write (filtered by coverage)
     // and the average coverage
     double avg_cov = 0.0;
     for (size_t i = 0; i < n_records; i++)
@@ -426,14 +423,17 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records
         int total = buffer[i].mC + buffer[i].uC;
         if (total >= min_cov)
         {
-            double meth_level = total > 0 ? 100.0 * ((double)buffer[i].mC / total) : 0.0;
-            if (meth_level >= min_meth && meth_level <= max_meth)
-            {
-                dims[0]++;
-                // Online mean update using dims[0] as valid_count
-                avg_cov += ((double)total - avg_cov) / dims[0];
-            }
+            dims[0]++;
+            // Online mean update using dims[0] as valid_count
+            avg_cov += ((double)total - avg_cov) / dims[0];
         }
+    }
+
+    // If no records pass the filter, return early
+    if (dims[0] == 0)
+    {
+        log_time("No records passed the coverage filter\n");
+        return 0;
     }
 
     // Prepare filtered buffer
@@ -444,25 +444,21 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records
         goto cleanup;
     }
 
-    // Cap coverage using avg_cov and fill filtered buffer
+    // fill filtered buffer
     size_t j = 0;
     for (size_t i = 0; i < n_records; i++)
     {
         int total = buffer[i].mC + buffer[i].uC;
         if (total >= min_cov)
         {
-            double meth_level = total > 0 ? 100.0 * ((double)buffer[i].mC / total) : 0.0;
-            if (meth_level >= min_meth && meth_level <= max_meth)
+            // Only cap coverage if enabled
+            if (cap_cov && total > avg_cov)
             {
-                // Only cap coverage if enabled
-                if (cap_cov && total > avg_cov)
-                {
-                    double prop = (double)buffer[i].mC / total;
-                    buffer[i].mC = (uint16_t)round((avg_cov * prop));
-                    buffer[i].uC = (uint16_t)(avg_cov - buffer[i].mC);
-                }
-                filtered_buffer[j++] = buffer[i];
+                double prop = (double)buffer[i].mC / total;
+                buffer[i].mC = (uint16_t)round((avg_cov * prop));
+                buffer[i].uC = (uint16_t)(avg_cov - buffer[i].mC);
             }
+            filtered_buffer[j++] = buffer[i];
         }
     }
 
@@ -1006,8 +1002,6 @@ void process_chromosome(ThreadArg *targ)
         region_args[i].min_phred = targ->min_phred;
         region_args[i].min_cov = targ->min_cov;
         region_args[i].cap_cov = targ->cap_cov;
-        region_args[i].min_meth = targ->min_meth;
-        region_args[i].max_meth = targ->max_meth;
         region_args[i].keep_chg = targ->keep_chg;
         region_args[i].keep_chh = targ->keep_chh;
         region_args[i].hdf5_compression = targ->hdf5_compression;
@@ -1149,8 +1143,6 @@ void process_chromosome(ThreadArg *targ)
                     0,
                     targ->min_cov,
                     targ->cap_cov,
-                    targ->min_meth,
-                    targ->max_meth,
                     targ->output_format);
 
                 free(ctx_buffer);
@@ -1172,8 +1164,6 @@ void process_chromosome(ThreadArg *targ)
             0,
             targ->min_cov,
             targ->cap_cov,
-            targ->min_meth,
-            targ->max_meth,
             targ->output_format);
     }
 
@@ -1192,7 +1182,7 @@ void cleanup_hdf5(void)
     H5close();
 }
 
-int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_entries) 
+int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_entries, char **reference_file) 
 {
     FILE *fp = fopen(filename, "r");
     if (!fp) 
@@ -1215,6 +1205,16 @@ int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_ent
     free(data);
     if (!json) 
         return -3;
+
+    // Get reference file path
+    cJSON *ref = cJSON_GetObjectItem(json, "reference");
+    if (ref && cJSON_IsString(ref) && ref->valuestring) 
+    {
+        *reference_file = strdup(ref->valuestring);
+        fprintf(stderr, "Found reference file: %s\n", *reference_file);
+    }
+    else
+        fprintf(stderr, "Warning: No reference file specified in mapping\n");
 
     cJSON *chroms = cJSON_GetObjectItem(json, "chromosomes");
     if (!chroms || !cJSON_IsArray(chroms)) 
@@ -1277,13 +1277,32 @@ int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_ent
     return 0;
 }
 
+static void print_usage(const char *prog) 
+{
+    fprintf(stderr, "Usage: %s [options] <input.bam> <output_dir> [ref.fa]\n", prog);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -h, --help                Show this help message\n");
+    fprintf(stderr, "  -q, --min-mapq INT        Minimum mapping quality [%d]\n", DEFAULT_MIN_MAPQ);
+    fprintf(stderr, "  -p, --min-phred INT       Minimum base quality [%d]\n", DEFAULT_MIN_PHRED);
+    fprintf(stderr, "  -c, --cap-cov INT         Cap coverage (optional, default: 0)\n");
+    fprintf(stderr, "  -G, --CHG                 Process CHG context\n");
+    fprintf(stderr, "  -H, --CHH                 Process CHH context\n");
+    fprintf(stderr, "  -m, --chrom-mapping FILE  Chromosome mapping file [chrom_mapping.json]\n");
+    fprintf(stderr, "  -z, --compression INT     HDF5 compression level [%d]\n", DEFAULT_HDF5_COMPRESSION);
+    fprintf(stderr, "  -k, --chunk-size INT      HDF5 chunk size [%d]\n", DEFAULT_HDF5_CHUNK_SIZE);
+    fprintf(stderr, "  -f, --output-format STR   Output format (hdf5, txt, both) [hdf5]\n");
+    fprintf(stderr, "  -s, --split-context-files Split output by context\n");
+    fprintf(stderr, "  -o, --output-dir DIR      Output directory\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Note: ref.fa is optional. If provided, it will override the reference in chrom_mapping.json\n");
+    fprintf(stderr, "\n");
+}
+
 int main(int argc, char *argv[])
 {
     fprintf(stderr, "Program: MethylExtractor\nParameters:\n");
     for (int i = 0; i < argc; i++)
         fprintf(stderr, "  Arg %d: %s\n", i, argv[i]);
-
-    log_time("Starting processing...\n");
 
     int hdf5_compression = DEFAULT_HDF5_COMPRESSION;
     int hdf5_chunk_size = DEFAULT_HDF5_CHUNK_SIZE;
@@ -1294,72 +1313,36 @@ int main(int argc, char *argv[])
     int min_mapq = DEFAULT_MIN_MAPQ;
     int min_phred = DEFAULT_MIN_PHRED;
     int min_cov = DEFAULT_MIN_COV;
-    int cap_cov = DEFAULT_CAP_COVERAGE;
-    int min_meth = DEFAULT_MIN_METH;
-    int max_meth = DEFAULT_MAX_METH;
+    int cap_cov = 0;  // Default to 0 (no capping)
     OutputFormat output_format = OUTPUT_HDF5;  // Default to HDF5 output
     const char *out_dir = NULL;
     int split_context_files = 0;
-    const char *chrom_mapping_file = NULL;
+    const char *chrom_mapping_file = "chrom_mapping.json";  // Default to chrom_mapping.json
+    const char *ref_file = NULL;  // Will be set from chrom_mapping or command line
+
     struct option long_options[] = {
-        {"o", required_argument, 0, 'o'},
-        {"hdf5-compression", required_argument, 0, 'z'},
-        {"hdf5-chunk-size", required_argument, 0, 'k'},
-        {"@", required_argument, 0, 't'},
-        {"chunk-size", required_argument, 0, 's'},
+        {"help", no_argument, 0, 'h'},
+        {"min-mapq", required_argument, 0, 'q'},
+        {"min-phred", required_argument, 0, 'p'},
+        {"cap-cov", required_argument, 0, 'c'},
         {"CHG", no_argument, 0, 'G'},
         {"CHH", no_argument, 0, 'H'},
-        {"q", required_argument, 0, 'q'},
-        {"p", required_argument, 0, 'p'},
-        {"c", required_argument, 0, 'c'},
-        {"no-cap-coverage", no_argument, 0, 'N'},
-        {"l", required_argument, 0, 'l'},
-        {"L", required_argument, 0, 'L'},
-        {"output-format", required_argument, 0, 'x'},  // New option
-        {"split-context-files", no_argument, 0, 'S'},
-        {"chrom-mapping", required_argument, 0, 'M'},
-        {0, 0, 0, 0}};
+        {"chrom-mapping", required_argument, 0, 'm'},
+        {"compression", required_argument, 0, 'z'},
+        {"chunk-size", required_argument, 0, 'k'},
+        {"output-format", required_argument, 0, 'f'},
+        {"split-context-files", no_argument, 0, 's'},
+        {"output-dir", required_argument, 0, 'o'},
+        {0, 0, 0, 0}
+    };
     int opt;
-    while ((opt = getopt_long(argc, argv, "n:o:z:k:t:GHq:p:c:Nl:L:x:S:M:", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "hq:p:c:GHm:z:k:fs:o:", long_options, NULL)) != -1)
     {
         switch (opt)
         {
-        case 'G':
-            keep_chg = 1;
-            break;
-        case 'H':
-            keep_chh = 1;
-            break;
-        case 'o':
-            out_dir = optarg;
-            break;
-        case 'z':
-            hdf5_compression = atoi(optarg);
-            break;
-        case 'k':
-            hdf5_chunk_size = atoi(optarg);
-            if (hdf5_chunk_size < 1)
-            {
-                fprintf(stderr, "HDF5 chunk size must be positive\n");
-                return 1;
-            }
-            break;
-        case 's':
-            chunk_size = atoi(optarg);
-            if (chunk_size < 1)
-            {
-                fprintf(stderr, "Chunk size must be positive\n");
-                return 1;
-            }
-            break;
-        case 't':
-            num_threads = atoi(optarg);
-            if (num_threads < 1)
-            {
-                fprintf(stderr, "Number of threads must be positive\n");
-                return 1;
-            }
-            break;
+        case 'h':
+            print_usage(argv[0]);
+            return 0;
         case 'q':
             min_mapq = atoi(optarg);
             if (min_mapq < 0)
@@ -1384,26 +1367,27 @@ int main(int argc, char *argv[])
                 return 1;
             }
             break;
-        case 'N':
-            cap_cov = 0;
+        case 'G':
+            keep_chg = 1;
             break;
-        case 'l':
-            min_meth = atoi(optarg);
-            if (min_meth < 0 || min_meth > 100)
+        case 'H':
+            keep_chh = 1;
+            break;
+        case 'm':
+            chrom_mapping_file = optarg;
+            break;
+        case 'z':
+            hdf5_compression = atoi(optarg);
+            break;
+        case 'k':
+            hdf5_chunk_size = atoi(optarg);
+            if (hdf5_chunk_size < 1)
             {
-                fprintf(stderr, "Minimum methylation level must be between 0 and 100\n");
+                fprintf(stderr, "HDF5 chunk size must be positive\n");
                 return 1;
             }
             break;
-        case 'L':
-            max_meth = atoi(optarg);
-            if (max_meth < 0 || max_meth > 100)
-            {
-                fprintf(stderr, "Maximum methylation level must be between 0 and 100\n");
-                return 1;
-            }
-            break;
-        case 'x':
+        case 'f':
             if (strcmp(optarg, "hdf5") == 0)
                 output_format = OUTPUT_HDF5;
             else if (strcmp(optarg, "txt") == 0)
@@ -1416,66 +1400,92 @@ int main(int argc, char *argv[])
                 return 1;
             }
             break;
-        case 'S':
+        case 's':
             split_context_files = 1;
             break;
-        case 'M':
-            chrom_mapping_file = optarg;
+        case 'o':
+            out_dir = optarg;
             break;
         case '?':
         default:
-            fprintf(stderr, "Usage: %s [options] <ref.fa> <sorted_alignments.bam>\n", argv[0]);
-            fprintf(stderr, "Options:\n");
-            fprintf(stderr, "  --o DIR                  Output directory for output files\n");
-            fprintf(stderr, "  --output-format FORMAT   Output format (hdf5, txt, or both, default: hdf5)\n");
-            fprintf(stderr, "  --hdf5-compression INT   Compression level (0-9, default: %d)\n", DEFAULT_HDF5_COMPRESSION);
-            fprintf(stderr, "  --hdf5-chunk-size INT    Chunk size for HDF5 datasets (default: %d)\n", DEFAULT_HDF5_CHUNK_SIZE);
-            fprintf(stderr, "  --chunk-size INT         Genomic chunk size for threading (default: %d)\n", DEFAULT_CHUNK_SIZE);
-            fprintf(stderr, "  --@ INT                  Number of threads to use (default: %d)\n", DEFAULT_THREADS);
-            fprintf(stderr, "  --CHG                    Keep CHG context methylation data\n");
-            fprintf(stderr, "  --CHH                    Keep CHH context methylation data\n");
-            fprintf(stderr, "  --q INT                  Minimum mapping quality (default: %d)\n", DEFAULT_MIN_MAPQ);
-            fprintf(stderr, "  --p INT                  Minimum Phred score (default: %d)\n", DEFAULT_MIN_PHRED);
-            fprintf(stderr, "  --c INT                  Minimum coverage (default: %d)\n", DEFAULT_MIN_COV);
-            fprintf(stderr, "  --no-cap-coverage        Disable automatic coverage capping\n");
-            fprintf(stderr, "  --l INT                  Minimum methylation level (default: %d)\n", DEFAULT_MIN_METH);
-            fprintf(stderr, "  --L INT                  Maximum methylation level (default: %d)\n", DEFAULT_MAX_METH);
-            fprintf(stderr, "  --split-context-files     Output separate files for each context (CG, CHG, CHH)\n");
-            fprintf(stderr, "  --chrom-mapping FILE      JSON file with chromosome mapping and selection\n");
+            print_usage(argv[0]);
             return 1;
         }
     }
-    if (argc - optind < 2)
+
+    if (argc - optind < 1 || argc - optind > 2)
     {
-        fprintf(stderr, "Usage: %s [options] <ref.fa> <sorted_alignments.bam>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [options] <input.bam> [ref.fa]\n", argv[0]);
         return 1;
     }
 
-    if (min_meth > max_meth)
+    if (!out_dir)
     {
-        fprintf(stderr, "Minimum methylation level (%d) must not exceed maximum methylation level (%d)\n", min_meth, max_meth);
+        fprintf(stderr, "Error: Output directory (-o/--output-dir) is required\n");
         return 1;
     }
 
-    const char *ref_file = argv[optind];
-    const char *bam_file = argv[optind + 1];
+    const char *bam_file = argv[optind - 1];  // BAM file is the second-to-last argument
+    const char *cmd_ref_file = NULL;
+    if (optind < argc)  // If we have a last argument
+        cmd_ref_file = argv[optind];  // It's the optional reference file
+
     if (num_threads == DEFAULT_THREADS)
     {
         num_threads = sysconf(_SC_NPROCESSORS_ONLN);
         if (num_threads < 1)
             num_threads = DEFAULT_THREADS;
     }
+
     if (make_directory(out_dir) != 0)
     {
         fprintf(stderr, "Failed to create output directory: %s\n", out_dir);
         return 1;
     }
+
+    log_time("Starting processing...\n");
+
+    log_time("Loading chromosome mapping...\n");
+    int valid_chr_count = 0;
+    ChromMapEntry *chroms = NULL;
+    int n_chroms = 0;
+    char *mapping_ref_file = NULL;
+    if (load_chrom_mapping(chrom_mapping_file, &chroms, &n_chroms, &mapping_ref_file) != 0) 
+    {
+        fprintf(stderr, "Failed to load chromosome mapping from %s\n", chrom_mapping_file);
+        return 1;
+    }
+
+    // If reference file was provided on command line, use it
+    if (cmd_ref_file)
+    {
+        ref_file = cmd_ref_file;
+        log_time("Using reference from command line: %s\n", ref_file);
+    }
+    else if (mapping_ref_file)
+    {
+        // use the one from chrom_mapping
+        ref_file = mapping_ref_file;
+        log_time("Using reference from chrom_mapping: %s\n", ref_file);
+    }
+    else
+    {
+        fprintf(stderr, "No reference file specified in chrom_mapping.json or command line\n");
+        free(chroms);
+        return 1;
+    }
+
+    log_time("Loading reference...\n");
     faidx_t *fai = fai_load(ref_file);
     if (!fai)
     {
         fprintf(stderr, "Failed to load reference: %s\n", ref_file);
+        free(mapping_ref_file);
+        free(chroms);
         return 1;
     }
+    
+    log_time("Loading BAM...\n");
     samFile *in = sam_open(bam_file, "r");
     if (!in)
     {
@@ -1483,6 +1493,8 @@ int main(int argc, char *argv[])
         fai_destroy(fai);
         return 1;
     }
+
+    log_time("Reading BAM header...\n");
     bam_hdr_t *header = sam_hdr_read(in);
     if (!header)
     {
@@ -1492,6 +1504,8 @@ int main(int argc, char *argv[])
         return 1;
     }
     sam_close(in);
+
+    log_time("Allocating thread arguments...\n");
     ThreadArg *thread_args = malloc(header->n_targets * sizeof(ThreadArg));
     if (!thread_args)
     {
@@ -1500,14 +1514,8 @@ int main(int argc, char *argv[])
         fai_destroy(fai);
         return 1;
     }
-    int valid_chr_count = 0;
-    ChromMapEntry *chroms = NULL;
-    int n_chroms = 0;
-    if (!chrom_mapping_file || load_chrom_mapping(chrom_mapping_file, &chroms, &n_chroms) != 0) 
-    {
-        fprintf(stderr, "Failed to load chromosome mapping from %s\n", chrom_mapping_file);
-        return 1;
-    }
+
+    log_time("Processing chromosomes...\n");
     for (int i = 0; i < n_chroms; ++i) 
     {
         ChromMapEntry *entry = &chroms[i];
@@ -1537,8 +1545,6 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].min_phred = min_phred;
         thread_args[valid_chr_count].min_cov = min_cov;
         thread_args[valid_chr_count].cap_cov = cap_cov;
-        thread_args[valid_chr_count].min_meth = min_meth;
-        thread_args[valid_chr_count].max_meth = max_meth;
         thread_args[valid_chr_count].keep_chg = keep_chg;
         thread_args[valid_chr_count].keep_chh = keep_chh;
         thread_args[valid_chr_count].hdf5_compression = hdf5_compression;
@@ -1550,6 +1556,8 @@ int main(int argc, char *argv[])
         valid_chr_count++;
     }
     free(chroms);
+
+    log_time("Allocating threads...\n");
     pthread_t *threads = malloc(valid_chr_count * sizeof(pthread_t));
     if (!threads)
     {
@@ -1562,6 +1570,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    log_time("Creating thread argument copies...\n");
     // Create a copy of thread arguments for each thread
     ThreadArg **thread_args_copies = malloc(valid_chr_count * sizeof(ThreadArg *));
     if (!thread_args_copies) 
@@ -1576,6 +1585,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    log_time("Creating threads...\n");
     int active_threads = 0;
     for (int i = 0; i < valid_chr_count; i++)
     {
@@ -1606,8 +1616,6 @@ int main(int argc, char *argv[])
         thread_args_copies[i]->min_phred = thread_args[i].min_phred;
         thread_args_copies[i]->min_cov = thread_args[i].min_cov;
         thread_args_copies[i]->cap_cov = thread_args[i].cap_cov;
-        thread_args_copies[i]->min_meth = thread_args[i].min_meth;
-        thread_args_copies[i]->max_meth = thread_args[i].max_meth;
         thread_args_copies[i]->keep_chg = thread_args[i].keep_chg;
         thread_args_copies[i]->keep_chh = thread_args[i].keep_chh;
         thread_args_copies[i]->hdf5_compression = thread_args[i].hdf5_compression;
@@ -1635,13 +1643,16 @@ int main(int argc, char *argv[])
                     active_threads--;
     }
 
+    log_time("Joining threads...\n");
     for (int i = 0; i < valid_chr_count; i++)
         if (pthread_join(threads[i], NULL) == 0)
             if (active_threads > 0)
                 active_threads--;
 
+    log_time("Cleaning up HDF5...\n");
     cleanup_hdf5();
-    
+
+    log_time("Cleaning up thread argument copies...\n");
     // Clean up thread argument copies
     for (int i = 0; i < valid_chr_count; i++) 
         if (thread_args_copies[i]) 
@@ -1653,6 +1664,7 @@ int main(int argc, char *argv[])
 
     free(thread_args_copies);
 
+    log_time("Cleaning up original thread arguments...\n");
     // Clean up original thread arguments
     for (int i = 0; i < valid_chr_count; i++)
     {
@@ -1663,6 +1675,7 @@ int main(int argc, char *argv[])
     free(thread_args);
     sam_hdr_destroy(header);
     fai_destroy(fai);
+    free(mapping_ref_file);
 
     log_time("Processing complete. MethylExtractor has finished.\n");
         
