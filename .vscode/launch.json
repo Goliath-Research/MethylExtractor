@@ -6,8 +6,8 @@
       "type": "cppdbg",
       "request": "launch",
       "args": [
-        "-m", "/home/ubuntu/Work/HRA006113/human2014.json",
-        "-o", "/home/ubuntu/Work/HRA006113/HRR1458901", 
+        "-m", "/home/ubuntu/Work/HRA006113/human2022.json",
+        "-o", "/home/ubuntu/sample", 
         "-z", "9", 
         "-q", "30", 
         "-p", "20", 
@@ -16,8 +16,8 @@
         "-c", "0",
         "-k", "1000000",
         "-s",
-        "/home/ubuntu/Work/HRA006113/HRR1458908/HRR1458908.bam",
-        "/home/ubuntu/Work/genomes/human_genome/release-113/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+        "/home/ubuntu/sample/HRR1459216.bam",
+        "/home/ubuntu/Work/genomes/human_genome/release-113/hg38.fa"
       ],
       "stopAtEntry": false,
       "externalConsole": false,

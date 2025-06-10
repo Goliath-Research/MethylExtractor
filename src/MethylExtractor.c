@@ -1413,8 +1413,9 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (argc - optind < 1 || argc - optind > 2)
+    if (optind > argc)
     {
+        fprintf(stderr, "Error: Input BAM file is required\n");
         fprintf(stderr, "Usage: %s [options] <input.bam> [ref.fa]\n", argv[0]);
         return 1;
     }
@@ -1425,9 +1426,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    const char *bam_file = argv[optind - 1];  // BAM file is the second-to-last argument
+    const char *bam_file = argv[optind - 1];  // BAM file is the last argument
     const char *cmd_ref_file = NULL;
-    if (optind < argc)  // If we have a last argument
+    if (optind < argc)  // If we have a reference file
         cmd_ref_file = argv[optind];  // It's the optional reference file
 
     if (num_threads == DEFAULT_THREADS)
@@ -1484,7 +1485,15 @@ int main(int argc, char *argv[])
         free(chroms);
         return 1;
     }
-    
+
+    // Print chromosome names from FASTA index
+    // fprintf(stderr, "\nChromosomes in FASTA file:\n");
+    // for (int i = 0; i < faidx_nseq(fai); i++) {
+    //     const char *name = faidx_iseq(fai, i);
+    //     fprintf(stderr, "  %d: %s (length: %d)\n", i, name, faidx_seq_len(fai, name));
+    // }
+    // fprintf(stderr, "\n");
+
     log_time("Loading BAM...\n");
     samFile *in = sam_open(bam_file, "r");
     if (!in)
@@ -1503,6 +1512,14 @@ int main(int argc, char *argv[])
         fai_destroy(fai);
         return 1;
     }
+
+    // Print chromosome names from BAM header
+    // fprintf(stderr, "\nChromosomes in BAM file:\n");
+    // for (int i = 0; i < header->n_targets; i++) {
+    //     fprintf(stderr, "  %d: %s (length: %d)\n", i, header->target_name[i], header->target_len[i]);
+    // }
+    // fprintf(stderr, "\n");
+
     sam_close(in);
 
     log_time("Allocating thread arguments...\n");
@@ -1519,7 +1536,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < n_chroms; ++i) 
     {
         ChromMapEntry *entry = &chroms[i];
-        // Find BAM tid for entry->bam
+
         int tid = bam_name2id(header, entry->bam);
         if (tid < 0) 
         {
