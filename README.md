@@ -26,7 +26,7 @@ make
 - `-G, --CHG`: Include CHG context
 - `-H, --CHH`: Include CHH context
 - `-m, --chrom-mapping FILE`: Chromosome mapping file
-- `-z, --compression INT`: HDF5 compression level [0]
+- `-z, --compression INT`: HDF5 compression level [6]
 - `-k, --chunk-size INT`: HDF5 chunk size [1000]
 - `-f, --output-format STR`: Output format (hdf5, txt, both) [hdf5]
 - `-s, --split`: Split output by context
