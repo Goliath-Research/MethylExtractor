@@ -1,147 +1,72 @@
 # MethylExtractor
 
-MethylExtractor is a command-line tool for extracting methylation data from BAM files and writing it to HDF5 or text format.
+A tool for extracting methylation data from BAM files.
 
-## Project Structure
-
-```
-MethylExtractor/
-├── src/
-│   └── MethylExtractor.c
-├── include/
-│   └── (header files for tshlib and hdf5 if needed)
-├── lib/
-│   └── (static/dynamic libs for tshlib and hdf5 if custom)
-├── build/
-│   ├── static/
-│   ├── debug/
-│   ├── dynamic/
-│   └── docker/
-├── Dockerfile
-├── Makefile
-└── README.md
-```
-
-## Building the Project
-
-### Prerequisites
-
-The Makefile can automatically install all required dependencies:
+## Installation
 
 ```bash
-make install-deps
+git clone https://github.com/yourusername/MethylExtractor.git
+cd MethylExtractor
+make
 ```
-
-This will install:
-- GCC compiler
-- Make
-- HDF5 library and development headers
-- HTSlib library and development headers
-- Other build dependencies
-
-### Build Instructions
-
-The Makefile supports multiple build configurations:
-
-1. **Install Dependencies**:
-   ```bash
-   make install-deps
-   ```
-
-2. **Static Build**:
-   ```bash
-   make static
-   ```
-   This will create a statically linked binary at `build/static/MethylExtractor`.
-
-3. **Dynamic Build**:
-   ```bash
-   make dynamic
-   ```
-   This will create a dynamically linked binary at `build/dynamic/MethylExtractor`.
-
-4. **Debug Build**:
-   ```bash
-   make debug
-   ```
-   This will create a debug version with additional debugging information.
-
-5. **Containerized Build**:
-   ```bash
-   make docker
-   ```
-   This will build a Docker image named `MethylExtractor:latest`.
-
-6. **Install to System**:
-   ```bash
-   sudo make install
-   ```
-   This will install the binary to `/usr/bin/MethylExtractor`.
-
-7. **Clean Build Files**:
-   ```bash
-   make clean
-   ```
-   This will remove all build artifacts.
-
-8. **Build All Configurations**:
-   ```bash
-   make all
-   ```
-   This will build all configurations (static, dynamic, and debug).
 
 ## Usage
 
-Run the tool with the following command:
-
 ```bash
-./build/dynamic/MethylExtractor [options] <input.bam> [ref.fa]
+./MethylExtractor [options] <input.bam> [reference.fa]
 ```
 
-### Required Arguments:
-- `<input.bam>`: Input BAM file containing methylation data
+### Options
 
-### Optional Arguments:
-- `[ref.fa]`: Reference FASTA file (optional, will override reference in chrom_mapping.json if provided)
+- `-h, --help`: Show help message
+- `-t, --threads INT`: Number of threads [1]
+- `-q, --min-mapq INT`: Minimum mapping quality [0]
+- `-p, --min-phred INT`: Minimum base quality [0]
+- `-c, --cap-cov INT`: Cap coverage to this value [0]
+- `-G, --CHG`: Include CHG context
+- `-H, --CHH`: Include CHH context
+- `-m, --chrom-mapping FILE`: Chromosome mapping file
+- `-z, --compression INT`: HDF5 compression level [0]
+- `-k, --chunk-size INT`: HDF5 chunk size [1000]
+- `-f, --output-format STR`: Output format (hdf5, txt, both) [hdf5]
+- `-s, --split`: Split output by context
+- `-o, --output-dir DIR`: Output directory
 
-### Options:
-```
-  -h, --help                Show help message
-  -q, --min-mapq INT        Minimum mapping quality [30]
-  -p, --min-phred INT       Minimum base quality [20]
-  -c, --cap-cov INT         Cap coverage (optional, default: 0)
-  -G, --CHG                 Process CHG context
-  -H, --CHH                 Process CHH context
-  -m, --chrom-mapping FILE  Chromosome mapping file [chrom_mapping.json]
-  -z, --compression INT     HDF5 compression level [6]
-  -k, --chunk-size INT      HDF5 chunk size [1000000]
-  -f, --output-format STR   Output format (hdf5, txt, both) [hdf5]
-  -s, --split-context-files Split output by context
-  -o, --output-dir DIR      Output directory (required)
-```
+### Output Formats
 
-### Example Usage:
+- `hdf5`: HDF5 format (default)
+- `txt`: Text format
+- `both`: Both HDF5 and text formats
 
-1. Basic usage with default options:
+### Examples
+
+Basic usage:
 ```bash
-./build/dynamic/MethylExtractor -o output_dir input.bam
+./MethylExtractor input.bam reference.fa
 ```
 
-2. Process all contexts with custom quality thresholds:
+With options:
 ```bash
-./build/dynamic/MethylExtractor -G -H -q 20 -p 15 -o output_dir input.bam
+./MethylExtractor -t 4 -q 20 -p 20 -G -H -f both -o output_dir input.bam reference.fa
 ```
 
-3. Output in text format with split context files:
-```bash
-./build/dynamic/MethylExtractor -f txt -s -o output_dir input.bam
-```
+## Output Files
 
-4. Use custom reference file:
-```bash
-./build/dynamic/MethylExtractor -o output_dir input.bam ref.fa
-```
+The tool generates the following output files:
+
+- `output.h5`: HDF5 file containing methylation data
+- `output.txt`: Text file containing methylation data (if text format is selected)
+- `output.CG.txt`: Text file containing CG context data (if split by context)
+- `output.CHG.txt`: Text file containing CHG context data (if split by context)
+- `output.CHH.txt`: Text file containing CHH context data (if split by context)
+
+## Dependencies
+
+- HTSlib
+- HDF5
+- khash
+- pthread
 
 ## License
 
-[Add your license information here] 
+This project is licensed under the MIT License - see the LICENSE file for details. 
