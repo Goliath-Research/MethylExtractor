@@ -6,8 +6,7 @@
       "type": "cppdbg",
       "request": "launch",
       "args": [
-        "-m", "/home/ubuntu/Work/HRA006113/human2022.json",
-        "-o", "/home/ubuntu/sample", 
+        "-o", "/home/ubuntu/working_dir/30x/output", 
         "-z", "9", 
         "-q", "30", 
         "-p", "20", 
@@ -16,8 +15,8 @@
         "-c", "0",
         "-k", "1000000",
         "-s",
-        "/home/ubuntu/sample/HRR1459216.bam",
-        "/home/ubuntu/Work/genomes/human_genome/release-113/hg38.fa"
+        "-f", "both",
+        "/home/ubuntu/working_dir/30x/output/sample30x.clara_parabrics.duplicates_marked.bam",
       ],
       "stopAtEntry": false,
       "externalConsole": false,

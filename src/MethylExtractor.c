@@ -1317,26 +1317,26 @@ int main(int argc, char *argv[])
     OutputFormat output_format = OUTPUT_HDF5;  // Default to HDF5 output
     const char *out_dir = NULL;
     int split_context_files = 0;
-    const char *chrom_mapping_file = "chrom_mapping.json";  // Default to chrom_mapping.json
+    const char *chrom_mapping_file = NULL;  // Default to NULL
     const char *ref_file = NULL;  // Will be set from chrom_mapping or command line
 
     struct option long_options[] = {
         {"help", no_argument, 0, 'h'},
-        {"min-mapq", required_argument, 0, 'q'},
-        {"min-phred", required_argument, 0, 'p'},
-        {"cap-cov", required_argument, 0, 'c'},
-        {"CHG", no_argument, 0, 'G'},
-        {"CHH", no_argument, 0, 'H'},
-        {"chrom-mapping", required_argument, 0, 'm'},
+        {"quality", required_argument, 0, 'q'},
+        {"threads", required_argument, 0, 'p'},
+        {"min-cov", required_argument, 0, 'c'},
+        {"keep-chg", no_argument, 0, 'G'},
+        {"keep-chh", no_argument, 0, 'H'},
+        {"min-meth", required_argument, 0, 'm'},
         {"compression", required_argument, 0, 'z'},
-        {"chunk-size", required_argument, 0, 'k'},
-        {"output-format", required_argument, 0, 'f'},
-        {"split-context-files", no_argument, 0, 's'},
+        {"max-chr", required_argument, 0, 'k'},
+        {"format", required_argument, 0, 'f'},
+        {"split", no_argument, 0, 's'},
         {"output-dir", required_argument, 0, 'o'},
         {0, 0, 0, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "hq:p:c:GHm:z:k:fs:o:", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "hq:p:c:GHm:z:k:f:so:", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -1388,15 +1388,15 @@ int main(int argc, char *argv[])
             }
             break;
         case 'f':
-            if (strcmp(optarg, "hdf5") == 0)
+            if (strcmp(optarg, "both") == 0)
+                output_format = OUTPUT_BOTH;
+            else if (strcmp(optarg, "hdf5") == 0)
                 output_format = OUTPUT_HDF5;
             else if (strcmp(optarg, "txt") == 0)
                 output_format = OUTPUT_TXT;
-            else if (strcmp(optarg, "both") == 0)
-                output_format = OUTPUT_BOTH;
             else
             {
-                fprintf(stderr, "Invalid output format. Must be one of: hdf5, txt, both\n");
+                fprintf(stderr, "Error: Invalid output format '%s'. Must be one of: both, hdf5, txt\n", optarg);
                 return 1;
             }
             break;
@@ -1413,23 +1413,20 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (optind > argc)
+    // Check if we have the required BAM file argument
+    if (optind >= argc)
     {
-        fprintf(stderr, "Error: Input BAM file is required\n");
-        fprintf(stderr, "Usage: %s [options] <input.bam> [ref.fa]\n", argv[0]);
+        fprintf(stderr, "Error: No BAM file specified\n");
         return 1;
     }
 
-    if (!out_dir)
-    {
-        fprintf(stderr, "Error: Output directory (-o/--output-dir) is required\n");
-        return 1;
-    }
+    const char *bam_file = argv[optind];  // BAM file is the first non-option argument
+    const char *cmd_ref_file = NULL;      // Will be set if reference file is provided
 
-    const char *bam_file = argv[optind - 1];  // BAM file is the last argument
-    const char *cmd_ref_file = NULL;
-    if (optind < argc)  // If we have a reference file
-        cmd_ref_file = argv[optind];  // It's the optional reference file
+    if (optind + 1 < argc)  // If we have a reference file
+    {
+        cmd_ref_file = argv[optind + 1];  // It's the second non-option argument
+    }
 
     if (num_threads == DEFAULT_THREADS)
     {
@@ -1449,11 +1446,32 @@ int main(int argc, char *argv[])
     log_time("Loading chromosome mapping...\n");
     int valid_chr_count = 0;
     ChromMapEntry *chroms = NULL;
+    char chrom_mapping_path[1024];
+    if (chrom_mapping_file)
+    {
+        // Use the provided mapping file
+        strncpy(chrom_mapping_path, chrom_mapping_file, sizeof(chrom_mapping_path) - 1);
+        chrom_mapping_path[sizeof(chrom_mapping_path) - 1] = '\0';
+    }
+    else
+    {
+        // Use chrom_mapping.json in the same directory as the BAM file
+        char *bam_dir = strdup(bam_file);
+        char *last_slash = strrchr(bam_dir, '/');
+        if (last_slash) {
+            *(last_slash + 1) = '\0';  // Keep the trailing slash
+        } else {
+            bam_dir[0] = '\0';  // No directory, use current directory
+        }
+        snprintf(chrom_mapping_path, sizeof(chrom_mapping_path), "%schrom_mapping.json", bam_dir);
+        free(bam_dir);
+    }
+    
     int n_chroms = 0;
     char *mapping_ref_file = NULL;
-    if (load_chrom_mapping(chrom_mapping_file, &chroms, &n_chroms, &mapping_ref_file) != 0) 
+    if (load_chrom_mapping(chrom_mapping_path, &chroms, &n_chroms, &mapping_ref_file) != 0)
     {
-        fprintf(stderr, "Failed to load chromosome mapping from %s\n", chrom_mapping_file);
+        fprintf(stderr, "Error: Failed to load chromosome mapping from %s\n", chrom_mapping_path);
         return 1;
     }
 
@@ -1481,7 +1499,6 @@ int main(int argc, char *argv[])
     if (!fai)
     {
         fprintf(stderr, "Failed to load reference: %s\n", ref_file);
-        free(mapping_ref_file);
         free(chroms);
         return 1;
     }
@@ -1692,7 +1709,8 @@ int main(int argc, char *argv[])
     free(thread_args);
     sam_hdr_destroy(header);
     fai_destroy(fai);
-    free(mapping_ref_file);
+    if (mapping_ref_file)
+        free(mapping_ref_file);
 
     log_time("Processing complete. MethylExtractor has finished.\n");
         
