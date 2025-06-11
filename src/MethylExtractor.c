@@ -1282,6 +1282,7 @@ static void print_usage(const char *prog)
     fprintf(stderr, "Usage: %s [options] <input.bam> <output_dir> [ref.fa]\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -h, --help                Show this help message\n");
+    fprintf(stderr, "  -t, --threads INT         Number of threads [%d]\n", DEFAULT_THREADS);
     fprintf(stderr, "  -q, --min-mapq INT        Minimum mapping quality [%d]\n", DEFAULT_MIN_MAPQ);
     fprintf(stderr, "  -p, --min-phred INT       Minimum base quality [%d]\n", DEFAULT_MIN_PHRED);
     fprintf(stderr, "  -c, --cap-cov INT         Cap coverage (optional, default: 0)\n");
@@ -1291,7 +1292,7 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -z, --compression INT     HDF5 compression level [%d]\n", DEFAULT_HDF5_COMPRESSION);
     fprintf(stderr, "  -k, --chunk-size INT      HDF5 chunk size [%d]\n", DEFAULT_HDF5_CHUNK_SIZE);
     fprintf(stderr, "  -f, --output-format STR   Output format (hdf5, txt, both) [hdf5]\n");
-    fprintf(stderr, "  -s, --split-context-files Split output by context\n");
+    fprintf(stderr, "  -s, --split               Split output by context\n");
     fprintf(stderr, "  -o, --output-dir DIR      Output directory\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Note: ref.fa is optional. If provided, it will override the reference in chrom_mapping.json\n");
@@ -1322,15 +1323,16 @@ int main(int argc, char *argv[])
 
     struct option long_options[] = {
         {"help", no_argument, 0, 'h'},
-        {"quality", required_argument, 0, 'q'},
-        {"threads", required_argument, 0, 'p'},
-        {"min-cov", required_argument, 0, 'c'},
-        {"keep-chg", no_argument, 0, 'G'},
-        {"keep-chh", no_argument, 0, 'H'},
-        {"min-meth", required_argument, 0, 'm'},
+        {"threads", required_argument, 0, 't'},
+        {"min-mapq", required_argument, 0, 'q'},
+        {"min-phred", required_argument, 0, 'p'},
+        {"cap-cov", required_argument, 0, 'c'},
+        {"CHG", no_argument, 0, 'G'},
+        {"CHH", no_argument, 0, 'H'},
+        {"chrom-mapping", required_argument, 0, 'm'},
         {"compression", required_argument, 0, 'z'},
-        {"max-chr", required_argument, 0, 'k'},
-        {"format", required_argument, 0, 'f'},
+        {"chunk-size", required_argument, 0, 'k'},
+        {"output-format", required_argument, 0, 'f'},
         {"split", no_argument, 0, 's'},
         {"output-dir", required_argument, 0, 'o'},
         {0, 0, 0, 0}
@@ -1343,6 +1345,14 @@ int main(int argc, char *argv[])
         case 'h':
             print_usage(argv[0]);
             return 0;
+        case 't':
+            num_threads = atoi(optarg);
+            if (num_threads < 1)
+            {
+                fprintf(stderr, "Number of threads must be positive\n");
+                return 1;
+            }
+            break;
         case 'q':
             min_mapq = atoi(optarg);
             if (min_mapq < 0)
