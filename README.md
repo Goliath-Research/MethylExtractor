@@ -19,15 +19,16 @@ make
 ### Options
 
 - `-h, --help`: Show help message
-- `-t, --threads INT`: Number of threads [1]
-- `-q, --min-mapq INT`: Minimum mapping quality [0]
-- `-p, --min-phred INT`: Minimum base quality [0]
-- `-c, --cap-cov INT`: Cap coverage to this value [0]
+- `-t, --threads INT`: Number of threads [16]
+- `-q, --min-mapq INT`: Minimum mapping quality [30]
+- `-p, --min-phred INT`: Minimum base quality [20]
+- `-c, --min-cov INT`: Minimum coverage threshold [4]
+- `-C, --cap-cov INT`: Cap coverage to this value [0]
 - `-G, --CHG`: Include CHG context
 - `-H, --CHH`: Include CHH context
 - `-m, --chrom-mapping FILE`: Chromosome mapping file
 - `-z, --compression INT`: HDF5 compression level [6]
-- `-k, --chunk-size INT`: HDF5 chunk size [1000]
+- `-k, --chunk-size INT`: HDF5 chunk size [1000000]
 - `-f, --output-format STR`: Output format (hdf5, txt, both) [hdf5]
 - `-s, --split`: Split output by context
 - `-o, --output-dir DIR`: Output directory
