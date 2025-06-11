@@ -1285,7 +1285,8 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -t, --threads INT         Number of threads [%d]\n", DEFAULT_THREADS);
     fprintf(stderr, "  -q, --min-mapq INT        Minimum mapping quality [%d]\n", DEFAULT_MIN_MAPQ);
     fprintf(stderr, "  -p, --min-phred INT       Minimum base quality [%d]\n", DEFAULT_MIN_PHRED);
-    fprintf(stderr, "  -c, --cap-cov INT         Cap coverage (optional, default: 0)\n");
+    fprintf(stderr, "  -c, --min-cov INT         Minimum coverage [%d]\n", DEFAULT_MIN_COV);
+    fprintf(stderr, "  -C, --cap-cov INT         Cap coverage (optional, default: 0)\n");
     fprintf(stderr, "  -G, --CHG                 Process CHG context\n");
     fprintf(stderr, "  -H, --CHH                 Process CHH context\n");
     fprintf(stderr, "  -m, --chrom-mapping FILE  Chromosome mapping file [chrom_mapping.json]\n");
@@ -1326,7 +1327,8 @@ int main(int argc, char *argv[])
         {"threads", required_argument, 0, 't'},
         {"min-mapq", required_argument, 0, 'q'},
         {"min-phred", required_argument, 0, 'p'},
-        {"cap-cov", required_argument, 0, 'c'},
+        {"min-cov", required_argument, 0, 'c'},
+        {"cap-cov", required_argument, 0, 'C'},
         {"CHG", no_argument, 0, 'G'},
         {"CHH", no_argument, 0, 'H'},
         {"chrom-mapping", required_argument, 0, 'm'},
@@ -1338,7 +1340,7 @@ int main(int argc, char *argv[])
         {0, 0, 0, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "hq:p:c:GHm:z:k:f:so:", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "hq:p:c:C:GHm:z:k:f:so:", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -1374,6 +1376,14 @@ int main(int argc, char *argv[])
             if (min_cov < 0)
             {
                 fprintf(stderr, "Minimum coverage must be positive\n");
+                return 1;
+            }
+            break;
+        case 'C':
+            cap_cov = atoi(optarg);
+            if (cap_cov < 0)
+            {
+                fprintf(stderr, "Cap coverage must be positive\n");
                 return 1;
             }
             break;
