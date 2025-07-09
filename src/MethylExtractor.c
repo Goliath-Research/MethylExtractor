@@ -404,6 +404,111 @@ size_t find_buffer_index(MethylRecord *buffer, size_t offset, size_t size, uint3
     return -1;
 }
 
+// Structure to hold statistics
+typedef struct {
+    size_t num_positions;
+    uint64_t total_methylated;
+    uint64_t total_unmethylated;
+    double avg_methylation_level;
+    double avg_coverage;
+} MethylStats;
+
+// Function to calculate statistics from filtered buffer
+static MethylStats calculate_statistics(MethylRecord *filtered_buffer, size_t n_records)
+{
+    MethylStats stats = {0, 0, 0, 0.0, 0.0};
+    
+    if (n_records == 0)
+        return stats;
+    
+    stats.num_positions = n_records;
+    
+    // Use uint64_t to avoid overflow for large datasets
+    uint64_t total_mC = 0;
+    uint64_t total_uC = 0;
+    
+    for (size_t i = 0; i < n_records; i++) 
+    {
+        total_mC += filtered_buffer[i].mC;
+        total_uC += filtered_buffer[i].uC;
+    }
+    
+    stats.total_methylated = total_mC;
+    stats.total_unmethylated = total_uC;
+    
+    uint64_t total_coverage = total_mC + total_uC;
+    
+    if (total_coverage > 0) 
+    {
+        stats.avg_methylation_level = (double)total_mC / (double)total_coverage;
+        stats.avg_coverage = (double)total_coverage / (double)n_records;
+    }
+    
+    return stats;
+}
+
+// Function to write statistics JSON file
+static int write_statistics_json(const char *base_filename, MethylStats stats)
+{
+    char json_filename[1024];
+    
+    // Create JSON filename by replacing the extension with .json
+    const char *dot = strrchr(base_filename, '.');
+    if (dot && (strcmp(dot, ".txt") == 0 || strcmp(dot, ".h5") == 0)) 
+    {
+        size_t base_len = dot - base_filename;
+        strncpy(json_filename, base_filename, base_len);
+        json_filename[base_len] = '\0';
+        strcat(json_filename, ".json");
+    } 
+    else 
+        snprintf(json_filename, sizeof(json_filename), "%s.json", base_filename);
+    
+    // Create JSON object
+    cJSON *root = cJSON_CreateObject();
+    if (!root) 
+    {
+        fprintf(stderr, "Failed to create JSON root object\n");
+        return -1;
+    }
+    
+    // Add statistics to JSON
+    cJSON_AddNumberToObject(root, "num_positions", (double)stats.num_positions);
+    cJSON_AddNumberToObject(root, "total_methylated", (double)stats.total_methylated);
+    cJSON_AddNumberToObject(root, "total_unmethylated", (double)stats.total_unmethylated);
+    cJSON_AddNumberToObject(root, "avg_methylation_level", stats.avg_methylation_level);
+    cJSON_AddNumberToObject(root, "avg_coverage", stats.avg_coverage);
+    
+    // Write JSON to file
+    char *json_string = cJSON_Print(root);
+    if (!json_string) 
+    {
+        fprintf(stderr, "Failed to print JSON\n");
+        cJSON_Delete(root);
+        return -1;
+    }
+    
+    FILE *json_fp = fopen(json_filename, "w");
+    if (!json_fp) 
+    {
+        fprintf(stderr, "Failed to open JSON file for writing: %s\n", json_filename);
+        free(json_string);
+        cJSON_Delete(root);
+        return -1;
+    }
+    
+    fprintf(json_fp, "%s\n", json_string);
+    fclose(json_fp);
+    
+    log_time("Wrote statistics to: %s\n", json_filename);
+    
+    // Cleanup
+    free(json_string);
+    cJSON_Delete(root);
+    
+    return 0;
+}
+
 size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records,
                    int compression, int chunk_size, int append_mode,
                    int min_cov, int cap_cov,
@@ -631,6 +736,10 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records
 
         log_time("Finished writing HDF5 file: %s\n", filename);
     }
+
+    // Calculate and write statistics (same for both formats since content is identical)
+    MethylStats stats = calculate_statistics(filtered_buffer, dims[0]);
+    write_statistics_json(filename, stats);
 
     records_written = dims[0];
     log_time("Finished writing output files, wrote %llu filtered records\n", (unsigned long long)dims[0]);
@@ -1044,9 +1153,7 @@ void process_chromosome(ThreadArg *targ)
         fprintf(stderr, "Failed to allocate memory for joined array\n");
         // Clean up region arguments
         for (int i = 0; i < n_regions; i++) 
-        {
             free(region_args[i].chr);
-        }
         free(region_args);
         pthread_mutex_destroy(&buffer_mutex);
         free(buffer);
