@@ -1,9 +1,21 @@
 # Makefile for MethylExtractor
 
+# Detect architecture
+ARCH := $(shell uname -m)
+ifeq ($(ARCH),aarch64)
+    ARCH_NAME := arm64
+    HDF5_LIB_PATH := /usr/lib/aarch64-linux-gnu/hdf5/serial
+else ifeq ($(ARCH),x86_64)
+    ARCH_NAME := x64
+    HDF5_LIB_PATH := /usr/lib/x86_64-linux-gnu/hdf5/serial
+else
+    $(error Unsupported architecture: $(ARCH))
+endif
+
 CC = gcc
 CFLAGS = -O2 -Wall -Iinclude -I/usr/include/hdf5 -I/usr/include/htslib -I/usr/include
 DEBUG_CFLAGS = -g -O0 -Wall -Iinclude -I/usr/include/hdf5 -I/usr/include/htslib -I/usr/include -DDEBUG
-LDFLAGS = -Llib -L/usr/lib/aarch64-linux-gnu
+LDFLAGS = -Llib -L/usr/lib/$(ARCH_NAME)-linux-gnu
 
 # Dependencies
 HTSLIB_DIR = /usr
@@ -17,9 +29,9 @@ HDF5_LIBS = -lhdf5_serial -lhdf5_serial_hl
 STATIC_LIBS = -lz -lm -ldl -lpthread -lbz2 -llzma -lcurl -lcrypto -lssl -lzstd
 
 # Output directories
-STATIC_DIR = build/static
-DYNAMIC_DIR = build/dynamic
-DEBUG_DIR = build/debug
+STATIC_DIR = build/static/$(ARCH_NAME)
+DYNAMIC_DIR = build/dynamic/$(ARCH_NAME)
+DEBUG_DIR = build/debug/$(ARCH_NAME)
 
 # Targets
 all: deps dynamic
@@ -50,15 +62,15 @@ debug: $(DEBUG_DIR)/MethylExtractor
 
 $(STATIC_DIR)/MethylExtractor: src/MethylExtractor.c
 	mkdir -p $(STATIC_DIR)
-	$(CC) $(CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib/x86_64-linux-gnu/hdf5/serial $(HTSLIB_LIBS) $(HDF5_LIBS) $(STATIC_LIBS) -static
+	$(CC) $(CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_LIB_PATH) $(HTSLIB_LIBS) $(HDF5_LIBS) $(STATIC_LIBS) -static
 
 $(DYNAMIC_DIR)/MethylExtractor: src/MethylExtractor.c
 	mkdir -p $(DYNAMIC_DIR)
-	$(CC) $(CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
+	$(CC) $(CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_LIB_PATH) $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
 
 $(DEBUG_DIR)/MethylExtractor: src/MethylExtractor.c
 	mkdir -p $(DEBUG_DIR)
-	$(CC) $(DEBUG_CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_DIR)/lib $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
+	$(CC) $(DEBUG_CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_LIB_PATH) $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
 
 install: dynamic
 	sudo cp $(DYNAMIC_DIR)/MethylExtractor /usr/local/bin/
