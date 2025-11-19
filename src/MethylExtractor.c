@@ -9,11 +9,17 @@
 #include <getopt.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#include <errno.h>
 #include <hdf5/serial/hdf5.h>
 #include <pthread.h>
 #include <sys/sysinfo.h>
 #include <time.h>
 #include "cjson/cJSON.h"
+
+// Global debug variables and file for monitoring buffer[41].mC changes
+int debug_buffer_41_changed = 0;
+int debug_buffer_41_value = 0;
+FILE *debug_file = NULL;
 
 #define DEFAULT_MAX_CHR 24
 #define DEFAULT_HDF5_COMPRESSION 6
@@ -139,7 +145,24 @@ int make_directory(const char *path)
 {
     struct stat st = {0};
     if (stat(path, &st) == -1)
+    {
+        // Create parent directories recursively
+        char *parent = strdup(path);
+        char *slash = strrchr(parent, '/');
+        if (slash && slash != parent)
+        {
+            *slash = '\0';
+            if (make_directory(parent) != 0)
+            {
+                free(parent);
+                return -1;
+            }
+        }
+        free(parent);
+
+        // Create the directory
         return mkdir(path, 0700);
+    }
     return 0;
 }
 
@@ -560,8 +583,20 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records
             if (cap_cov && total > avg_cov)
             {
                 double prop = (double)buffer[i].mC / total;
+                uint16_t old_mC = buffer[i].mC;
                 buffer[i].mC = (uint16_t)round((avg_cov * prop));
                 buffer[i].uC = (uint16_t)(avg_cov - buffer[i].mC);
+                if (i == 41) {
+                    debug_buffer_41_changed = 1;
+                    debug_buffer_41_value = buffer[41].mC;
+                    if (debug_file) {
+                        fprintf(debug_file,
+                                "RECALCULATE: buffer[41].mC changed from %u to %u "
+                                "(capping: total=%d > avg_cov=%.1f, proportion=%.6f)\n",
+                                old_mC, buffer[41].mC, total, avg_cov, prop);
+                        fflush(debug_file);
+                    }
+                }
             }
             filtered_buffer[j++] = buffer[i];
         }
@@ -960,6 +995,13 @@ void *process_chromosome_region(void *arg)
             continue; // Only process C or G reference sites
 
         size_t idx = kh_val(targ->pos_map, iter_kh);
+
+        // Debug: Log when we process buffer[41]
+        if (idx == 41 && debug_file) {
+            fprintf(debug_file, "DEBUG: Processing buffer[41] at genomic position %lu\n", pos);
+            fflush(debug_file);
+        }
+
         for (int i = 0; i < n_plp; i++)
         {
             const bam_pileup1_t *p = &pileup[i];
@@ -967,12 +1009,14 @@ void *process_chromosome_region(void *arg)
                 continue;
 
             b = p->b;
+            int read_qual = b->core.qual;
             // Ignore low mapping quality reads
-            if (b->core.qual < targ->min_mapq)
+            if (read_qual < targ->min_mapq)
                 continue;
 
+            int read_flag = b->core.flag;
             // Ignore reads with default flags
-            if (b->core.flag & DEFAULT_FLAGS)
+            if (read_flag & DEFAULT_FLAGS)
                 continue;
 
             int strand = getRealStrand(b);
@@ -984,7 +1028,8 @@ void *process_chromosome_region(void *arg)
             uint8_t *qual = bam_get_qual(b);
 
             // Ignore low quality bases
-            if (qual[seq_idx] < targ->min_phred)
+            int base_qual = qual[seq_idx];
+            if (base_qual < targ->min_phred)
                 continue;
 
             int base = bam_seqi(seq, seq_idx);
@@ -993,17 +1038,65 @@ void *process_chromosome_region(void *arg)
 
             // Now, apply MethylDackel's logic:
             // CpG
-            if ((ref_base == 'C') && (strand == 1 || strand == 3)) 
+            if ((ref_base == 'C') && (strand == 1 || strand == 3))
             {
                 if (base == 2) // G
+                {
                     targ->buffer[idx].mC++;
+                    if (idx == 41) 
+                    {
+                        debug_buffer_41_changed = 1;
+                        debug_buffer_41_value = targ->buffer[41].mC;
+                        if (debug_file) 
+                        {
+                            fprintf(debug_file,
+                                    "INCREMENT: buffer[41].mC -> %u "
+                                    "(read_qual=%d, read_flag=0x%x, base_qual=%d, "
+                                    "base=%d, ref_base=%c, strand=%d, "
+                                    "condition: ref_base=='C' && (strand==1||strand==3) && base==2 [G])\n",
+                                    targ->buffer[41].mC,
+                                    read_qual,
+                                    read_flag,
+                                    base_qual,
+                                    base,
+                                    ref_base,
+                                    strand
+                            );
+                            fflush(debug_file);
+                        }
+                    }
+                }
                 else if (base == 8) // T
                     targ->buffer[idx].uC++;
-            } 
-            else if ((ref_base == 'G') && (strand == 2 || strand == 4)) 
+            }
+            else if ((ref_base == 'G') && (strand == 2 || strand == 4))
             {
                 if (base == 4) // C
+                {
                     targ->buffer[idx].mC++;
+                    if (idx == 41) 
+                    {
+                        debug_buffer_41_changed = 1;
+                        debug_buffer_41_value = targ->buffer[41].mC;
+                        if (debug_file) 
+                        {
+                            fprintf(debug_file,
+                                    "INCREMENT: buffer[41].mC -> %u "
+                                    "(read_qual=%d, read_flag=0x%x, base_qual=%d, "
+                                    "base=%d, ref_base=%c, strand=%d, "
+                                    "condition: ref_base=='G' && (strand==2||strand==4) && base==4 [C])\n",
+                                    targ->buffer[41].mC,
+                                    read_qual,
+                                    read_flag,
+                                    base_qual,
+                                    base,
+                                    ref_base,
+                                    strand
+                            );
+                            fflush(debug_file);
+                        }
+                    }
+                }
                 else if (base == 1) // A
                     targ->buffer[idx].uC++;
             }
@@ -1413,6 +1506,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < argc; i++)
         fprintf(stderr, "  Arg %d: %s\n", i, argv[i]);
 
+
     int hdf5_compression = DEFAULT_HDF5_COMPRESSION;
     int hdf5_chunk_size = DEFAULT_HDF5_CHUNK_SIZE;
     uint32_t chunk_size = DEFAULT_CHUNK_SIZE;
@@ -1449,6 +1543,7 @@ int main(int argc, char *argv[])
     int opt;
     while ((opt = getopt_long(argc, argv, "ht:q:p:c:C:GHm:z:k:f:so:", long_options, NULL)) != -1)
     {
+        fprintf(stderr, "DEBUG: Processing option: %c, optarg: %s\n", opt, optarg ? optarg : "(null)");
         switch (opt)
         {
         case 'h':
@@ -1482,15 +1577,17 @@ int main(int argc, char *argv[])
             min_cov = atoi(optarg);
             if (min_cov < 0)
             {
-                fprintf(stderr, "Minimum coverage must be positive\n");
+                fprintf(stderr, "Minimum coverage must be non-negative\n");
                 return 1;
             }
             break;
         case 'C':
+            fprintf(stderr, "DEBUG: Hit 'C' case with optarg: %s\n", optarg ? optarg : "(null)");
             cap_cov = atoi(optarg);
+            fprintf(stderr, "DEBUG: cap_cov = %d\n", cap_cov);
             if (cap_cov < 0)
             {
-                fprintf(stderr, "Cap coverage must be positive\n");
+                fprintf(stderr, "Cap coverage must be non-negative\n");
                 return 1;
             }
             break;
@@ -1566,6 +1663,22 @@ int main(int argc, char *argv[])
     {
         fprintf(stderr, "Failed to create output directory: %s\n", out_dir);
         return 1;
+    }
+
+    // Open debug file for monitoring buffer[41].mC changes in output directory
+    if (out_dir) {
+        char debug_path[1024];
+        snprintf(debug_path, sizeof(debug_path), "%s/debug_buffer_41.txt", out_dir);
+        debug_file = fopen(debug_path, "w");
+        if (debug_file) {
+            fprintf(debug_file, "Debug log for buffer[41].mC changes\n");
+            fprintf(debug_file, "==================================\n");
+            fprintf(debug_file, "Program started at: %s\n", __TIME__ " " __DATE__);
+            fprintf(debug_file, "Output directory: %s\n", out_dir);
+            fprintf(debug_file, "BAM file: %s\n", bam_file);
+            fprintf(debug_file, "Threads: %d\n\n", num_threads);
+            fflush(debug_file);
+        }
     }
 
     log_time("Starting processing...\n");
@@ -1840,6 +1953,12 @@ int main(int argc, char *argv[])
         free(mapping_ref_file);
 
     log_time("Processing complete. MethylExtractor has finished.\n");
-        
+
+    // Close debug file
+    if (debug_file) {
+        fprintf(debug_file, "\nDebug logging complete.\n");
+        fclose(debug_file);
+    }
+
     return 0;
 }
