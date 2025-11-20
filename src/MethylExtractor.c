@@ -16,10 +16,6 @@
 #include <time.h>
 #include "cjson/cJSON.h"
 
-// Global debug variables and file for monitoring buffer[41].mC changes
-int debug_buffer_41_changed = 0;
-int debug_buffer_41_value = 0;
-FILE *debug_file = NULL;
 
 #define DEFAULT_MAX_CHR 24
 #define DEFAULT_HDF5_COMPRESSION 6
@@ -27,9 +23,9 @@ FILE *debug_file = NULL;
 #define DEFAULT_HDF5_CHUNK_SIZE_INT 1000000
 #define DEFAULT_THREADS 16
 #define DEFAULT_CHUNK_SIZE 1000000
-#define DEFAULT_MIN_MAPQ 30
-#define DEFAULT_MIN_PHRED 20
-#define DEFAULT_MIN_COV 4
+#define DEFAULT_MIN_MAPQ 10
+#define DEFAULT_MIN_PHRED 5
+#define DEFAULT_MIN_COV 1
 #define DEFAULT_CAP_COVERAGE 1
 #define DEFAULT_FLAGS (BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY)
 #define TNC_A 0
@@ -51,6 +47,10 @@ FILE *debug_file = NULL;
 // Hash table for position-to-buffer-index mapping
 KHASH_MAP_INIT_INT64(pos, size_t)
 KHASH_SET_INIT_STR(str)
+
+// Hash table for overlapping reads
+KHASH_MAP_INIT_STR(olap_hash, bam1_t *)
+typedef khash_t(olap_hash) olap_hash_t;
 
 #define ZSTD_FILTER 32015  // Zstandard filter ID
 
@@ -109,12 +109,13 @@ typedef struct
     uint8_t *tnc_array; // New: TriNucleotideContexts[25] array
 } ThreadArg;
 
-typedef struct 
+typedef struct
 {
     samFile *in;
     hts_itr_t *iter;
     bam_hdr_t *hdr;
     ThreadArg *targ;
+    void *ohash;  // Overlap hash for handling overlapping paired-end reads
 } mplp_data_t;
 
 typedef struct 
@@ -583,20 +584,8 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records
             if (cap_cov && total > avg_cov)
             {
                 double prop = (double)buffer[i].mC / total;
-                uint16_t old_mC = buffer[i].mC;
                 buffer[i].mC = (uint16_t)round((avg_cov * prop));
                 buffer[i].uC = (uint16_t)(avg_cov - buffer[i].mC);
-                if (i == 41) {
-                    debug_buffer_41_changed = 1;
-                    debug_buffer_41_value = buffer[41].mC;
-                    if (debug_file) {
-                        fprintf(debug_file,
-                                "RECALCULATE: buffer[41].mC changed from %u to %u "
-                                "(capping: total=%d > avg_cov=%.1f, proportion=%.6f)\n",
-                                old_mC, buffer[41].mC, total, avg_cov, prop);
-                        fflush(debug_file);
-                    }
-                }
             }
             filtered_buffer[j++] = buffer[i];
         }
@@ -861,6 +850,170 @@ int getRealStrand(bam1_t *b)
     }
 }
 
+// Overlap handling functions
+void *initOlapHash() 
+{
+    return (void*) kh_init(olap_hash);
+}
+
+void destroyOlapHash(void *ohash) 
+{
+    khash_t(olap_hash) * oh = ( khash_t(olap_hash) *) ohash;
+    kh_destroy(olap_hash, oh);
+}
+
+//This is from bison - calculates the genomic positions for each base in a read
+int32_t *calculate_positions(bam1_t *read) {
+    int32_t *positions = malloc(sizeof(int32_t) * (size_t)read->core.l_qseq);
+    int i, j, offset = 0, op, op_len;
+    uint32_t *CIGAR = bam_get_cigar(read);
+    int32_t previous_position = read->core.pos;
+
+    for(i=0; i<read->core.n_cigar; i++) 
+    {
+        op = bam_cigar_op(*(CIGAR+i));
+        op_len = bam_cigar_oplen(*(CIGAR+i));
+        for(j=0; j<op_len; j++) 
+        {
+            if(op == 0 || op == 7 || op == 8) 
+            { //M, =, X
+                *(positions+offset) = previous_position++;
+                offset++;
+            } 
+            else if(op == 1 || op == 4) 
+            { //I, S, H
+                *(positions+offset) = -1;
+                offset++;
+            } 
+            else if(op == 2 || op == 3) 
+            { //D, N
+                previous_position++;
+            } 
+            else if(op == 5) 
+            { //H, which isn't in the sequence
+            } 
+            else 
+            { //P
+                fprintf(stderr, "[calculate_positions] We encountered a CIGAR operation that we're not ready to deal with in %s\n", bam_get_qname(read));
+            }
+        }
+    }
+    return positions;
+}
+
+void cust_tweak_overlap_quality(bam1_t *a, bam1_t *b) 
+{
+    int ia = 0, ib = 0;
+    int32_t na = a->core.l_qseq, nb = b->core.l_qseq;
+    int32_t *posa = calculate_positions(a);
+    int32_t *posb = calculate_positions(b);
+    uint8_t *a_qual = bam_get_qual(a), *b_qual = bam_get_qual(b);
+    uint8_t *a_seq  = bam_get_seq(a), *b_seq = bam_get_seq(b);
+
+    //If alignments are on opposite strands then exit
+    int sa = getRealStrand(a);
+    int sb = getRealStrand(b);
+    if(((sa-sb)&1) == 1) goto quit;
+
+    //Go to the first mapped position
+    while(ia<na && posa[ia]<0) ia++;
+    while(ib<nb && posb[ib]<0) ib++;
+    if(ia==na || ib==nb) goto quit;
+
+    //Go to the first overlapping position
+    if(posa[ia]<posb[ib]) 
+        while(ia<na && posa[ia]<posb[ib]) ia++;
+     else 
+        while(ib<nb && posb[ib]<posa[ia]) ib++;
+    
+    if(ia==na || ib==nb) goto quit;
+
+    //Take care of the overlap
+    while(ia<na && ib<nb) 
+    {
+        if(posa[ia] < posb[ib] || posa[ia] < 0) 
+        {
+            ia++;
+            continue;
+        }
+        if(posb[ib] < posa[ia] || posb[ib] < 0) 
+        {
+            ib++;
+            continue;
+        }
+        if(bam_seqi(a_seq, ia) != bam_seqi(b_seq, ib)) 
+        {
+            if(a_qual[ia]>b_qual[ib] && bam_seqi(a_seq,ia) != 15) 
+            {
+                a_qual[ia] -= b_qual[ib];
+                b_qual[ib] = 0;
+            } else if(b_qual[ib]>a_qual[ia] && bam_seqi(b_seq,ib) != 15) 
+            {
+                b_qual[ib] -= a_qual[ia];
+                a_qual[ia] = 0;
+            } else 
+            {
+                a_qual[ia] = 0;
+                b_qual[ib] = 0;
+            }
+        } 
+        else 
+        {
+            if(a_qual[ia]>b_qual[ib]) 
+            {
+                a_qual[ia] += 0.2*a_qual[ia];
+                b_qual[ib] = 0;
+            } 
+            else 
+            {
+                b_qual[ib] += 0.2*b_qual[ib];
+                a_qual[ia] = 0;
+            }
+        }
+        a_qual[ia] = (a_qual[ia]<=255) ? a_qual[ia] : 255;
+        b_qual[ib] = (b_qual[ib]<=255) ? b_qual[ib] : 255;
+        ia++;
+        ib++;
+    }
+
+quit :
+    free(posa);
+    free(posb);
+}
+
+int custom_overlap_constructor(void *data, const bam1_t *b, bam_pileup_cd *cd) 
+{
+    int ret;
+    mplp_data_t *foo = (mplp_data_t*) data;
+    khash_t(olap_hash) * ohash = ( khash_t(olap_hash) *)foo->ohash;
+    khiter_t k = kh_get(olap_hash, ohash, bam_get_qname(b));
+    bam1_t *a;
+    // Skip unpaired reads
+    if(!(b->core.flag & BAM_FPAIRED) || ((b->core.flag & 12) > 0)) return 0;
+
+    if (k==kh_end(ohash)) 
+    {
+        k = kh_put(olap_hash, ohash, bam_get_qname(b), &ret);
+        kh_value(ohash, k) = (bam1_t*)b;
+    } 
+    else 
+    {
+        a = kh_value(ohash, k);
+        cust_tweak_overlap_quality(a, (bam1_t*)b);
+        kh_del(olap_hash, ohash, k);
+    }
+    return 0;
+
+}
+
+int custom_overlap_destructor(void *data, const bam1_t *b, bam_pileup_cd *cd) {
+    mplp_data_t *foo = (mplp_data_t*) data;
+    khash_t(olap_hash) * ohash = ( khash_t(olap_hash) *)foo->ohash;
+    khiter_t k = kh_get(olap_hash, ohash, bam_get_qname(b));
+    if (k!=kh_end(ohash)) kh_del(olap_hash, ohash, k);
+    return 0;
+}
+
 static int mplp_fetch(void *data, bam1_t *b) 
 {
     int rv;
@@ -868,27 +1021,33 @@ static int mplp_fetch(void *data, bam1_t *b)
     uint8_t *p;
 
     // Debug: Check for NULL pointers
-    if (!ldata) {
+    if (!ldata) 
+    {
         //fprintf(stderr, "[DEBUG] mplp_fetch: ldata is NULL!\n");
         return -1;
     }
-    if (!ldata->in) {
+    if (!ldata->in) 
+    {
         //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->in is NULL!\n");
         return -1;
     }
-    if (!ldata->hdr) {
+    if (!ldata->hdr) 
+    {
         //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->hdr is NULL!\n");
         return -1;
     }
-    if (!b) {
+    if (!b) 
+    {
         //fprintf(stderr, "[DEBUG] mplp_fetch: bam1_t *b is NULL!\n");
         return -1;
     }
-    if (ldata->iter == NULL) {
+    if (ldata->iter == NULL) 
+    {
         //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->iter is NULL (using sam_read1 fallback)\n");
         return -1;
     }
-    if (ldata->targ == NULL) {
+    if (ldata->targ == NULL) 
+    {
         //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->targ is NULL!\n");
         return -1;
     }
@@ -898,23 +1057,28 @@ static int mplp_fetch(void *data, bam1_t *b)
     {
         rv = ldata->iter ? sam_itr_next(ldata->in, ldata->iter, b) : sam_read1(ldata->in, ldata->hdr, b);
 
-        if (rv < 0) {
+        if (rv < 0) 
+        {
             //fprintf(stderr, "[DEBUG] mplp_fetch: sam_itr_next/sam_read1 returned %d (EOF or error)\n", rv);
             return rv;
         }
-        if (b->core.tid == -1 || b->core.flag & BAM_FUNMAP) {
+        if (b->core.tid == -1 || b->core.flag & BAM_FUNMAP) 
+        {
             //fprintf(stderr, "[DEBUG] mplp_fetch: skipping unmapped read (tid == -1 or BAM_FUNMAP)\n");
             continue; // Unmapped
         }
-        if (b->core.qual < ldata->targ->min_mapq) {
+        if (b->core.qual < ldata->targ->min_mapq) 
+        {
             //fprintf(stderr, "[DEBUG] mplp_fetch: skipping read with low mapping quality (%d < %d)\n", b->core.qual, ldata->targ->min_mapq);
             continue; //-q
         }
-        if (b->core.flag & (BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY)) {
+        if (b->core.flag & (BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY)) 
+        {
             //fprintf(stderr, "[DEBUG] mplp_fetch: skipping read with flag 0xF00 (secondary, QC fail, duplicate, supplementary)\n");
             continue; // By default: secondary alignments, QC failed, PCR duplicates, and supplemental alignments
         }
-        if (b->core.flag & BAM_FDUP) {
+        if (b->core.flag & BAM_FDUP) 
+        {
             //fprintf(stderr, "[DEBUG] mplp_fetch: skipping duplicate read (BAM_FDUP)\n");
             continue;
         }
@@ -970,8 +1134,12 @@ void *process_chromosome_region(void *arg)
     mplp_data->in = in;
     mplp_data->iter = iter;
     mplp_data->hdr = header;
+    mplp_data->ohash = initOlapHash();
 
     bam_mplp_t mplp = bam_mplp_init(1, mplp_fetch, (void **)&mplp_data);
+    bam_mplp_set_maxcnt(mplp, INT_MAX);
+    bam_mplp_constructor(mplp, custom_overlap_constructor);
+    bam_mplp_destructor(mplp, custom_overlap_destructor);
 
     bam1_t *b = bam_init1();
     int tid, n_plp;
@@ -996,11 +1164,6 @@ void *process_chromosome_region(void *arg)
 
         size_t idx = kh_val(targ->pos_map, iter_kh);
 
-        // Debug: Log when we process buffer[41]
-        if (idx == 41 && debug_file) {
-            fprintf(debug_file, "DEBUG: Processing buffer[41] at genomic position %lu\n", pos);
-            fflush(debug_file);
-        }
 
         for (int i = 0; i < n_plp; i++)
         {
@@ -1034,77 +1197,47 @@ void *process_chromosome_region(void *arg)
 
             int base = bam_seqi(seq, seq_idx);
 
+            // Per-read filtering: skip reads that don't match expected bisulfite pattern
+            if (strand == 1 || strand == 3)  // OT/CTOT
+            {
+                if (ref_base != 'C' && ref_base != 'c')
+                    continue;  // Skip reads where reference is not C on OT/CTOT strand
+            }
+            else if (strand == 2 || strand == 4)  // OB/CTOB
+            {
+                if (ref_base != 'G' && ref_base != 'g')
+                    continue;  // Skip reads where reference is not G on OB/CTOB strand
+            }
+
             pthread_mutex_lock(targ->buffer_mutex);
 
-            // Now, apply MethylDackel's logic:
-            // CpG
+            // Now, apply methylation calling only for reads that passed the filter
             if ((ref_base == 'C') && (strand == 1 || strand == 3))
             {
-                if (base == 2) // G
+                if (base == 2) // C methylated
                 {
                     targ->buffer[idx].mC++;
-                    if (idx == 41) 
-                    {
-                        debug_buffer_41_changed = 1;
-                        debug_buffer_41_value = targ->buffer[41].mC;
-                        if (debug_file) 
-                        {
-                            fprintf(debug_file,
-                                    "INCREMENT: buffer[41].mC -> %u "
-                                    "(read_qual=%d, read_flag=0x%x, base_qual=%d, "
-                                    "base=%d, ref_base=%c, strand=%d, "
-                                    "condition: ref_base=='C' && (strand==1||strand==3) && base==2 [G])\n",
-                                    targ->buffer[41].mC,
-                                    read_qual,
-                                    read_flag,
-                                    base_qual,
-                                    base,
-                                    ref_base,
-                                    strand
-                            );
-                            fflush(debug_file);
-                        }
-                    }
                 }
-                else if (base == 8) // T
+                else if (base == 8) // T unmethylated
                     targ->buffer[idx].uC++;
             }
             else if ((ref_base == 'G') && (strand == 2 || strand == 4))
             {
-                if (base == 4) // C
+                if (base == 4) // G methylated
                 {
                     targ->buffer[idx].mC++;
-                    if (idx == 41) 
-                    {
-                        debug_buffer_41_changed = 1;
-                        debug_buffer_41_value = targ->buffer[41].mC;
-                        if (debug_file) 
-                        {
-                            fprintf(debug_file,
-                                    "INCREMENT: buffer[41].mC -> %u "
-                                    "(read_qual=%d, read_flag=0x%x, base_qual=%d, "
-                                    "base=%d, ref_base=%c, strand=%d, "
-                                    "condition: ref_base=='G' && (strand==2||strand==4) && base==4 [C])\n",
-                                    targ->buffer[41].mC,
-                                    read_qual,
-                                    read_flag,
-                                    base_qual,
-                                    base,
-                                    ref_base,
-                                    strand
-                            );
-                            fflush(debug_file);
-                        }
-                    }
                 }
-                else if (base == 1) // A
+                else if (base == 1) // A unmethylated
                     targ->buffer[idx].uC++;
             }
             // Otherwise, ignore
+
             pthread_mutex_unlock(targ->buffer_mutex);
         }
     }
     bam_destroy1(b);
+    destroyOlapHash(mplp_data->ohash);
+    free(mplp_data);
     hts_itr_destroy(iter);
     hts_idx_destroy(idx);
     sam_hdr_destroy(header);
@@ -1269,7 +1402,7 @@ void process_chromosome(ThreadArg *targ)
                 active_threads--;
             }
         
-        int max_region_threads = 8;
+        int max_region_threads = DEFAULT_THREADS;
         while (active_threads >= max_region_threads)
             for (int j = 0; j <= i; j++)
                 if (!joined[j] && pthread_join(threads[j], NULL) == 0)
@@ -1665,21 +1798,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Open debug file for monitoring buffer[41].mC changes in output directory
-    if (out_dir) {
-        char debug_path[1024];
-        snprintf(debug_path, sizeof(debug_path), "%s/debug_buffer_41.txt", out_dir);
-        debug_file = fopen(debug_path, "w");
-        if (debug_file) {
-            fprintf(debug_file, "Debug log for buffer[41].mC changes\n");
-            fprintf(debug_file, "==================================\n");
-            fprintf(debug_file, "Program started at: %s\n", __TIME__ " " __DATE__);
-            fprintf(debug_file, "Output directory: %s\n", out_dir);
-            fprintf(debug_file, "BAM file: %s\n", bam_file);
-            fprintf(debug_file, "Threads: %d\n\n", num_threads);
-            fflush(debug_file);
-        }
-    }
 
     log_time("Starting processing...\n");
 
@@ -1953,12 +2071,6 @@ int main(int argc, char *argv[])
         free(mapping_ref_file);
 
     log_time("Processing complete. MethylExtractor has finished.\n");
-
-    // Close debug file
-    if (debug_file) {
-        fprintf(debug_file, "\nDebug logging complete.\n");
-        fclose(debug_file);
-    }
 
     return 0;
 }
