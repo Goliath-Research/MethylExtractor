@@ -1676,7 +1676,6 @@ int main(int argc, char *argv[])
     int opt;
     while ((opt = getopt_long(argc, argv, "ht:q:p:c:C:GHm:z:k:f:so:", long_options, NULL)) != -1)
     {
-        fprintf(stderr, "DEBUG: Processing option: %c, optarg: %s\n", opt, optarg ? optarg : "(null)");
         switch (opt)
         {
         case 'h':
@@ -1715,9 +1714,7 @@ int main(int argc, char *argv[])
             }
             break;
         case 'C':
-            fprintf(stderr, "DEBUG: Hit 'C' case with optarg: %s\n", optarg ? optarg : "(null)");
             cap_cov = atoi(optarg);
-            fprintf(stderr, "DEBUG: cap_cov = %d\n", cap_cov);
             if (cap_cov < 0)
             {
                 fprintf(stderr, "Cap coverage must be non-negative\n");
