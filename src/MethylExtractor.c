@@ -4,7 +4,6 @@
 #include <math.h>
 #include <htslib/sam.h>
 #include <htslib/faidx.h>
-#include <htslib/khash.h>
 #include <unistd.h>
 #include <getopt.h>
 #include <sys/stat.h>
@@ -15,47 +14,32 @@
 #include <sys/sysinfo.h>
 #include <time.h>
 #include "cjson/cJSON.h"
-
+#include <htslib/hts_defs.h> // provides bam_cigar_op() and bam_cigar_oplen()
 
 #define DEFAULT_MAX_CHR 24
 #define DEFAULT_HDF5_COMPRESSION 6
 #define DEFAULT_HDF5_CHUNK_SIZE 1000000
-#define DEFAULT_HDF5_CHUNK_SIZE_INT 1000000
 #define DEFAULT_THREADS 16
 #define DEFAULT_CHUNK_SIZE 1000000
-#define DEFAULT_MIN_MAPQ 10
-#define DEFAULT_MIN_PHRED 5
-#define DEFAULT_MIN_COV 1
+#define DEFAULT_MIN_MAPQ 30
+#define DEFAULT_MIN_PHRED 20
+#define DEFAULT_MIN_COV 4
 #define DEFAULT_CAP_COVERAGE 1
 #define DEFAULT_FLAGS (BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY)
+
 #define TNC_A 0
 #define TNC_C 1
 #define TNC_G 2
 #define TNC_T 3
 #define TNC_N 4
+
 #define CONTEXT_CPG 1
 #define CONTEXT_CHG 2
 #define CONTEXT_CHH 3
-#define STRAND_MASK 0x80
-#define CONTEXT_MASK 0x03
-#define MAX_CHR_NAME 2
-#define MAX_REGIONS_PER_CHR 8
-#define TNC_MASK 0x1F
-#define STRAND_BITS_MASK 0x60
-#define SIGN_MASK 0x80
 
-// Hash table for position-to-buffer-index mapping
-KHASH_MAP_INIT_INT64(pos, size_t)
-KHASH_SET_INIT_STR(str)
+#define ZSTD_FILTER 32015
 
-// Hash table for overlapping reads
-KHASH_MAP_INIT_STR(olap_hash, bam1_t *)
-typedef khash_t(olap_hash) olap_hash_t;
-
-#define ZSTD_FILTER 32015  // Zstandard filter ID
-
-// Output format types
-typedef enum 
+typedef enum
 {
     OUTPUT_NONE = 0,
     OUTPUT_HDF5 = 1,
@@ -63,12 +47,11 @@ typedef enum
     OUTPUT_BOTH = 3
 } OutputFormat;
 
-
-typedef struct 
+typedef struct
 {
-    unsigned tnc     : 5;
+    unsigned tnc : 5;
     unsigned context : 2;
-    unsigned strand  : 1;
+    unsigned strand : 1;
 } tnc_bitfield_t;
 
 typedef struct
@@ -76,9 +59,17 @@ typedef struct
     uint32_t pos;
     uint16_t mC;
     uint16_t uC;
-    tnc_bitfield_t tnc; // Now stores strand + context + TNC as bitfield
-    uint8_t _pad[1]; // explicit padding for alignment
+    tnc_bitfield_t tnc;
+    uint8_t _pad[1];
 } MethylRecord;
+
+// Private per-thread counters (dense genomic arrays)
+typedef struct
+{
+    uint32_t *mC;
+    uint32_t *uC;
+    size_t size;
+} PrivateCounts;
 
 typedef struct
 {
@@ -99,26 +90,20 @@ typedef struct
     uint32_t chunk_size;
     uint32_t start_pos;
     uint32_t end_pos;
-    MethylRecord *buffer;
-    size_t buffer_offset;
-    size_t buffer_size;
-    pthread_mutex_t *buffer_mutex;
-    OutputFormat output_format;  // New: replaces debug_output
+    OutputFormat output_format;
     int split_context_files;
-    khash_t(pos) * pos_map;
-    uint8_t *tnc_array; // New: TriNucleotideContexts[25] array
 } ThreadArg;
 
+// Extended for private counting
 typedef struct
 {
-    samFile *in;
-    hts_itr_t *iter;
-    bam_hdr_t *hdr;
-    ThreadArg *targ;
-    void *ohash;  // Overlap hash for handling overlapping paired-end reads
-} mplp_data_t;
+    ThreadArg base;
+    PrivateCounts counts;
+    size_t start_site_idx;
+    size_t end_site_idx;
+} RegionArg;
 
-typedef struct 
+typedef struct
 {
     char fasta[64];
     char bam[64];
@@ -126,7 +111,7 @@ typedef struct
     int extract;
 } ChromMapEntry;
 
-static void log_time(const char *format, ...) 
+static void log_time(const char *format, ...)
 {
     time_t rawtime;
     struct tm *timeinfo;
@@ -134,7 +119,6 @@ static void log_time(const char *format, ...)
     time(&rawtime);
     timeinfo = localtime(&rawtime);
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
-    
     va_list args;
     va_start(args, format);
     fprintf(stderr, "[%s] ", time_str);
@@ -147,21 +131,14 @@ int make_directory(const char *path)
     struct stat st = {0};
     if (stat(path, &st) == -1)
     {
-        // Create parent directories recursively
         char *parent = strdup(path);
         char *slash = strrchr(parent, '/');
         if (slash && slash != parent)
         {
             *slash = '\0';
-            if (make_directory(parent) != 0)
-            {
-                free(parent);
-                return -1;
-            }
+            make_directory(parent);
         }
         free(parent);
-
-        // Create the directory
         return mkdir(path, 0700);
     }
     return 0;
@@ -203,10 +180,9 @@ static inline char decode_nucleotide(uint8_t n)
 
 static inline void decode_trinucleotide(uint8_t tnc, char *trinucl)
 {
-    // Decode MethylDackel-style TNC index (0-24) to first and second bases (middle base not stored)
-    uint8_t n2 = (tnc / 5) % 4; // Middle base index
-    uint8_t n3 = tnc % 5;       // Last base index
-    trinucl[0] = 'C';           // Central base is always C in MethylDackel naming
+    uint8_t n2 = (tnc / 5) % 4;
+    uint8_t n3 = tnc % 5;
+    trinucl[0] = 'C';
     trinucl[1] = decode_nucleotide(n2);
     trinucl[2] = decode_nucleotide(n3);
     trinucl[3] = '\0';
@@ -225,22 +201,20 @@ static inline const char *get_context_string(int context)
 
 static inline uint8_t encode_trinucleotide_context(const char *chr_seq, int pos, int chr_len, char strand)
 {
-    // MethylDackel-style: encode based on surrounding bases considering strand direction
     int direction = (strand == '+') ? 1 : -1;
     uint8_t rv = 0;
     char base;
 
-    // Last base: column
     if ((direction > 0 && pos + 2 >= chr_len) || (direction < 0 && pos <= 1))
         rv = 4;
     else
     {
         base = chr_seq[pos + 2 * direction];
         if (direction < 0)
-            base = (base == 'A') ? 'T'  : (base == 'T') ? 'A'
-                                        : (base == 'C') ? 'G'
-                                        : (base == 'G') ? 'C'
-                                        : 'N';
+            base = (base == 'A') ? 'T' : (base == 'T') ? 'A'
+                                     : (base == 'C')   ? 'G'
+                                     : (base == 'G')   ? 'C'
+                                                       : 'N';
         switch (toupper(base))
         {
         case 'A':
@@ -261,17 +235,16 @@ static inline uint8_t encode_trinucleotide_context(const char *chr_seq, int pos,
         }
     }
 
-    // Middle base
     if ((direction > 0 && pos + 1 >= chr_len) || (direction < 0 && pos == 0))
         rv += 20;
     else
     {
         base = chr_seq[pos + direction];
         if (direction < 0)
-            base = (base == 'A') ? 'T'  : (base == 'T') ? 'A'
-                                        : (base == 'C') ? 'G'
-                                        : (base == 'G') ? 'C'
-                                        : 'N';
+            base = (base == 'A') ? 'T' : (base == 'T') ? 'A'
+                                     : (base == 'C')   ? 'G'
+                                     : (base == 'G')   ? 'C'
+                                                       : 'N';
         switch (toupper(base))
         {
         case 'A':
@@ -291,67 +264,36 @@ static inline uint8_t encode_trinucleotide_context(const char *chr_seq, int pos,
             break;
         }
     }
-    return rv; // 0-24
-}
-
-static inline int8_t encode_strand_context(char strand, int context)
-{
-    return strand == '-' ? -context : context;
+    return rv;
 }
 
 static inline int isCpG(const char *seq, int pos, int seqlen)
 {
     if (pos >= seqlen)
         return 0;
-    if (toupper(*(seq + pos)) == 'C')
-    {
-        if (pos + 1 == seqlen)
-            return 0;
-        if (toupper(*(seq + pos + 1)) == 'G')
-            return 1;
-        return 0;
-    }
-    else if (toupper(*(seq + pos)) == 'G')
-    {
-        if (pos == 0)
-            return 0;
-        if (toupper(*(seq + pos - 1)) == 'C')
-            return -1;
-        return 0;
-    }
+    if (toupper(seq[pos]) == 'C' && pos + 1 < seqlen && toupper(seq[pos + 1]) == 'G')
+        return 1;
+    if (toupper(seq[pos]) == 'G' && pos > 0 && toupper(seq[pos - 1]) == 'C')
+        return -1;
     return 0;
 }
 
 static inline int isCHG(const char *seq, int pos, int seqlen)
 {
-    if (pos >= seqlen)
+    if (pos + 2 >= seqlen)
         return 0;
-    if (toupper(*(seq + pos)) == 'C')
-    {
-        if (pos + 2 >= seqlen)
-            return 0;
-        if (toupper(*(seq + pos + 2)) == 'G')
-            return 1;
-        return 0;
-    }
-    else if (toupper(*(seq + pos)) == 'G')
-    {
-        if (pos <= 1)
-            return 0;
-        if (toupper(*(seq + pos - 2)) == 'C')
-            return -1;
-        return 0;
-    }
+    if (toupper(seq[pos]) == 'C' && toupper(seq[pos + 2]) == 'G')
+        return 1;
+    if (pos >= 2 && toupper(seq[pos]) == 'G' && toupper(seq[pos - 2]) == 'C')
+        return -1;
     return 0;
 }
 
 static inline int isCHH(const char *seq, int pos, int seqlen)
 {
-    if (pos >= seqlen)
-        return 0;
-    if (toupper(*(seq + pos)) == 'C')
+    if (toupper(seq[pos]) == 'C')
         return 1;
-    else if (toupper(*(seq + pos)) == 'G')
+    if (toupper(seq[pos]) == 'G')
         return -1;
     return 0;
 }
@@ -361,21 +303,17 @@ int get_context(const char *chr_seq, int chr_len, int pos, int8_t *strand_ctx, u
     int context = 0;
     if (isCpG(chr_seq, pos, chr_len))
         context = CONTEXT_CPG;
-    else if (isCHG(chr_seq, pos, chr_len))
+    else if (keep_chg && isCHG(chr_seq, pos, chr_len))
         context = CONTEXT_CHG;
-    else if (isCHH(chr_seq, pos, chr_len))
+    else if (keep_chh && isCHH(chr_seq, pos, chr_len))
         context = CONTEXT_CHH;
+    else
+        return 0;
 
     char c2 = toupper(chr_seq[pos]);
     char strand = (c2 == 'C') ? '+' : '-';
     *tnc = encode_trinucleotide_context(chr_seq, pos, chr_len, strand);
-    if (c2 == 'C')
-        *strand_ctx = encode_strand_context('+', context);
-    else if (c2 == 'G')
-        *strand_ctx = encode_strand_context('-', context);
-    else
-        *strand_ctx = 0;
-
+    *strand_ctx = (strand == '+') ? context : -context;
     return context;
 }
 
@@ -383,10 +321,12 @@ size_t count_methylation_sites(const char *chr_seq, uint32_t chr_len, int keep_c
 {
     size_t count = 0;
     for (uint32_t pos = 0; pos < chr_len; pos++)
-        if (isCpG((char *)chr_seq, pos, chr_len) ||
-            (keep_chg && isCHG((char *)chr_seq, pos, chr_len)) ||
-            (keep_chh && isCHH((char *)chr_seq, pos, chr_len)))
+    {
+        if (isCpG(chr_seq, pos, chr_len) ||
+            (keep_chg && isCHG(chr_seq, pos, chr_len)) ||
+            (keep_chh && isCHH(chr_seq, pos, chr_len)))
             count++;
+    }
     return count;
 }
 
@@ -400,143 +340,153 @@ void initialize_buffer(MethylRecord *buffer, size_t site_count, const char *chr_
         int ctx = get_context(chr_seq, chr_len, pos, &strand_ctx, &tnc_val, keep_chg, keep_chh);
         if (ctx)
         {
-            char strand = (strand_ctx > 0) ? '+' : '-';
             buffer[idx].pos = pos + 1;
-            buffer[idx].mC = 0;
-            buffer[idx].uC = 0;
+            buffer[idx].mC = buffer[idx].uC = 0;
             buffer[idx].tnc.tnc = tnc_val;
             buffer[idx].tnc.context = ctx;
-            buffer[idx].tnc.strand = (strand == '+') ? 0 : 1;
+            buffer[idx].tnc.strand = (strand_ctx > 0) ? 0 : 1;
             idx++;
         }
     }
 }
 
-size_t find_buffer_index(MethylRecord *buffer, size_t offset, size_t size, uint32_t pos)
+int getRealStrand(bam1_t *b)
 {
-    size_t left = offset, right = offset + size - 1;
-    while (left <= right)
+    char *XG = (char *)bam_aux_get(b, "XG");
+    if (XG && (XG[1] == 'C' || XG[1] == 'G'))
     {
-        size_t mid = left + (right - left) / 2;
-        if (buffer[mid].pos == pos + 1)
-            return mid;
-        if (buffer[mid].pos < pos + 1)
-            left = mid + 1;
+        if (XG[1] == 'C')
+        {
+            if (b->core.flag & BAM_FREVERSE)
+                return (b->core.flag & BAM_FREAD1) ? 1 : 3;
+            return (b->core.flag & BAM_FREAD1) ? 3 : 1;
+        }
         else
-            right = mid - 1;
+        {
+            if (b->core.flag & BAM_FREVERSE)
+                return (b->core.flag & BAM_FREAD1) ? 4 : 2;
+            return (b->core.flag & BAM_FREAD1) ? 2 : 4;
+        }
     }
-    return -1;
+    if (b->core.flag & BAM_FPAIRED)
+    {
+        if ((b->core.flag & (BAM_FREAD1 | BAM_FREVERSE)) == (BAM_FREAD1 | BAM_FREVERSE))
+            return 2;
+        else if (b->core.flag & BAM_FREAD1)
+            return 1;
+        else if ((b->core.flag & (BAM_FREAD2 | BAM_FREVERSE)) == (BAM_FREAD2 | BAM_FREVERSE))
+            return 1;
+        else
+            return 2;
+    }
+    return (b->core.flag & BAM_FREVERSE) ? 2 : 1;
 }
 
-// Structure to hold statistics
-typedef struct {
+typedef struct
+{
     size_t num_positions;
-    uint64_t total_methylated;
-    uint64_t total_unmethylated;
-    double avg_methylation_level;
-    double avg_coverage;
+    uint64_t total_methylated, total_unmethylated;
+    double avg_methylation_level, avg_coverage;
 } MethylStats;
 
-// Function to calculate statistics from filtered buffer
 static MethylStats calculate_statistics(MethylRecord *filtered_buffer, size_t n_records)
 {
     MethylStats stats = {0, 0, 0, 0.0, 0.0};
-    
+
     if (n_records == 0)
         return stats;
-    
+
     stats.num_positions = n_records;
-    
+
     // Use uint64_t to avoid overflow for large datasets
     uint64_t total_mC = 0;
     uint64_t total_uC = 0;
-    
-    for (size_t i = 0; i < n_records; i++) 
+
+    for (size_t i = 0; i < n_records; i++)
     {
         total_mC += filtered_buffer[i].mC;
         total_uC += filtered_buffer[i].uC;
     }
-    
+
     stats.total_methylated = total_mC;
     stats.total_unmethylated = total_uC;
-    
+
     uint64_t total_coverage = total_mC + total_uC;
-    
-    if (total_coverage > 0) 
+
+    if (total_coverage > 0)
     {
         stats.avg_methylation_level = (double)total_mC / (double)total_coverage;
         stats.avg_coverage = (double)total_coverage / (double)n_records;
     }
-    
+
     return stats;
 }
 
-// Function to write statistics JSON file
 static int write_statistics_json(const char *base_filename, MethylStats stats)
 {
     char json_filename[1024];
-    
+
     // Create JSON filename by replacing the extension with .json
     const char *dot = strrchr(base_filename, '.');
-    if (dot && (strcmp(dot, ".txt") == 0 || strcmp(dot, ".h5") == 0)) 
+    if (dot && (strcmp(dot, ".txt") == 0 || strcmp(dot, ".h5") == 0))
     {
         size_t base_len = dot - base_filename;
         strncpy(json_filename, base_filename, base_len);
         json_filename[base_len] = '\0';
         strcat(json_filename, ".json");
-    } 
-    else 
+    }
+    else
         snprintf(json_filename, sizeof(json_filename), "%s.json", base_filename);
-    
+
     // Create JSON object
     cJSON *root = cJSON_CreateObject();
-    if (!root) 
+    if (!root)
     {
         fprintf(stderr, "Failed to create JSON root object\n");
         return -1;
     }
-    
+
     // Add statistics to JSON
     cJSON_AddNumberToObject(root, "num_positions", (double)stats.num_positions);
     cJSON_AddNumberToObject(root, "total_methylated", (double)stats.total_methylated);
     cJSON_AddNumberToObject(root, "total_unmethylated", (double)stats.total_unmethylated);
     cJSON_AddNumberToObject(root, "avg_methylation_level", stats.avg_methylation_level);
     cJSON_AddNumberToObject(root, "avg_coverage", stats.avg_coverage);
-    
+
     // Write JSON to file
     char *json_string = cJSON_Print(root);
-    if (!json_string) 
+    if (!json_string)
     {
         fprintf(stderr, "Failed to print JSON\n");
         cJSON_Delete(root);
         return -1;
     }
-    
+
     FILE *json_fp = fopen(json_filename, "w");
-    if (!json_fp) 
+    if (!json_fp)
     {
         fprintf(stderr, "Failed to open JSON file for writing: %s\n", json_filename);
         free(json_string);
         cJSON_Delete(root);
         return -1;
     }
-    
+
     fprintf(json_fp, "%s\n", json_string);
     fclose(json_fp);
-    
+
     log_time("Wrote statistics to: %s\n", json_filename);
-    
+
     // Cleanup
     free(json_string);
     cJSON_Delete(root);
-    
+
     return 0;
 }
 
 size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records,
-                   int compression, int chunk_size, int append_mode,
-                   int min_cov, int cap_cov,
-                   OutputFormat output_format)
+                    int compression, int chunk_size, int append_mode,
+                    int min_cov, int cap_cov,
+                    OutputFormat output_format)
 {
     size_t records_written = 0;
     hsize_t dims[1] = {0};
@@ -587,8 +537,8 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records
                 buffer[i].mC = (uint16_t)round((avg_cov * prop));
                 buffer[i].uC = (uint16_t)(avg_cov - buffer[i].mC);
             }
-            filtered_buffer[j++] = buffer[i];
         }
+        filtered_buffer[j++] = buffer[i];
     }
 
     // Handle TXT output
@@ -663,9 +613,7 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records
         H5Tinsert(type, "uC", HOFFSET(MethylRecord, uC), H5T_NATIVE_UINT16);
         H5Tinsert(type, "tnc", HOFFSET(MethylRecord, tnc), H5T_NATIVE_UINT8);
 
-        file = append_mode ? 
-            H5Fopen(filename, H5F_ACC_RDWR, H5P_DEFAULT) : 
-            H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+        file = append_mode ? H5Fopen(filename, H5F_ACC_RDWR, H5P_DEFAULT) : H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
         if (file < 0)
         {
             fprintf(stderr, "Failed to %s HDF5 file: %s\n", append_mode ? "open" : "create", filename);
@@ -697,10 +645,10 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records
         // Set Zstandard compression
         unsigned int cd_values[1] = {compression};
         status = H5Pset_filter(dcpl, ZSTD_FILTER, H5Z_FLAG_OPTIONAL, 1, cd_values);
-        if (status < 0) 
+        if (status < 0)
         {
             fprintf(stderr, "Failed to set Zstandard filter\n");
-            goto cleanup;    
+            goto cleanup;
         }
 
         mem_type = H5Tcopy(type);
@@ -789,458 +737,113 @@ cleanup:
     return records_written;
 }
 
-int getRealStrand(bam1_t *b)
+static void *process_region_direct(void *arg)
 {
-    char *XG = (char *)bam_aux_get(b, "XG");
-    if (XG != NULL && *(XG + 1) != 'C' && *(XG + 1) != 'G')
-        XG = NULL;
-    if (XG == NULL)
-    {
-        if (b->core.flag & BAM_FPAIRED)
-        {
-            if ((b->core.flag & (BAM_FREAD1 | BAM_FREVERSE)) == (BAM_FREAD1 | BAM_FREVERSE))
-                return 2;
-            else if (b->core.flag & BAM_FREAD1)
-                return 1;
-            else if ((b->core.flag & (BAM_FREAD2 | BAM_FREVERSE)) == (BAM_FREAD2 | BAM_FREVERSE))
-                return 1;
-            else if (b->core.flag & BAM_FREAD2)
-                return 2;
-            return 0;
-        }
-        else
-        {
-            if (b->core.flag & BAM_FREVERSE)
-                return 2;
-            return 1;
-        }
-    }
-    else
-    {
-        if (*(XG + 1) == 'C')
-        {
-            if ((b->core.flag & (BAM_FREAD1 | BAM_FREVERSE)) == (BAM_FREAD1 | BAM_FREVERSE))
-                return 1;
-            else if ((b->core.flag & BAM_FREAD1) == BAM_FREAD1)
-                return 3;
-            else if ((b->core.flag & (BAM_FREAD2 | BAM_FREVERSE)) == (BAM_FREAD2 | BAM_FREVERSE))
-                return 3;
-            else if ((b->core.flag & BAM_FREAD2) == BAM_FREAD2)
-                return 1;
-            else if (b->core.flag & BAM_FREVERSE)
-                return 3;
-            else
-                return 1;
-        }
-        else
-        {
-            if ((b->core.flag & (BAM_FREAD1 | BAM_FREVERSE)) == (BAM_FREAD1 | BAM_FREVERSE))
-                return 4;
-            else if ((b->core.flag & BAM_FREAD1) == BAM_FREAD1)
-                return 2;
-            else if ((b->core.flag & (BAM_FREAD2 | BAM_FREVERSE)) == (BAM_FREAD2 | BAM_FREVERSE))
-                return 2;
-            else if ((b->core.flag & BAM_FREAD2) == BAM_FREAD2)
-                return 4;
-            else if (b->core.flag & BAM_FREVERSE)
-                return 2;
-            else
-                return 4;
-        }
-    }
-}
+    RegionArg *r = (RegionArg *)arg;
+    ThreadArg *t = &r->base;
 
-// Overlap handling functions
-void *initOlapHash() 
-{
-    return (void*) kh_init(olap_hash);
-}
-
-void destroyOlapHash(void *ohash) 
-{
-    khash_t(olap_hash) * oh = ( khash_t(olap_hash) *) ohash;
-    kh_destroy(olap_hash, oh);
-}
-
-//This is from bison - calculates the genomic positions for each base in a read
-int32_t *calculate_positions(bam1_t *read) {
-    int32_t *positions = malloc(sizeof(int32_t) * (size_t)read->core.l_qseq);
-    int i, j, offset = 0, op, op_len;
-    uint32_t *CIGAR = bam_get_cigar(read);
-    int32_t previous_position = read->core.pos;
-
-    for(i=0; i<read->core.n_cigar; i++) 
-    {
-        op = bam_cigar_op(*(CIGAR+i));
-        op_len = bam_cigar_oplen(*(CIGAR+i));
-        for(j=0; j<op_len; j++) 
-        {
-            if(op == 0 || op == 7 || op == 8) 
-            { //M, =, X
-                *(positions+offset) = previous_position++;
-                offset++;
-            } 
-            else if(op == 1 || op == 4) 
-            { //I, S, H
-                *(positions+offset) = -1;
-                offset++;
-            } 
-            else if(op == 2 || op == 3) 
-            { //D, N
-                previous_position++;
-            } 
-            else if(op == 5) 
-            { //H, which isn't in the sequence
-            } 
-            else 
-            { //P
-                fprintf(stderr, "[calculate_positions] We encountered a CIGAR operation that we're not ready to deal with in %s\n", bam_get_qname(read));
-            }
-        }
-    }
-    return positions;
-}
-
-void cust_tweak_overlap_quality(bam1_t *a, bam1_t *b) 
-{
-    int ia = 0, ib = 0;
-    int32_t na = a->core.l_qseq, nb = b->core.l_qseq;
-    int32_t *posa = calculate_positions(a);
-    int32_t *posb = calculate_positions(b);
-    uint8_t *a_qual = bam_get_qual(a), *b_qual = bam_get_qual(b);
-    uint8_t *a_seq  = bam_get_seq(a), *b_seq = bam_get_seq(b);
-
-    //If alignments are on opposite strands then exit
-    int sa = getRealStrand(a);
-    int sb = getRealStrand(b);
-    if(((sa-sb)&1) == 1) goto quit;
-
-    //Go to the first mapped position
-    while(ia<na && posa[ia]<0) ia++;
-    while(ib<nb && posb[ib]<0) ib++;
-    if(ia==na || ib==nb) goto quit;
-
-    //Go to the first overlapping position
-    if(posa[ia]<posb[ib]) 
-        while(ia<na && posa[ia]<posb[ib]) ia++;
-     else 
-        while(ib<nb && posb[ib]<posa[ia]) ib++;
-    
-    if(ia==na || ib==nb) goto quit;
-
-    //Take care of the overlap
-    while(ia<na && ib<nb) 
-    {
-        if(posa[ia] < posb[ib] || posa[ia] < 0) 
-        {
-            ia++;
-            continue;
-        }
-        if(posb[ib] < posa[ia] || posb[ib] < 0) 
-        {
-            ib++;
-            continue;
-        }
-        if(bam_seqi(a_seq, ia) != bam_seqi(b_seq, ib)) 
-        {
-            if(a_qual[ia]>b_qual[ib] && bam_seqi(a_seq,ia) != 15) 
-            {
-                a_qual[ia] -= b_qual[ib];
-                b_qual[ib] = 0;
-            } else if(b_qual[ib]>a_qual[ia] && bam_seqi(b_seq,ib) != 15) 
-            {
-                b_qual[ib] -= a_qual[ia];
-                a_qual[ia] = 0;
-            } else 
-            {
-                a_qual[ia] = 0;
-                b_qual[ib] = 0;
-            }
-        } 
-        else 
-        {
-            if(a_qual[ia]>b_qual[ib]) 
-            {
-                a_qual[ia] += 0.2*a_qual[ia];
-                b_qual[ib] = 0;
-            } 
-            else 
-            {
-                b_qual[ib] += 0.2*b_qual[ib];
-                a_qual[ia] = 0;
-            }
-        }
-        a_qual[ia] = (a_qual[ia]<=255) ? a_qual[ia] : 255;
-        b_qual[ib] = (b_qual[ib]<=255) ? b_qual[ib] : 255;
-        ia++;
-        ib++;
-    }
-
-quit :
-    free(posa);
-    free(posb);
-}
-
-int custom_overlap_constructor(void *data, const bam1_t *b, bam_pileup_cd *cd) 
-{
-    int ret;
-    mplp_data_t *foo = (mplp_data_t*) data;
-    khash_t(olap_hash) * ohash = ( khash_t(olap_hash) *)foo->ohash;
-    khiter_t k = kh_get(olap_hash, ohash, bam_get_qname(b));
-    bam1_t *a;
-    // Skip unpaired reads
-    if(!(b->core.flag & BAM_FPAIRED) || ((b->core.flag & 12) > 0)) return 0;
-
-    if (k==kh_end(ohash)) 
-    {
-        k = kh_put(olap_hash, ohash, bam_get_qname(b), &ret);
-        kh_value(ohash, k) = (bam1_t*)b;
-    } 
-    else 
-    {
-        a = kh_value(ohash, k);
-        cust_tweak_overlap_quality(a, (bam1_t*)b);
-        kh_del(olap_hash, ohash, k);
-    }
-    return 0;
-
-}
-
-int custom_overlap_destructor(void *data, const bam1_t *b, bam_pileup_cd *cd) {
-    mplp_data_t *foo = (mplp_data_t*) data;
-    khash_t(olap_hash) * ohash = ( khash_t(olap_hash) *)foo->ohash;
-    khiter_t k = kh_get(olap_hash, ohash, bam_get_qname(b));
-    if (k!=kh_end(ohash)) kh_del(olap_hash, ohash, k);
-    return 0;
-}
-
-static int mplp_fetch(void *data, bam1_t *b) 
-{
-    int rv;
-    mplp_data_t *ldata = (mplp_data_t *)data;
-    uint8_t *p;
-
-    // Debug: Check for NULL pointers
-    if (!ldata) 
-    {
-        //fprintf(stderr, "[DEBUG] mplp_fetch: ldata is NULL!\n");
-        return -1;
-    }
-    if (!ldata->in) 
-    {
-        //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->in is NULL!\n");
-        return -1;
-    }
-    if (!ldata->hdr) 
-    {
-        //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->hdr is NULL!\n");
-        return -1;
-    }
-    if (!b) 
-    {
-        //fprintf(stderr, "[DEBUG] mplp_fetch: bam1_t *b is NULL!\n");
-        return -1;
-    }
-    if (ldata->iter == NULL) 
-    {
-        //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->iter is NULL (using sam_read1 fallback)\n");
-        return -1;
-    }
-    if (ldata->targ == NULL) 
-    {
-        //fprintf(stderr, "[DEBUG] mplp_fetch: ldata->targ is NULL!\n");
-        return -1;
-    }
-    //fprintf(stderr, "[DEBUG] mplp_fetch: ldata=%p, in=%p, hdr=%p, iter=%p, targ=%p, b=%p\n", ldata, ldata->in, ldata->hdr, ldata->iter, ldata->targ, b);
-
-    while (1)
-    {
-        rv = ldata->iter ? sam_itr_next(ldata->in, ldata->iter, b) : sam_read1(ldata->in, ldata->hdr, b);
-
-        if (rv < 0) 
-        {
-            //fprintf(stderr, "[DEBUG] mplp_fetch: sam_itr_next/sam_read1 returned %d (EOF or error)\n", rv);
-            return rv;
-        }
-        if (b->core.tid == -1 || b->core.flag & BAM_FUNMAP) 
-        {
-            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping unmapped read (tid == -1 or BAM_FUNMAP)\n");
-            continue; // Unmapped
-        }
-        if (b->core.qual < ldata->targ->min_mapq) 
-        {
-            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping read with low mapping quality (%d < %d)\n", b->core.qual, ldata->targ->min_mapq);
-            continue; //-q
-        }
-        if (b->core.flag & (BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY)) 
-        {
-            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping read with flag 0xF00 (secondary, QC fail, duplicate, supplementary)\n");
-            continue; // By default: secondary alignments, QC failed, PCR duplicates, and supplemental alignments
-        }
-        if (b->core.flag & BAM_FDUP) 
-        {
-            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping duplicate read (BAM_FDUP)\n");
-            continue;
-        }
-        p = bam_aux_get(b, "NH");
-        if (p) {
-            int NH = bam_aux2i(p);
-            if (NH > 1) {
-                //fprintf(stderr, "[DEBUG] mplp_fetch: skipping multi-mapper (NH=%d)\n", NH);
-                continue; // Ignore obvious multimappers
-            }
-        }
-        if ((b->core.flag & (BAM_FPAIRED | BAM_FMUNMAP)) == (BAM_FPAIRED | BAM_FMUNMAP)) {
-            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping singleton (flag & (BAM_FPAIRED | BAM_FMUNMAP) == (BAM_FPAIRED | BAM_FMUNMAP))\n");
-            continue; // Singleton
-        }
-        if ((b->core.flag & (BAM_FPAIRED | BAM_FPROPER_PAIR)) == BAM_FPAIRED) {
-            //fprintf(stderr, "[DEBUG] mplp_fetch: skipping discordant (flag & (BAM_FPAIRED | BAM_FMUNMAP) == BAM_FPAIRED)\n");
-            continue; // Discordant
-        }
-        if ((b->core.flag & (BAM_FPAIRED | BAM_FMUNMAP)) == BAM_FPAIRED) {
-            //fprintf(stderr, "[DEBUG] mplp_fetch: marking discordant pair as proper (flag & (BAM_FPAIRED | BAM_FMUNMAP) == BAM_FPAIRED)\n");
-            b->core.flag |= BAM_FPROPER_PAIR; // Discordant pairs can cause double counts
-        }
-        // If we reach here, the read passed all filters
-        //fprintf(stderr, "[DEBUG] mplp_fetch: read passed all filters (qname=%s, tid=%d, pos=%ld, flag=0x%x)\n", bam_get_qname(b), b->core.tid, (long)b->core.pos, b->core.flag);
-        break;
-    }
-    return rv;
-}
-
-void *process_chromosome_region(void *arg)
-{
-    ThreadArg *targ = (ThreadArg *)arg;
-    samFile *in = sam_open(targ->bam_file, "r");
+    samFile *in = sam_open(t->bam_file, "r");
     if (!in)
+        return NULL;
+    hts_idx_t *idx = sam_index_load(in, t->bam_file);
+    if (!idx)
     {
-        fprintf(stderr, "Thread %s:%u-%u: Failed to open BAM file\n", targ->chr, targ->start_pos, targ->end_pos);
+        sam_close(in);
         return NULL;
     }
-    bam_hdr_t *header = sam_hdr_read(in);
-    hts_idx_t *idx = sam_index_load(in, targ->bam_file);
-    hts_itr_t *iter = sam_itr_queryi(idx, targ->tid, targ->start_pos, targ->end_pos);
+    hts_itr_t *iter = sam_itr_queryi(idx, t->tid, t->start_pos, t->end_pos);
     if (!iter)
     {
-        log_time("Thread %s:%u-%u: Failed to create iterator\n", targ->chr, targ->start_pos, targ->end_pos);
-        sam_hdr_destroy(header);
+        hts_idx_destroy(idx);
         sam_close(in);
         return NULL;
     }
 
-    mplp_data_t *mplp_data = malloc(sizeof(mplp_data_t));
-    mplp_data->targ = targ;
-    mplp_data->in = in;
-    mplp_data->iter = iter;
-    mplp_data->hdr = header;
-    mplp_data->ohash = initOlapHash();
-
-    bam_mplp_t mplp = bam_mplp_init(1, mplp_fetch, (void **)&mplp_data);
-    bam_mplp_set_maxcnt(mplp, INT_MAX);
-    bam_mplp_constructor(mplp, custom_overlap_constructor);
-    bam_mplp_destructor(mplp, custom_overlap_destructor);
-
+    bam_hdr_t *hdr = sam_hdr_read(in);
     bam1_t *b = bam_init1();
-    int tid, n_plp;
-    hts_pos_t pos;
-    const bam_pileup1_t *pileup;
 
-    while (bam_mplp64_auto(mplp, &tid, &pos, &n_plp, &pileup) > 0)
+    while (sam_itr_next(in, iter, b) >= 0)
     {
-        if (tid != targ->tid) 
+        bam1_core_t *c = &b->core;
+        if (c->flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY))
             continue;
-        if (pos < targ->start_pos || pos >= targ->end_pos)
+        if (c->qual < t->min_mapq)
+            continue;
+        uint8_t *nh = bam_aux_get(b, "NH");
+        if (nh && bam_aux2i(nh) > 1)
             continue;
 
-        uint64_t key = ((uint64_t)targ->tid << 32) | pos;
-        khint_t iter_kh = kh_get(pos, targ->pos_map, key);
-        if (iter_kh == kh_end(targ->pos_map))
+        int strand = getRealStrand(b);
+        if (strand == 0)
             continue;
 
-        char ref_base = toupper(targ->chr_seq[pos]);
-        if (ref_base != 'C' && ref_base != 'G')
-            continue; // Only process C or G reference sites
+        uint8_t *seq = bam_get_seq(b);
+        uint8_t *qual = bam_get_qual(b);
+        int32_t pos = c->pos;
+        uint32_t *cigar = bam_get_cigar(b);
+        int qpos = 0;
 
-        size_t idx = kh_val(targ->pos_map, iter_kh);
-
-
-        for (int i = 0; i < n_plp; i++)
+        for (int k = 0; k < c->n_cigar; ++k)
         {
-            const bam_pileup1_t *p = &pileup[i];
-            if (p->is_del || p->is_refskip)
-                continue;
+            int op = bam_cigar_op(cigar[k]);
+            int len = bam_cigar_oplen(cigar[k]);
 
-            b = p->b;
-            int read_qual = b->core.qual;
-            // Ignore low mapping quality reads
-            if (read_qual < targ->min_mapq)
-                continue;
-
-            int read_flag = b->core.flag;
-            // Ignore reads with default flags
-            if (read_flag & DEFAULT_FLAGS)
-                continue;
-
-            int strand = getRealStrand(b);
-            if (strand == 0)
-                continue;   // Strand not determined
-
-            int seq_idx = p->qpos;
-            uint8_t *seq = bam_get_seq(b);
-            uint8_t *qual = bam_get_qual(b);
-
-            // Ignore low quality bases
-            int base_qual = qual[seq_idx];
-            if (base_qual < targ->min_phred)
-                continue;
-
-            int base = bam_seqi(seq, seq_idx);
-
-            // Per-read filtering: skip reads that don't match expected bisulfite pattern
-            if (strand == 1 || strand == 3)  // OT/CTOT
+            if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF)
             {
-                if (ref_base != 'C' && ref_base != 'c')
-                    continue;  // Skip reads where reference is not C on OT/CTOT strand
-            }
-            else if (strand == 2 || strand == 4)  // OB/CTOB
-            {
-                if (ref_base != 'G' && ref_base != 'g')
-                    continue;  // Skip reads where reference is not G on OB/CTOB strand
-            }
-
-            pthread_mutex_lock(targ->buffer_mutex);
-
-            // Now, apply methylation calling only for reads that passed the filter
-            if ((ref_base == 'C') && (strand == 1 || strand == 3))
-            {
-                if (base == 2) // C methylated
+                for (int i = 0; i < len; ++i)
                 {
-                    targ->buffer[idx].mC++;
-                }
-                else if (base == 8) // T unmethylated
-                    targ->buffer[idx].uC++;
-            }
-            else if ((ref_base == 'G') && (strand == 2 || strand == 4))
-            {
-                if (base == 4) // G methylated
-                {
-                    targ->buffer[idx].mC++;
-                }
-                else if (base == 1) // A unmethylated
-                    targ->buffer[idx].uC++;
-            }
-            // Otherwise, ignore
+                    if (pos < t->start_pos || pos >= t->end_pos)
+                    {
+                        pos++;
+                        qpos++;
+                        continue;
+                    }
+                    char ref = toupper(t->chr_seq[pos]);
+                    if (ref != 'C' && ref != 'G')
+                    {
+                        pos++;
+                        qpos++;
+                        continue;
+                    }
+                    if (qual[qpos] < t->min_phred)
+                    {
+                        pos++;
+                        qpos++;
+                        continue;
+                    }
 
-            pthread_mutex_unlock(targ->buffer_mutex);
+                    int base = bam_seqi(seq, qpos);
+                    uint32_t rel = (uint32_t)(pos - t->start_pos);
+
+                    if (ref == 'C' && (strand == 1 || strand == 3))
+                    {
+                        if (base == 2)
+                            r->counts.mC[rel]++; // C->C methylated
+                        else if (base == 8)
+                            r->counts.uC[rel]++; // C->T unmethylated
+                    }
+                    else if (ref == 'G' && (strand == 2 || strand == 4))
+                    {
+                        if (base == 4)
+                            r->counts.mC[rel]++; // G->G methylated
+                        else if (base == 1)
+                            r->counts.uC[rel]++; // G->A unmethylated
+                    }
+                    pos++;
+                    qpos++;
+                }
+            }
+            else if (op == BAM_CDEL || op == BAM_CREF_SKIP)
+                pos += len;
+            else if (op == BAM_CINS || op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP)
+                qpos += len;
         }
     }
+
     bam_destroy1(b);
-    destroyOlapHash(mplp_data->ohash);
-    free(mplp_data);
+    sam_hdr_destroy(hdr);
     hts_itr_destroy(iter);
     hts_idx_destroy(idx);
-    sam_hdr_destroy(header);
     sam_close(in);
     return NULL;
 }
@@ -1248,197 +851,79 @@ void *process_chromosome_region(void *arg)
 void process_chromosome(ThreadArg *targ)
 {
     size_t site_count = count_methylation_sites(targ->chr_seq, targ->chr_len, targ->keep_chg, targ->keep_chh);
-    MethylRecord *buffer = calloc(site_count, sizeof(MethylRecord));
-    if (!buffer)
-    {
-        fprintf(stderr, "Failed to allocate buffer for %s\n", targ->chr);
+    if (site_count == 0)
         return;
-    }
+
+    MethylRecord *buffer = calloc(site_count, sizeof(MethylRecord));
     initialize_buffer(buffer, site_count, targ->chr_seq, targ->chr_len, targ->keep_chg, targ->keep_chh);
 
-    khash_t(pos) *pos_map = kh_init(pos);
+    uint32_t *site_positions = malloc(site_count * sizeof(uint32_t));
     for (size_t i = 0; i < site_count; i++)
+        site_positions[i] = buffer[i].pos - 1;
+
+    int n_threads = get_nprocs();
+    if (n_threads > 32)
+        n_threads = 32;
+    if (n_threads < 1)
+        n_threads = 8;
+
+    size_t sites_per_thread = (site_count + n_threads - 1) / n_threads;
+
+    RegionArg *regions = calloc(n_threads, sizeof(RegionArg));
+    pthread_t *threads = malloc(n_threads * sizeof(pthread_t));
+
+    for (int i = 0; i < n_threads; i++)
     {
-        uint64_t key = ((uint64_t)targ->tid << 32) | (buffer[i].pos - 1);
-        int ret;
-        khint_t iter = kh_put(pos, pos_map, key, &ret);
-        kh_val(pos_map, iter) = i;
+        RegionArg *r = &regions[i];
+        r->base = *targ;
+        r->start_site_idx = i * sites_per_thread;
+        r->end_site_idx = (i + 1) * sites_per_thread;
+        if (r->end_site_idx > site_count)
+            r->end_site_idx = site_count;
+        if (r->start_site_idx >= site_count)
+            break;
+
+        r->base.start_pos = site_positions[r->start_site_idx];
+        r->base.end_pos = (r->end_site_idx < site_count) ? site_positions[r->end_site_idx - 1] + 10 : targ->chr_len;
+
+        uint32_t range = r->base.end_pos - r->base.start_pos;
+        r->counts.mC = calloc(range, sizeof(uint32_t));
+        r->counts.uC = calloc(range, sizeof(uint32_t));
+        r->counts.size = range;
+
+        pthread_create(&threads[i], NULL, process_region_direct, r);
     }
 
-    uint32_t chunk_size = targ->chunk_size;
-    if (chunk_size > targ->chr_len)
-        chunk_size = targ->chr_len;
-
-    int n_regions = (int)ceil((double)targ->chr_len / chunk_size);
-    if (n_regions > MAX_REGIONS_PER_CHR)
+    for (int i = 0; i < n_threads; i++)
     {
-        n_regions = MAX_REGIONS_PER_CHR;
-        chunk_size = (targ->chr_len + n_regions - 1) / n_regions;
-    }
-    if (n_regions < 1)
-        n_regions = 1;
-
-    // Allocate thread arguments array
-    ThreadArg *region_args = malloc(n_regions * sizeof(ThreadArg));
-    if (!region_args) 
-    {
-        fprintf(stderr, "Failed to allocate region arguments\n");
-        free(buffer);
-        kh_destroy(pos, pos_map);
-        return;
+        if (regions[i].start_site_idx < site_count)
+            pthread_join(threads[i], NULL);
     }
 
-    pthread_mutex_t buffer_mutex;
-    pthread_mutex_init(&buffer_mutex, NULL);
-
-    size_t sites_per_region = (site_count + n_regions - 1) / n_regions;
-
-    // First, validate the chromosome name
-    if (!targ->chr || strlen(targ->chr) == 0) 
+    for (int i = 0; i < n_threads; i++)
     {
-        fprintf(stderr, "Invalid chromosome name\n");
-        free(region_args);
-        pthread_mutex_destroy(&buffer_mutex);
-        free(buffer);
-        kh_destroy(pos, pos_map);
-        return;
-    }
-
-    for (int i = 0; i < n_regions; i++)
-    {
-        // Initialize each thread argument structure
-        memset(&region_args[i], 0, sizeof(ThreadArg));
-        
-        // Copy all non-pointer fields
-        region_args[i].bam_file = targ->bam_file;
-        region_args[i].out_dir = targ->out_dir;
-        region_args[i].tid = targ->tid;
-        
-        // Make a deep copy of the chromosome name and validate it
-        region_args[i].chr = strdup(targ->chr);
-        if (!region_args[i].chr || strlen(region_args[i].chr) == 0) 
-        {
-            fprintf(stderr, "Failed to allocate or validate chromosome name copy for region %d\n", i);
-            // Clean up previously allocated regions
-            for (int j = 0; j < i; j++) 
-            {
-                free(region_args[j].chr);
-            }
-            free(region_args);
-            pthread_mutex_destroy(&buffer_mutex);
-            free(buffer);
-            kh_destroy(pos, pos_map);
-            return;
-        }
-
-        region_args[i].chr_len = targ->chr_len;
-        region_args[i].chr_seq = targ->chr_seq;
-        region_args[i].min_mapq = targ->min_mapq;
-        region_args[i].min_phred = targ->min_phred;
-        region_args[i].min_cov = targ->min_cov;
-        region_args[i].cap_cov = targ->cap_cov;
-        region_args[i].keep_chg = targ->keep_chg;
-        region_args[i].keep_chh = targ->keep_chh;
-        region_args[i].hdf5_compression = targ->hdf5_compression;
-        region_args[i].hdf5_chunk_size = targ->hdf5_chunk_size;
-        region_args[i].chunk_size = targ->chunk_size;
-        region_args[i].output_format = targ->output_format;
-        region_args[i].split_context_files = targ->split_context_files;
-
-        // Set shared resources
-        region_args[i].buffer = buffer;
-        region_args[i].buffer_mutex = &buffer_mutex;
-        region_args[i].pos_map = pos_map;
-        region_args[i].buffer_offset = i * sites_per_region;
-        region_args[i].buffer_size = (i == n_regions - 1) ? site_count - i * sites_per_region : sites_per_region;
-
-        uint32_t start_pos = i * chunk_size;
-        uint32_t end_pos = (i == n_regions - 1) ? targ->chr_len : ((i + 1) * chunk_size);
-
-        if (end_pos > targ->chr_len)
-            end_pos = targ->chr_len;
-
-        if (i > 0 && buffer[region_args[i].buffer_offset].pos > 0)
-        {
-            uint32_t buffer_start = buffer[region_args[i].buffer_offset].pos - 1;
-            if (buffer_start < end_pos)
-                start_pos = buffer_start;
-        }
-        if (start_pos >= end_pos)
-            start_pos = (end_pos > chunk_size) ? end_pos - chunk_size : 0;
-
-        region_args[i].start_pos = start_pos;
-        region_args[i].end_pos = end_pos;
-    }
-
-    pthread_t threads[n_regions];
-    int active_threads = 0;
-    int *joined = calloc(n_regions, sizeof(int));
-    if (!joined)
-    {
-        fprintf(stderr, "Failed to allocate memory for joined array\n");
-        // Clean up region arguments
-        for (int i = 0; i < n_regions; i++) 
-            free(region_args[i].chr);
-        free(region_args);
-        pthread_mutex_destroy(&buffer_mutex);
-        free(buffer);
-        kh_destroy(pos, pos_map);
-        return;
-    }
-
-    for (int i = 0; i < n_regions; i++)
-    {
-        if (pthread_create(&threads[i], NULL, process_chromosome_region, &region_args[i]) != 0)
-        {
-            fprintf(stderr, "Failed to create thread for %s\n", region_args[i].chr);
+        if (regions[i].start_site_idx >= site_count)
             continue;
-        }
-        active_threads++;
-        for (int j = 0; j <= i; j++)
-            if (!joined[j] && pthread_join(threads[j], NULL) == 0)
-            {
-                joined[j] = 1;
-                active_threads--;
-            }
-        
-        int max_region_threads = DEFAULT_THREADS;
-        while (active_threads >= max_region_threads)
-            for (int j = 0; j <= i; j++)
-                if (!joined[j] && pthread_join(threads[j], NULL) == 0)
-                {
-                    joined[j] = 1;
-                    active_threads--;
-                }
-
-    }
-    for (int i = 0; i < n_regions; i++)
-    {
-        if (!joined[i] && pthread_join(threads[i], NULL) == 0)
+        uint32_t offset = regions[i].base.start_pos;
+        for (size_t j = regions[i].start_site_idx; j < regions[i].end_site_idx; j++)
         {
-            joined[i] = 1;
-            if (active_threads > 0)
-                active_threads--;
-            fprintf(
-                stderr,
-                "Final join: Completed thread %d for chromosome region %s:%u-%u, active threads: %d\n",
-                i,
-                region_args[i].chr,
-                region_args[i].start_pos,
-                region_args[i].end_pos,
-                active_threads);
+            uint32_t gpos = site_positions[j];
+            uint32_t rel = gpos - offset;
+            buffer[j].mC += regions[i].counts.mC[rel];
+            buffer[j].uC += regions[i].counts.uC[rel];
         }
+        free(regions[i].counts.mC);
+        free(regions[i].counts.uC);
     }
-    free(joined);
-    pthread_mutex_destroy(&buffer_mutex);
 
-    if (targ->split_context_files) 
+    // Output (unchanged)
+    if (targ->split_context_files)
     {
-        for (int ctx = CONTEXT_CPG; ctx <= CONTEXT_CHH; ++ctx) 
+        for (int ctx = CONTEXT_CPG; ctx <= CONTEXT_CHH; ++ctx)
         {
             if ((ctx == CONTEXT_CPG) ||
                 (ctx == CONTEXT_CHG && targ->keep_chg) ||
-                (ctx == CONTEXT_CHH && targ->keep_chh)) 
+                (ctx == CONTEXT_CHH && targ->keep_chh))
             {
                 // Filter buffer for this context
                 size_t n_ctx_records = 0;
@@ -1457,16 +942,15 @@ void process_chromosome(ThreadArg *targ)
 
                 // Output file name - use appropriate extension based on output format
                 char out_path[1024];
-                const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5";  // For OUTPUT_BOTH, use .h5
+                const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5"; // For OUTPUT_BOTH, use .h5
                 snprintf(
-                    out_path, 
-                    sizeof(out_path), 
-                    "%s/%s-%s%s", 
-                    targ->out_dir, 
-                    targ->chr, 
+                    out_path,
+                    sizeof(out_path),
+                    "%s/%s-%s%s",
+                    targ->out_dir,
+                    targ->chr,
                     get_context_string(ctx),
-                    ext
-                );
+                    ext);
                 flush_buffer(
                     out_path,
                     ctx_buffer,
@@ -1481,12 +965,12 @@ void process_chromosome(ThreadArg *targ)
                 free(ctx_buffer);
             }
         }
-    } 
-    else 
+    }
+    else
     {
         // Output file name - use appropriate extension based on output format
         char out_path[1024];
-        const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5";  // For OUTPUT_BOTH, use .h5
+        const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5"; // For OUTPUT_BOTH, use .h5
         snprintf(out_path, sizeof(out_path), "%s/%s%s", targ->out_dir, targ->chr, ext);
         flush_buffer(
             out_path,
@@ -1500,14 +984,10 @@ void process_chromosome(ThreadArg *targ)
             targ->output_format);
     }
 
-    kh_destroy(pos, pos_map);
+    free(site_positions);
     free(buffer);
-
-    // Clean up region arguments
-    for (int i = 0; i < n_regions; i++)
-        if (region_args[i].chr) 
-            free(region_args[i].chr);
-    free(region_args);
+    free(threads);
+    free(regions);
 }
 
 void cleanup_hdf5(void)
@@ -1515,17 +995,17 @@ void cleanup_hdf5(void)
     H5close();
 }
 
-int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_entries, char **reference_file) 
+int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_entries, char **reference_file)
 {
     FILE *fp = fopen(filename, "r");
-    if (!fp) 
+    if (!fp)
         return -1;
     fseek(fp, 0, SEEK_END);
     long len = ftell(fp);
     fseek(fp, 0, SEEK_SET);
     char *data = malloc(len + 1);
     size_t nread = fread(data, 1, len, fp);
-    if (nread != len) 
+    if (nread != len)
     {
         free(data);
         fclose(fp);
@@ -1536,12 +1016,12 @@ int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_ent
 
     cJSON *json = cJSON_Parse(data);
     free(data);
-    if (!json) 
+    if (!json)
         return -3;
 
     // Get reference file path
     cJSON *ref = cJSON_GetObjectItem(json, "reference");
-    if (ref && cJSON_IsString(ref) && ref->valuestring) 
+    if (ref && cJSON_IsString(ref) && ref->valuestring)
     {
         *reference_file = strdup(ref->valuestring);
         fprintf(stderr, "Found reference file: %s\n", *reference_file);
@@ -1550,7 +1030,7 @@ int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_ent
         fprintf(stderr, "Warning: No reference file specified in mapping\n");
 
     cJSON *chroms = cJSON_GetObjectItem(json, "chromosomes");
-    if (!chroms || !cJSON_IsArray(chroms)) 
+    if (!chroms || !cJSON_IsArray(chroms))
     {
         cJSON_Delete(json);
         return -4;
@@ -1558,51 +1038,51 @@ int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_ent
     int count = cJSON_GetArraySize(chroms);
     *entries = calloc(count, sizeof(ChromMapEntry));
     *n_entries = 0;
-    for (int i = 0; i < count; ++i) 
+    for (int i = 0; i < count; ++i)
     {
         cJSON *item = cJSON_GetArrayItem(chroms, i);
-        if (!cJSON_IsObject(item)) 
+        if (!cJSON_IsObject(item))
             continue;
         cJSON *extract = cJSON_GetObjectItem(item, "extract");
-        if (!extract || !cJSON_IsBool(extract) || !cJSON_IsTrue(extract)) 
+        if (!extract || !cJSON_IsBool(extract) || !cJSON_IsTrue(extract))
             continue;
         ChromMapEntry *e = &(*entries)[*n_entries];
-        
+
         // Initialize all strings to empty
         e->fasta[0] = '\0';
         e->bam[0] = '\0';
         e->name[0] = '\0';
-        
+
         cJSON *fasta = cJSON_GetObjectItem(item, "fasta");
         cJSON *bam = cJSON_GetObjectItem(item, "bam");
         cJSON *name = cJSON_GetObjectItem(item, "name");
-        
+
         // Validate and copy each field
-        if (fasta && cJSON_IsString(fasta) && fasta->valuestring) 
+        if (fasta && cJSON_IsString(fasta) && fasta->valuestring)
         {
             strncpy(e->fasta, fasta->valuestring, sizeof(e->fasta) - 1);
             e->fasta[sizeof(e->fasta) - 1] = '\0';
         }
-        
-        if (bam && cJSON_IsString(bam) && bam->valuestring) 
+
+        if (bam && cJSON_IsString(bam) && bam->valuestring)
         {
             strncpy(e->bam, bam->valuestring, sizeof(e->bam) - 1);
             e->bam[sizeof(e->bam) - 1] = '\0';
         }
-        
-        if (name && cJSON_IsString(name) && name->valuestring) 
+
+        if (name && cJSON_IsString(name) && name->valuestring)
         {
             strncpy(e->name, name->valuestring, sizeof(e->name) - 1);
             e->name[sizeof(e->name) - 1] = '\0';
         }
-        
+
         // Validate that we have all required fields
-        if (e->fasta[0] == '\0' || e->bam[0] == '\0' || e->name[0] == '\0') 
+        if (e->fasta[0] == '\0' || e->bam[0] == '\0' || e->name[0] == '\0')
         {
             fprintf(stderr, "Warning: Skipping chromosome entry with missing required fields\n");
             continue;
         }
-        
+
         e->extract = 1;
         (*n_entries)++;
     }
@@ -1610,7 +1090,7 @@ int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_ent
     return 0;
 }
 
-static void print_usage(const char *prog) 
+static void print_usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [options] <input.bam> <output_dir> [ref.fa]\n", prog);
     fprintf(stderr, "Options:\n");
@@ -1639,7 +1119,6 @@ int main(int argc, char *argv[])
     for (int i = 0; i < argc; i++)
         fprintf(stderr, "  Arg %d: %s\n", i, argv[i]);
 
-
     int hdf5_compression = DEFAULT_HDF5_COMPRESSION;
     int hdf5_chunk_size = DEFAULT_HDF5_CHUNK_SIZE;
     uint32_t chunk_size = DEFAULT_CHUNK_SIZE;
@@ -1649,12 +1128,12 @@ int main(int argc, char *argv[])
     int min_mapq = DEFAULT_MIN_MAPQ;
     int min_phred = DEFAULT_MIN_PHRED;
     int min_cov = DEFAULT_MIN_COV;
-    int cap_cov = 0;  // Default to 0 (no capping)
-    OutputFormat output_format = OUTPUT_HDF5;  // Default to HDF5 output
+    int cap_cov = 0;                          // Default to 0 (no capping)
+    OutputFormat output_format = OUTPUT_HDF5; // Default to HDF5 output
     const char *out_dir = NULL;
     int split_context_files = 0;
-    const char *chrom_mapping_file = NULL;  // Default to NULL
-    const char *ref_file = NULL;  // Will be set from chrom_mapping or command line
+    const char *chrom_mapping_file = NULL; // Default to NULL
+    const char *ref_file = NULL;           // Will be set from chrom_mapping or command line
 
     struct option long_options[] = {
         {"help", no_argument, 0, 'h'},
@@ -1671,11 +1150,11 @@ int main(int argc, char *argv[])
         {"output-format", required_argument, 0, 'f'},
         {"split", no_argument, 0, 's'},
         {"output-dir", required_argument, 0, 'o'},
-        {0, 0, 0, 0}
-    };
+        {0, 0, 0, 0}};
     int opt;
     while ((opt = getopt_long(argc, argv, "ht:q:p:c:C:GHm:z:k:f:so:", long_options, NULL)) != -1)
     {
+        fprintf(stderr, "DEBUG: Processing option: %c, optarg: %s\n", opt, optarg ? optarg : "(null)");
         switch (opt)
         {
         case 'h':
@@ -1714,7 +1193,9 @@ int main(int argc, char *argv[])
             }
             break;
         case 'C':
+            fprintf(stderr, "DEBUG: Hit 'C' case with optarg: %s\n", optarg ? optarg : "(null)");
             cap_cov = atoi(optarg);
+            fprintf(stderr, "DEBUG: cap_cov = %d\n", cap_cov);
             if (cap_cov < 0)
             {
                 fprintf(stderr, "Cap coverage must be non-negative\n");
@@ -1774,12 +1255,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    const char *bam_file = argv[optind];  // BAM file is the first non-option argument
-    const char *cmd_ref_file = NULL;      // Will be set if reference file is provided
+    const char *bam_file = argv[optind]; // BAM file is the first non-option argument
+    const char *cmd_ref_file = NULL;     // Will be set if reference file is provided
 
-    if (optind + 1 < argc)  // If we have a reference file
+    if (optind + 1 < argc) // If we have a reference file
     {
-        cmd_ref_file = argv[optind + 1];  // It's the second non-option argument
+        cmd_ref_file = argv[optind + 1]; // It's the second non-option argument
     }
 
     if (num_threads == DEFAULT_THREADS)
@@ -1794,7 +1275,6 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Failed to create output directory: %s\n", out_dir);
         return 1;
     }
-
 
     log_time("Starting processing...\n");
 
@@ -1813,15 +1293,15 @@ int main(int argc, char *argv[])
         // Use chrom_mapping.json in the same directory as the BAM file
         char *bam_dir = strdup(bam_file);
         char *last_slash = strrchr(bam_dir, '/');
-        if (last_slash) {
-            *(last_slash + 1) = '\0';  // Keep the trailing slash
-        } else {
-            bam_dir[0] = '\0';  // No directory, use current directory
-        }
+        if (last_slash)
+            *(last_slash + 1) = '\0'; // Keep the trailing slash
+        else
+            bam_dir[0] = '\0'; // No directory, use current directory
+
         snprintf(chrom_mapping_path, sizeof(chrom_mapping_path), "%schrom_mapping.json", bam_dir);
         free(bam_dir);
     }
-    
+
     int n_chroms = 0;
     char *mapping_ref_file = NULL;
     if (load_chrom_mapping(chrom_mapping_path, &chroms, &n_chroms, &mapping_ref_file) != 0)
@@ -1857,14 +1337,6 @@ int main(int argc, char *argv[])
         free(chroms);
         return 1;
     }
-
-    // Print chromosome names from FASTA index
-    // fprintf(stderr, "\nChromosomes in FASTA file:\n");
-    // for (int i = 0; i < faidx_nseq(fai); i++) {
-    //     const char *name = faidx_iseq(fai, i);
-    //     fprintf(stderr, "  %d: %s (length: %d)\n", i, name, faidx_seq_len(fai, name));
-    // }
-    // fprintf(stderr, "\n");
 
     log_time("Loading BAM...\n");
     samFile *in = sam_open(bam_file, "r");
@@ -1905,12 +1377,12 @@ int main(int argc, char *argv[])
     }
 
     log_time("Processing chromosomes...\n");
-    for (int i = 0; i < n_chroms; ++i) 
+    for (int i = 0; i < n_chroms; ++i)
     {
         ChromMapEntry *entry = &chroms[i];
 
         int tid = bam_name2id(header, entry->bam);
-        if (tid < 0) 
+        if (tid < 0)
         {
             fprintf(stderr, "BAM does not contain chromosome %s\n", entry->bam);
             continue;
@@ -1918,17 +1390,18 @@ int main(int argc, char *argv[])
         // Fetch sequence for entry->fasta
         int seq_len = 0;
         char *seq = faidx_fetch_seq(fai, entry->fasta, 0, header->target_len[tid], &seq_len);
-        if (!seq || seq_len <= 0) 
+        if (!seq || seq_len <= 0)
         {
             fprintf(stderr, "Failed to fetch sequence for %s\n", entry->fasta);
-            if (seq) free(seq);
+            if (seq)
+                free(seq);
             continue;
         }
         // Set up ThreadArg as before, but use entry->name for output
         thread_args[valid_chr_count].bam_file = bam_file;
         thread_args[valid_chr_count].out_dir = out_dir;
         thread_args[valid_chr_count].tid = tid;
-        thread_args[valid_chr_count].chr = strdup(entry->name);  // Make a copy of the name
+        thread_args[valid_chr_count].chr = strdup(entry->name); // Make a copy of the name
         thread_args[valid_chr_count].chr_len = header->target_len[tid];
         thread_args[valid_chr_count].min_mapq = min_mapq;
         thread_args[valid_chr_count].min_phred = min_phred;
@@ -1962,7 +1435,7 @@ int main(int argc, char *argv[])
     log_time("Creating thread argument copies...\n");
     // Create a copy of thread arguments for each thread
     ThreadArg **thread_args_copies = malloc(valid_chr_count * sizeof(ThreadArg *));
-    if (!thread_args_copies) 
+    if (!thread_args_copies)
     {
         fprintf(stderr, "Failed to allocate thread argument copies\n");
         free(threads);
@@ -1980,7 +1453,7 @@ int main(int argc, char *argv[])
     {
         // Create a deep copy of the thread arguments
         thread_args_copies[i] = malloc(sizeof(ThreadArg));
-        if (!thread_args_copies[i]) 
+        if (!thread_args_copies[i])
         {
             fprintf(stderr, "Failed to allocate thread argument copy %d\n", i);
             continue;
@@ -1988,12 +1461,12 @@ int main(int argc, char *argv[])
 
         // Initialize the structure to zero
         memset(thread_args_copies[i], 0, sizeof(ThreadArg));
-        
+
         // Make deep copies of all string fields
         thread_args_copies[i]->bam_file = strdup(thread_args[i].bam_file);
         thread_args_copies[i]->out_dir = strdup(thread_args[i].out_dir);
         thread_args_copies[i]->chr = strdup(thread_args[i].chr);
-        
+
         // Make a deep copy of the chromosome sequence
         thread_args_copies[i]->chr_seq = malloc(thread_args[i].chr_len + 1);
         memcpy(thread_args_copies[i]->chr_seq, thread_args[i].chr_seq, thread_args[i].chr_len + 1);
@@ -2043,8 +1516,8 @@ int main(int argc, char *argv[])
 
     log_time("Cleaning up thread argument copies...\n");
     // Clean up thread argument copies
-    for (int i = 0; i < valid_chr_count; i++) 
-        if (thread_args_copies[i]) 
+    for (int i = 0; i < valid_chr_count; i++)
+        if (thread_args_copies[i])
         {
             free(thread_args_copies[i]->chr_seq);
             free(thread_args_copies[i]->chr);
@@ -2058,7 +1531,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < valid_chr_count; i++)
     {
         free(thread_args[i].chr_seq);
-        free(thread_args[i].chr);  // Free the copied chromosome name
+        free(thread_args[i].chr); // Free the copied chromosome name
     }
     free(threads);
     free(thread_args);
