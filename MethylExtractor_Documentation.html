@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MethylExtractor Documentation</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f8f9fa;
+        }
+        .header {
+            text-align: center;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px 20px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 3em;
+            font-weight: 300;
+        }
+        .header p {
+            margin: 10px 0 0 0;
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+        .section {
+            background: white;
+            padding: 30px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .section h2 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+            margin-top: 0;
+        }
+        .section h3 {
+            color: #34495e;
+            margin-top: 25px;
+        }
+        .code-block {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 4px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            margin: 15px 0;
+            overflow-x: auto;
+        }
+        .command {
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            margin: 15px 0;
+        }
+        .parameter-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        .parameter-table th, .parameter-table td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+        }
+        .parameter-table th {
+            background-color: #f8f9fa;
+            font-weight: 600;
+            color: #2c3e50;
+        }
+        .parameter-table tr:nth-child(even) {
+            background-color: #f8f9fa;
+        }
+        .highlight {
+            background-color: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            margin: 15px 0;
+        }
+        .important {
+            background-color: #f8d7da;
+            border-left: 4px solid #dc3545;
+            padding: 15px;
+            margin: 15px 0;
+        }
+        .info {
+            background-color: #d1ecf1;
+            border-left: 4px solid #17a2b8;
+            padding: 15px;
+            margin: 15px 0;
+        }
+        .feature-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .feature-item {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #3498db;
+        }
+        .feature-item h4 {
+            margin: 0 0 10px 0;
+            color: #2c3e50;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            padding: 20px;
+            color: #6c757d;
+            border-top: 1px solid #dee2e6;
+        }
+        .navigation {
+            background: #343a40;
+            color: white;
+            padding: 10px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            margin: -20px -20px 20px -20px;
+        }
+        .nav-links {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+        }
+        .nav-links a {
+            color: #adb5bd;
+            text-decoration: none;
+            padding: 5px 10px;
+            border-radius: 4px;
+            transition: all 0.3s;
+        }
+        .nav-links a:hover {
+            color: white;
+            background: #495057;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="navigation">
+        <div class="nav-links">
+            <a href="#overview">Overview</a>
+            <a href="#installation">Installation</a>
+            <a href="#usage">Usage</a>
+            <a href="#features">Features</a>
+            <a href="#output">Output</a>
+            <a href="#examples">Examples</a>
+            <a href="#performance">Performance</a>
+        </div>
+    </div>
+
+    <div class="header">
+        <h1>MethylExtractor</h1>
+        <p>High-performance DNA methylation analysis from bisulfite sequencing data</p>
+    </div>
+
+    <div id="overview" class="section">
+        <h2>Overview</h2>
+        <p><strong>MethylExtractor</strong> is a high-performance tool for extracting DNA methylation data from bisulfite sequencing BAM files. It analyzes methylation patterns at CpG, CHG, and CHH sites, providing comprehensive methylation analysis with advanced features for quality control and overlapping read handling.</p>
+
+        <p>The tool processes aligned bisulfite sequencing data to identify methylated and unmethylated cytosines across different genomic contexts, producing detailed methylation statistics and coverage information.</p>
+
+        <div class="highlight">
+            <strong>Key Benefits:</strong>
+            <ul>
+                <li>⚡ High-performance multi-threaded processing</li>
+                <li>🔬 Advanced overlapping read pair handling</li>
+                <li>📊 Comprehensive quality filtering and control</li>
+                <li>💾 Flexible output formats (HDF5, text, or both)</li>
+                <li>🎯 Deterministic results regardless of thread count</li>
+            </ul>
+        </div>
+    </div>
+
+    <div id="installation" class="section">
+        <h2>Installation</h2>
+
+        <h3>Prerequisites</h3>
+        <p>MethylExtractor requires the following system dependencies:</p>
+        <ul>
+            <li>HTSlib (for BAM/SAM file handling)</li>
+            <li>HDF5 (for binary output format)</li>
+            <li>Zlib, Bzip2, LZMA, and other compression libraries</li>
+            <li>GCC compiler with OpenMP support</li>
+        </ul>
+
+        <h3>Building from Source</h3>
+        <div class="code-block">
+git clone &lt;repository-url&gt;
+cd MethylExtractor
+make
+        </div>
+
+        <p>The Makefile will automatically download and install required system dependencies, then compile the program optimized for your architecture.</p>
+
+        <h3>Verification</h3>
+        <p>After successful compilation, verify the installation:</p>
+        <div class="command">
+./build/dynamic/arm64/MethylExtractor --help
+        </div>
+
+        <div class="info">
+            <strong>Note:</strong> The binary will be located in <code>build/dynamic/arm64/</code> (or <code>build/dynamic/x64/</code> on x86 systems).
+        </div>
+    </div>
+
+    <div id="usage" class="section">
+        <h2>Usage</h2>
+
+        <h3>Basic Syntax</h3>
+        <div class="command">
+MethylExtractor [options] &lt;input.bam&gt; &lt;output_directory&gt; [reference.fa]
+        </div>
+
+        <h3>Command-Line Options</h3>
+
+        <table class="parameter-table">
+            <thead>
+                <tr>
+                    <th>Option</th>
+                    <th>Description</th>
+                    <th>Default</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><code>-h, --help</code></td>
+                    <td>Show help message and exit</td>
+                    <td>N/A</td>
+                </tr>
+                <tr>
+                    <td><code>-t, --threads INT</code></td>
+                    <td>Number of threads for processing</td>
+                    <td>16</td>
+                </tr>
+                <tr>
+                    <td><code>-q, --min-mapq INT</code></td>
+                    <td>Minimum mapping quality (MAPQ)</td>
+                    <td>30</td>
+                </tr>
+                <tr>
+                    <td><code>-p, --min-phred INT</code></td>
+                    <td>Minimum base quality (Phred score)</td>
+                    <td>20</td>
+                </tr>
+                <tr>
+                    <td><code>-c, --min-cov INT</code></td>
+                    <td>Minimum coverage threshold</td>
+                    <td>4</td>
+                </tr>
+                <tr>
+                    <td><code>-C, --cap-cov INT</code></td>
+                    <td>Cap coverage to this value (0 = disabled)</td>
+                    <td>0</td>
+                </tr>
+                <tr>
+                    <td><code>-G, --CHG</code></td>
+                    <td>Include CHG methylation contexts</td>
+                    <td>Disabled</td>
+                </tr>
+                <tr>
+                    <td><code>-H, --CHH</code></td>
+                    <td>Include CHH methylation contexts</td>
+                    <td>Disabled</td>
+                </tr>
+                <tr>
+                    <td><code>-m, --chrom-mapping FILE</code></td>
+                    <td>Chromosome mapping configuration file</td>
+                    <td>chrom_mapping.json</td>
+                </tr>
+                <tr>
+                    <td><code>-z, --compression INT</code></td>
+                    <td>HDF5 compression level (0-9)</td>
+                    <td>6</td>
+                </tr>
+                <tr>
+                    <td><code>-k, --chunk-size INT</code></td>
+                    <td>HDF5 chunk size for I/O optimization</td>
+                    <td>1,000,000</td>
+                </tr>
+                <tr>
+                    <td><code>-f, --output-format STR</code></td>
+                    <td>Output format: hdf5, txt, or both</td>
+                    <td>hdf5</td>
+                </tr>
+                <tr>
+                    <td><code>-s, --split</code></td>
+                    <td>Split output by methylation context</td>
+                    <td>Disabled</td>
+                </tr>
+                <tr>
+                    <td><code>-o, --output-dir DIR</code></td>
+                    <td>Output directory (overrides positional argument)</td>
+                    <td>N/A</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>Chromosome Mapping File</h3>
+        <p>The chromosome mapping file (<code>chrom_mapping.json</code>) defines which chromosomes to process and their corresponding reference sequences:</p>
+
+        <div class="code-block">
+{
+  "reference": "/path/to/genome.fa",
+  "chromosomes": [
+    {
+      "name": "chr1",
+      "fasta": "chr1",
+      "bam": "chr1",
+      "extract": true
+    },
+    {
+      "name": "chr2",
+      "fasta": "chr2",
+      "bam": "chr2",
+      "extract": true
+    }
+  ]
+}
+        </div>
+
+        <div class="info">
+            <strong>Tip:</strong> If no chromosome mapping file is provided, MethylExtractor will look for <code>chrom_mapping.json</code> in the same directory as the input BAM file.
+        </div>
+    </div>
+
+    <div id="features" class="section">
+        <h2>Key Features</h2>
+
+        <div class="feature-list">
+            <div class="feature-item">
+                <h4>🔬 Advanced Read Processing</h4>
+                <ul>
+                    <li>Proper handling of overlapping paired-end reads</li>
+                    <li>Quality-based filtering at both read and base levels</li>
+                    <li>Comprehensive duplicate and multimapper filtering</li>
+                    <li>Bisulfite conversion pattern validation</li>
+                </ul>
+            </div>
+
+            <div class="feature-item">
+                <h4>⚡ High Performance</h4>
+                <ul>
+                    <li>Multi-threaded processing with deterministic results</li>
+                    <li>Memory-efficient streaming I/O</li>
+                    <li>HDF5 compression for compact storage</li>
+                    <li>Optimized for large-scale bisulfite sequencing datasets</li>
+                </ul>
+            </div>
+
+            <div class="feature-item">
+                <h4>📊 Comprehensive Analysis</h4>
+                <ul>
+                    <li>CpG, CHG, and CHH methylation contexts</li>
+                    <li>Per-position methylation statistics</li>
+                    <li>Coverage normalization and capping</li>
+                    <li>Strand-specific methylation analysis</li>
+                </ul>
+            </div>
+
+            <div class="feature-item">
+                <h4>💾 Flexible Output</h4>
+                <ul>
+                    <li>HDF5 format for efficient storage and analysis</li>
+                    <li>Human-readable text format</li>
+                    <li>Context-specific output splitting</li>
+                    <li>Comprehensive statistics reporting</li>
+                </ul>
+            </div>
+        </div>
+
+        <h3>Quality Control Features</h3>
+        <div class="important">
+            <strong>MethylExtractor implements rigorous quality control:</strong>
+            <ul>
+                <li>Reads with MAPQ &lt; 30 are filtered out</li>
+                <li>Bases with Phred quality &lt; 20 are excluded</li>
+                <li>PCR duplicates and secondary alignments are removed</li>
+                <li>Overlapping read pairs are properly handled to prevent double-counting</li>
+                <li>Bisulfite conversion patterns are validated</li>
+            </ul>
+        </div>
+    </div>
+
+    <div id="output" class="section">
+        <h2>Output Formats</h2>
+
+        <h3>HDF5 Format (Default)</h3>
+        <p>The HDF5 output provides efficient storage and fast random access to methylation data:</p>
+
+        <div class="code-block">
+Dataset: methylation_data
+├── pos (uint32) - Genomic position (1-based)
+├── mC (uint16) - Methylated cytosine count
+├── uC (uint16) - Unmethylated cytosine count
+└── tnc (uint8) - Trinucleotide context and strand information
+        </div>
+
+        <h3>Text Format</h3>
+        <p>Human-readable tab-separated format:</p>
+        <div class="code-block">
+# Format: position strand methylated_count unmethylated_count context trinucleotide
+161     +       11      9       CG      CGT
+310     -       8       12      CG      CGA
+...
+        </div>
+
+        <h3>Output Files</h3>
+        <table class="parameter-table">
+            <thead>
+                <tr>
+                    <th>Option</th>
+                    <th>Output Files</th>
+                    <th>Description</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><code>-f hdf5</code></td>
+                    <td><code>chr1.h5</code>, <code>chr2.h5</code>, ...</td>
+                    <td>HDF5 files per chromosome</td>
+                </tr>
+                <tr>
+                    <td><code>-f txt</code></td>
+                    <td><code>chr1.txt</code>, <code>chr2.txt</code>, ...</td>
+                    <td>Text files per chromosome</td>
+                </tr>
+                <tr>
+                    <td><code>-f both</code></td>
+                    <td>Both HDF5 and text files</td>
+                    <td>Combined output formats</td>
+                </tr>
+                <tr>
+                    <td><code>-s --split</code></td>
+                    <td><code>chr1.CG.h5</code>, <code>chr1.CHG.h5</code>, ...</td>
+                    <td>Separate files per context</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>Statistics Output</h3>
+        <p>Each output includes a JSON statistics file with genome-wide methylation metrics:</p>
+        <div class="code-block">
+{
+  "num_positions": 1345382,
+  "total_methylated": 5084976,
+  "total_unmethylated": 18665653,
+  "avg_methylation_level": 0.214,
+  "avg_coverage": 17.65
+}
+        </div>
+    </div>
+
+    <div id="examples" class="section">
+        <h2>Examples</h2>
+
+        <h3>Basic Usage</h3>
+        <div class="code-block">
+# Process a single BAM file with default settings
+./MethylExtractor input.bam output_dir reference.fa
+        </div>
+
+        <h3>High-Quality Analysis</h3>
+        <div class="code-block">
+# Strict quality filtering, multi-threading, all contexts
+./MethylExtractor \
+    -t 16 \
+    -q 30 \
+    -p 20 \
+    -c 4 \
+    -G \
+    -H \
+    -f both \
+    -s \
+    input.bam \
+    output_dir \
+    reference.fa
+        </div>
+
+        <h3>Production Pipeline</h3>
+        <div class="code-block">
+# Optimized for production use
+./MethylExtractor \
+    --threads 32 \
+    --min-mapq 30 \
+    --min-phred 20 \
+    --min-cov 5 \
+    --cap-cov 100 \
+    --CHG \
+    --CHH \
+    --output-format hdf5 \
+    --split \
+    --compression 9 \
+    sample.bam \
+    results/ \
+    genome.fa
+        </div>
+
+        <h3>Custom Chromosome Processing</h3>
+        <div class="code-block">
+# Use custom chromosome mapping
+./MethylExtractor \
+    -m custom_chromosomes.json \
+    -t 8 \
+    input.bam \
+    output_dir
+        </div>
+
+        <h3>Quick Analysis</h3>
+        <div class="code-block">
+# Fast analysis with relaxed filtering
+./MethylExtractor \
+    -t 4 \
+    -q 20 \
+    -p 15 \
+    -c 1 \
+    -f txt \
+    input.bam \
+    output_dir \
+    reference.fa
+        </div>
+    </div>
+
+    <div id="performance" class="section">
+        <h2>Performance & Best Practices</h2>
+
+        <h3>Threading Guidelines</h3>
+        <div class="info">
+            <strong>Recommended thread counts:</strong>
+            <ul>
+                <li><strong>Small datasets (&lt; 10GB BAM):</strong> 4-8 threads</li>
+                <li><strong>Medium datasets (10-50GB BAM):</strong> 8-16 threads</li>
+                <li><strong>Large datasets (&gt; 50GB BAM):</strong> 16-32 threads</li>
+                <li><strong>Very large datasets:</strong> 32+ threads</li>
+            </ul>
+        </div>
+
+        <h3>Quality Filtering Recommendations</h3>
+        <table class="parameter-table">
+            <thead>
+                <tr>
+                    <th>Parameter</th>
+                    <th>Conservative</th>
+                    <th>Standard</th>
+                    <th>Relaxed</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><code>--min-mapq</code></td>
+                    <td>30</td>
+                    <td>20</td>
+                    <td>10</td>
+                </tr>
+                <tr>
+                    <td><code>--min-phred</code></td>
+                    <td>25</td>
+                    <td>20</td>
+                    <td>15</td>
+                </tr>
+                <tr>
+                    <td><code>--min-cov</code></td>
+                    <td>5</td>
+                    <td>4</td>
+                    <td>1</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>Memory Usage</h3>
+        <p>MethylExtractor is designed for memory efficiency:</p>
+        <ul>
+            <li>Streaming I/O prevents loading entire BAM files into memory</li>
+            <li>Per-chromosome processing with configurable chunk sizes</li>
+            <li>HDF5 chunked storage for optimal I/O performance</li>
+            <li>Memory usage scales with chromosome size, not genome size</li>
+        </ul>
+
+        <h3>Coverage Capping</h3>
+        <div class="highlight">
+            <strong>Use coverage capping (<code>-C</code>) for:</strong>
+            <ul>
+                <li>PCR amplification bias correction</li>
+                <li>Normalization across samples with varying coverage</li>
+                <li>Reducing the impact of copy number variations</li>
+            </ul>
+        </div>
+
+        <h3>Troubleshooting</h3>
+
+        <h4>Common Issues</h4>
+        <dl>
+            <dt>High memory usage</dt>
+            <dd>Reduce thread count or process fewer chromosomes simultaneously</dd>
+
+            <dt>Slow processing</dt>
+            <dd>Check I/O performance, consider SSD storage for large datasets</dd>
+
+            <dt>Empty output files</dt>
+            <dd>Check chromosome mapping file, verify BAM headers match reference</dd>
+
+            <dt>Low methylation levels</dt>
+            <dd>Verify bisulfite conversion efficiency, check quality filtering parameters</dd>
+        </dl>
+
+        <h4>Performance Optimization</h4>
+        <ul>
+            <li>Use SSD storage for both input BAM files and output directories</li>
+            <li>Adjust chunk size (<code>-k</code>) based on chromosome sizes</li>
+            <li>Use appropriate compression levels (<code>-z</code>) for I/O balance</li>
+            <li>Consider processing large chromosomes separately for better memory management</li>
+        </ul>
+    </div>
+
+    <div class="footer">
+        <p><strong>MethylExtractor</strong> - High-performance DNA methylation analysis tool</p>
+        <p>Built with HTSlib and HDF5 for reliable bisulfite sequencing analysis</p>
+        <p>&copy; 2024 - Advanced methylation analysis made efficient</p>
+    </div>
+
+</body>
+</html>
