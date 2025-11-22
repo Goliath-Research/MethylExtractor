@@ -24,7 +24,7 @@
 #define DEFAULT_MIN_MAPQ 30
 #define DEFAULT_MIN_PHRED 20
 #define DEFAULT_MIN_COV 4
-#define DEFAULT_CAP_COVERAGE 1
+#define DEFAULT_CAP_COVERAGE 0
 #define DEFAULT_FLAGS (BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY)
 
 #define TNC_A 0
@@ -527,13 +527,13 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records
     size_t j = 0;
     for (size_t i = 0; i < n_records; i++)
     {
-        int total = buffer[i].mC + buffer[i].uC;
-        if (total >= min_cov)
+        int coverage = buffer[i].mC + buffer[i].uC;
+        if (coverage >= min_cov)
         {
             // Only cap coverage if enabled
-            if (cap_cov && total > avg_cov)
+            if (cap_cov && coverage > avg_cov)
             {
-                double prop = (double)buffer[i].mC / total;
+                double prop = (double)buffer[i].mC / coverage;
                 buffer[i].mC = (uint16_t)round((avg_cov * prop));
                 buffer[i].uC = (uint16_t)(avg_cov - buffer[i].mC);
             }
@@ -1128,7 +1128,7 @@ int main(int argc, char *argv[])
     int min_mapq = DEFAULT_MIN_MAPQ;
     int min_phred = DEFAULT_MIN_PHRED;
     int min_cov = DEFAULT_MIN_COV;
-    int cap_cov = 0;                          // Default to 0 (no capping)
+    int cap_cov = DEFAULT_CAP_COVERAGE;
     OutputFormat output_format = OUTPUT_HDF5; // Default to HDF5 output
     const char *out_dir = NULL;
     int split_context_files = 0;
@@ -1193,9 +1193,7 @@ int main(int argc, char *argv[])
             }
             break;
         case 'C':
-            fprintf(stderr, "DEBUG: Hit 'C' case with optarg: %s\n", optarg ? optarg : "(null)");
             cap_cov = atoi(optarg);
-            fprintf(stderr, "DEBUG: cap_cov = %d\n", cap_cov);
             if (cap_cov < 0)
             {
                 fprintf(stderr, "Cap coverage must be non-negative\n");
