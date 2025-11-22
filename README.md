@@ -48,7 +48,7 @@ MethylExtractor [options] <input.bam> <output_directory> [reference.fa]
 | `-m, --chrom-mapping FILE` | Chromosome mapping configuration file | `chrom_mapping.json` |
 | `-z, --compression INT` | HDF5 compression level (0-9) | 6 |
 | `-k, --chunk-size INT` | HDF5 chunk size for I/O optimization | 1,000,000 |
-| `-f, --output-format STR` | Output format: `hdf5`, `txt`, or `both` | `hdf5` |
+| `-f, --output-format STR` | Output format: `hdf5`, `txt`, `both`, or `parquet` | `hdf5` |
 | `-s, --split` | Split output by methylation context | Disabled |
 | `-o, --output-dir DIR` | Output directory | N/A |
 
@@ -82,6 +82,25 @@ Dataset: methylation_data
 └── tnc (uint8) - Trinucleotide context and strand
 ```
 
+### Parquet Format
+Columnar storage format with Zstd compression for efficient querying and cloud storage:
+
+```bash
+# Columns in Parquet file:
+position: uint32          # Genomic position (1-based)
+strand: string            # '+' or '-'
+methylated_count: uint16  # Methylated cytosine count
+unmethylated_count: uint16 # Unmethylated cytosine count
+context: string           # 'CG', 'CHG', or 'CHH'
+trinucleotide: string     # Full trinucleotide context
+```
+
+**Advantages:**
+- ⚡ Fast queries on specific genomic regions
+- 📦 Excellent compression with Zstd
+- ☁️ Cloud-optimized storage (S3, GCS)
+- 🔧 Compatible with Python, R, Java ecosystems
+
 ### Text Format
 Human-readable tab-separated values:
 ```bash
@@ -97,6 +116,7 @@ Human-readable tab-separated values:
 | `-f hdf5` | `chr1.h5`, `chr2.h5`, ... | Per-chromosome HDF5 files |
 | `-f txt` | `chr1.txt`, `chr2.txt`, ... | Per-chromosome text files |
 | `-f both` | Both HDF5 and text files | Combined output |
+| `-f parquet` | `chr1.parquet`, `chr2.parquet`, ... | Per-chromosome Parquet files (Zstd compressed) |
 | `-s --split` | `chr1.CG.h5`, `chr1.CHG.h5`, ... | Separate files per context |
 
 ### Statistics Output

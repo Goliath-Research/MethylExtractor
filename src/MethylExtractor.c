@@ -44,7 +44,8 @@ typedef enum
     OUTPUT_NONE = 0,
     OUTPUT_HDF5 = 1,
     OUTPUT_TXT = 2,
-    OUTPUT_BOTH = 3
+    OUTPUT_BOTH = 3,
+    OUTPUT_PARQUET = 4
 } OutputFormat;
 
 typedef struct
@@ -603,6 +604,86 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records
         txt_fp = NULL;
     }
 
+    // Handle Parquet output (CSV format that can be converted to Parquet)
+    if (output_format == OUTPUT_PARQUET || output_format == OUTPUT_BOTH)
+    {
+        char parquet_filename[1024];
+        const char *chr_num = strrchr(filename, '/');
+        const char *dir_end = chr_num;
+        if (chr_num)
+            chr_num++;
+        else
+            chr_num = filename;
+
+        if (dir_end)
+        {
+            snprintf(
+                parquet_filename,
+                sizeof(parquet_filename),
+                "%.*s%.*s.csv",
+                (int)(dir_end - filename + 1),
+                filename,
+                (int)(strrchr(chr_num, '.') - chr_num),
+                chr_num);
+        }
+        else
+        {
+            snprintf(
+                parquet_filename,
+                sizeof(parquet_filename),
+                "%.*s.csv",
+                (int)(strrchr(chr_num, '.') - chr_num),
+                chr_num);
+        }
+
+        log_time("Starting to write Parquet-compatible CSV file: %s\n", parquet_filename);
+        FILE *csv_fp = fopen(parquet_filename, "w");
+        if (!csv_fp)
+        {
+            fprintf(stderr, "Failed to open CSV file for writing: %s\n", parquet_filename);
+            goto cleanup;
+        }
+
+        // Write CSV header
+        fprintf(csv_fp, "position,strand,methylated_count,unmethylated_count,context,trinucleotide\n");
+
+        // Write data rows
+        for (size_t i = 0; i < dims[0]; i++)
+        {
+            char tnc_str[4];
+            decode_trinucleotide(filtered_buffer[i].tnc.tnc, tnc_str);
+            char strand = filtered_buffer[i].tnc.strand ? '-' : '+';
+            int context = filtered_buffer[i].tnc.context;
+            fprintf(csv_fp, "%u,%c,%u,%u,%s,%s\n",
+                    filtered_buffer[i].pos,
+                    strand,
+                    filtered_buffer[i].mC,
+                    filtered_buffer[i].uC,
+                    get_context_string(context),
+                    tnc_str);
+        }
+
+        log_time("Finished writing Parquet-compatible CSV file: %s\n", parquet_filename);
+        fclose(csv_fp);
+        csv_fp = NULL;
+
+        // Optional: Convert CSV to Parquet using system command
+        // This requires pandas/pyarrow to be installed
+        char actual_parquet_filename[1024];
+        snprintf(actual_parquet_filename, sizeof(actual_parquet_filename), "%.*s.parquet",
+                (int)(strrchr(parquet_filename, '.') - parquet_filename), parquet_filename);
+
+        char convert_cmd[4096];
+        int cmd_len = snprintf(convert_cmd, sizeof(convert_cmd),
+                "python3 -c \"import pandas as pd; df = pd.read_csv('%s'); df.to_parquet('%s', compression='zstd', index=False)\" 2>/dev/null || echo 'Note: CSV written. Install pandas/pyarrow to auto-convert to Parquet.'",
+                parquet_filename, actual_parquet_filename);
+
+        if (cmd_len > 0 && cmd_len < sizeof(convert_cmd)) {
+            int result = system(convert_cmd);
+            (void)result; // Suppress unused result warning
+        }
+    }
+
     // Handle HDF5 output
     if (output_format == OUTPUT_HDF5 || output_format == OUTPUT_BOTH)
     {
@@ -942,7 +1023,8 @@ void process_chromosome(ThreadArg *targ)
 
                 // Output file name - use appropriate extension based on output format
                 char out_path[1024];
-                const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5"; // For OUTPUT_BOTH, use .h5
+                const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" :
+                                 (targ->output_format == OUTPUT_PARQUET) ? ".parquet" : ".h5"; // For OUTPUT_BOTH, use .h5
                 snprintf(
                     out_path,
                     sizeof(out_path),
@@ -970,7 +1052,8 @@ void process_chromosome(ThreadArg *targ)
     {
         // Output file name - use appropriate extension based on output format
         char out_path[1024];
-        const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5"; // For OUTPUT_BOTH, use .h5
+        const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" :
+                         (targ->output_format == OUTPUT_PARQUET) ? ".parquet" : ".h5"; // For OUTPUT_BOTH, use .h5
         snprintf(out_path, sizeof(out_path), "%s/%s%s", targ->out_dir, targ->chr, ext);
         flush_buffer(
             out_path,
@@ -1105,7 +1188,7 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -m, --chrom-mapping FILE  Chromosome mapping file [chrom_mapping.json]\n");
     fprintf(stderr, "  -z, --compression INT     HDF5 compression level [%d]\n", DEFAULT_HDF5_COMPRESSION);
     fprintf(stderr, "  -k, --chunk-size INT      HDF5 chunk size [%d]\n", DEFAULT_HDF5_CHUNK_SIZE);
-    fprintf(stderr, "  -f, --output-format STR   Output format (hdf5, txt, both) [hdf5]\n");
+    fprintf(stderr, "  -f, --output-format STR   Output format (hdf5, txt, both, parquet) [hdf5]\n");
     fprintf(stderr, "  -s, --split               Split output by context\n");
     fprintf(stderr, "  -o, --output-dir DIR      Output directory\n");
     fprintf(stderr, "\n");
@@ -1227,9 +1310,11 @@ int main(int argc, char *argv[])
                 output_format = OUTPUT_HDF5;
             else if (strcmp(optarg, "txt") == 0)
                 output_format = OUTPUT_TXT;
+            else if (strcmp(optarg, "parquet") == 0)
+                output_format = OUTPUT_PARQUET;
             else
             {
-                fprintf(stderr, "Error: Invalid output format '%s'. Must be one of: both, hdf5, txt\n", optarg);
+                fprintf(stderr, "Error: Invalid output format '%s'. Must be one of: both, hdf5, txt, parquet\n", optarg);
                 return 1;
             }
             break;

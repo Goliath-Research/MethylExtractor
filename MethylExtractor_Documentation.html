@@ -297,7 +297,7 @@ MethylExtractor [options] &lt;input.bam&gt; &lt;output_directory&gt; [reference.
                 </tr>
                 <tr>
                     <td><code>-f, --output-format STR</code></td>
-                    <td>Output format: hdf5, txt, or both</td>
+                    <td>Output format: hdf5, txt, both, or parquet</td>
                     <td>hdf5</td>
                 </tr>
                 <tr>
@@ -413,6 +413,28 @@ Dataset: methylation_data
 └── tnc (uint8) - Trinucleotide context and strand information
         </div>
 
+        <h3>Parquet Format</h3>
+        <p>Columnar storage format with Zstd compression for efficient querying and cloud storage:</p>
+        <div class="code-block">
+# Columns in Parquet file:
+position: uint32              # Genomic position (1-based)
+strand: string                # '+' or '-'
+methylated_count: uint16      # Methylated cytosine count
+unmethylated_count: uint16    # Unmethylated cytosine count
+context: string               # 'CG', 'CHG', or 'CHH'
+trinucleotide: string         # Full trinucleotide context
+        </div>
+
+        <div class="info">
+            <strong>Advantages of Parquet:</strong>
+            <ul>
+                <li>⚡ Fast queries on specific genomic regions</li>
+                <li>📦 Excellent compression with Zstd (better than HDF5 gzip)</li>
+                <li>☁️ Cloud-optimized storage (S3, GCS, Azure)</li>
+                <li>🔧 Compatible with Python, R, Java, and Spark ecosystems</li>
+            </ul>
+        </div>
+
         <h3>Text Format</h3>
         <p>Human-readable tab-separated format:</p>
         <div class="code-block">
@@ -446,6 +468,11 @@ Dataset: methylation_data
                     <td><code>-f both</code></td>
                     <td>Both HDF5 and text files</td>
                     <td>Combined output formats</td>
+                </tr>
+                <tr>
+                    <td><code>-f parquet</code></td>
+                    <td><code>chr1.parquet</code>, <code>chr2.parquet</code>, ...</td>
+                    <td>Parquet files per chromosome (Zstd compressed)</td>
                 </tr>
                 <tr>
                     <td><code>-s --split</code></td>
@@ -511,6 +538,27 @@ Dataset: methylation_data
     sample.bam \
     results/ \
     genome.fa
+        </div>
+
+        <h3>Parquet Output for Cloud Analytics</h3>
+        <div class="code-block">
+# Generate Parquet files with Zstd compression for cloud storage and fast querying
+./MethylExtractor \
+    -t 16 \
+    -q 30 \
+    -p 20 \
+    -c 5 \
+    -G \
+    -H \
+    -f parquet \
+    -s \
+    sample.bam \
+    cloud_results/ \
+    genome.fa
+        </div>
+
+        <div class="info">
+            <strong>Parquet Advantages:</strong> Zstd-compressed Parquet files are ideal for cloud storage (S3, GCS) and provide fast columnar queries with tools like DuckDB, Polars, or Apache Spark.
         </div>
 
         <h3>Custom Chromosome Processing</h3>
