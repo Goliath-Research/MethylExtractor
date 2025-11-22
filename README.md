@@ -46,7 +46,7 @@ MethylExtractor [options] <input.bam> <output_directory> [reference.fa]
 | `-G, --CHG` | Include CHG methylation contexts | Disabled |
 | `-H, --CHH` | Include CHH methylation contexts | Disabled |
 | `-m, --chrom-mapping FILE` | Chromosome mapping configuration file | `chrom_mapping.json` |
-| `-z, --compression INT` | HDF5 compression level (0-9) | 6 |
+| `-z, --compression INT` | Compression level for HDF5/Parquet (0-9) | 6 |
 | `-k, --chunk-size INT` | HDF5 chunk size for I/O optimization | 1,000,000 |
 | `-f, --output-format STR` | Output format: `hdf5`, `txt`, `both`, or `parquet` | `hdf5` |
 | `-s, --split` | Split output by methylation context | Disabled |

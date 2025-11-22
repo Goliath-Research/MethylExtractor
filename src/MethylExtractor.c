@@ -86,7 +86,7 @@ typedef struct
     int cap_cov;
     int keep_chg;
     int keep_chh;
-    int hdf5_compression;
+    int compression;
     int hdf5_chunk_size;
     uint32_t chunk_size;
     uint32_t start_pos;
@@ -1037,7 +1037,7 @@ void process_chromosome(ThreadArg *targ)
                     out_path,
                     ctx_buffer,
                     n_ctx_records,
-                    targ->hdf5_compression,
+                    targ->compression,
                     targ->hdf5_chunk_size,
                     0,
                     targ->min_cov,
@@ -1059,7 +1059,7 @@ void process_chromosome(ThreadArg *targ)
             out_path,
             buffer,
             site_count,
-            targ->hdf5_compression,
+            targ->compression,
             targ->hdf5_chunk_size,
             0,
             targ->min_cov,
@@ -1186,7 +1186,7 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -G, --CHG                 Process CHG context\n");
     fprintf(stderr, "  -H, --CHH                 Process CHH context\n");
     fprintf(stderr, "  -m, --chrom-mapping FILE  Chromosome mapping file [chrom_mapping.json]\n");
-    fprintf(stderr, "  -z, --compression INT     HDF5 compression level [%d]\n", DEFAULT_HDF5_COMPRESSION);
+    fprintf(stderr, "  -z, --compression INT     Compression level for HDF5/Parquet [%d]\n", DEFAULT_HDF5_COMPRESSION);
     fprintf(stderr, "  -k, --chunk-size INT      HDF5 chunk size [%d]\n", DEFAULT_HDF5_CHUNK_SIZE);
     fprintf(stderr, "  -f, --output-format STR   Output format (hdf5, txt, both, parquet) [hdf5]\n");
     fprintf(stderr, "  -s, --split               Split output by context\n");
@@ -1202,7 +1202,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < argc; i++)
         fprintf(stderr, "  Arg %d: %s\n", i, argv[i]);
 
-    int hdf5_compression = DEFAULT_HDF5_COMPRESSION;
+    int compression = DEFAULT_HDF5_COMPRESSION;
     int hdf5_chunk_size = DEFAULT_HDF5_CHUNK_SIZE;
     uint32_t chunk_size = DEFAULT_CHUNK_SIZE;
     int num_threads = DEFAULT_THREADS;
@@ -1293,7 +1293,7 @@ int main(int argc, char *argv[])
             chrom_mapping_file = optarg;
             break;
         case 'z':
-            hdf5_compression = atoi(optarg);
+            compression = atoi(optarg);
             break;
         case 'k':
             hdf5_chunk_size = atoi(optarg);
@@ -1492,7 +1492,7 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].cap_cov = cap_cov;
         thread_args[valid_chr_count].keep_chg = keep_chg;
         thread_args[valid_chr_count].keep_chh = keep_chh;
-        thread_args[valid_chr_count].hdf5_compression = hdf5_compression;
+        thread_args[valid_chr_count].compression = compression;
         thread_args[valid_chr_count].hdf5_chunk_size = hdf5_chunk_size;
         thread_args[valid_chr_count].chunk_size = chunk_size;
         thread_args[valid_chr_count].chr_seq = seq;
@@ -1563,7 +1563,7 @@ int main(int argc, char *argv[])
         thread_args_copies[i]->cap_cov = thread_args[i].cap_cov;
         thread_args_copies[i]->keep_chg = thread_args[i].keep_chg;
         thread_args_copies[i]->keep_chh = thread_args[i].keep_chh;
-        thread_args_copies[i]->hdf5_compression = thread_args[i].hdf5_compression;
+        thread_args_copies[i]->compression = thread_args[i].compression;
         thread_args_copies[i]->hdf5_chunk_size = thread_args[i].hdf5_chunk_size;
         thread_args_copies[i]->chunk_size = thread_args[i].chunk_size;
         thread_args_copies[i]->output_format = thread_args[i].output_format;
