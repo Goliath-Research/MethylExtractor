@@ -13,8 +13,8 @@ else
 endif
 
 CC = gcc
-CFLAGS = -O2 -Wall -Iinclude -I/usr/include/hdf5 -I/usr/include/htslib -I/usr/include
-DEBUG_CFLAGS = -g -O0 -Wall -Iinclude -I/usr/include/hdf5 -I/usr/include/htslib -I/usr/include -DDEBUG
+CFLAGS = -O2 -Wall -Iinclude -Iinclude/cjson -I/usr/include/hdf5 -I/usr/include/htslib -I/usr/include
+DEBUG_CFLAGS = -g -O0 -Wall -Iinclude -Iinclude/cjson -I/usr/include/hdf5 -I/usr/include/htslib -I/usr/include -DDEBUG
 LDFLAGS = -Llib -L/usr/lib/$(ARCH_NAME)-linux-gnu
 
 # Dependencies
@@ -33,6 +33,9 @@ STATIC_DIR = build/static/$(ARCH_NAME)
 DYNAMIC_DIR = build/dynamic/$(ARCH_NAME)
 DEBUG_DIR = build/debug/$(ARCH_NAME)
 
+# Source files
+SRCS = src/main.c src/bam_processing.c src/output_formats.c src/utils.c src/cjson/cJSON.c
+
 # Targets
 all: deps dynamic
 
@@ -48,7 +51,8 @@ deps:
 		liblzma-dev \
 		libcurl4-gnutls-dev \
 		libssl-dev \
-		libzstd-dev
+		libzstd-dev \
+		zstd
 	@echo "Dependencies installed successfully"
 
 # Note: Static linking is challenging due to missing static libraries for HTSlib and HDF5 dependencies
@@ -60,17 +64,17 @@ dynamic: $(DYNAMIC_DIR)/MethylExtractor
 
 debug: $(DEBUG_DIR)/MethylExtractor
 
-$(STATIC_DIR)/MethylExtractor: src/MethylExtractor.c
+$(STATIC_DIR)/MethylExtractor: $(SRCS)
 	mkdir -p $(STATIC_DIR)
-	$(CC) $(CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_LIB_PATH) $(HTSLIB_LIBS) $(HDF5_LIBS) $(STATIC_LIBS) -static
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_LIB_PATH) $(HTSLIB_LIBS) $(HDF5_LIBS) $(STATIC_LIBS) -static
 
-$(DYNAMIC_DIR)/MethylExtractor: src/MethylExtractor.c
+$(DYNAMIC_DIR)/MethylExtractor: $(SRCS)
 	mkdir -p $(DYNAMIC_DIR)
-	$(CC) $(CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_LIB_PATH) $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_LIB_PATH) $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
 
-$(DEBUG_DIR)/MethylExtractor: src/MethylExtractor.c
+$(DEBUG_DIR)/MethylExtractor: $(SRCS)
 	mkdir -p $(DEBUG_DIR)
-	$(CC) $(DEBUG_CFLAGS) -o $@ $^ src/cjson/cJSON.c $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_LIB_PATH) $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
+	$(CC) $(DEBUG_CFLAGS) -o $@ $^ $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_LIB_PATH) $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
 
 install: dynamic
 	sudo cp $(DYNAMIC_DIR)/MethylExtractor /usr/local/bin/
@@ -79,4 +83,4 @@ install: dynamic
 clean:
 	rm -rf build
 
-.PHONY: all deps static dynamic debug install clean 
+.PHONY: all deps static dynamic debug install clean
