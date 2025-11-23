@@ -22,14 +22,13 @@ static void print_usage(const char *prog)
                     "[chrom_mapping.json]\n");
     fprintf(
         stderr,
-        "  -z, --compression INT     Compression level for HDF5/Parquet [%d]\n",
+        "  -z, --compression INT     Compression level for HDF5 [%d]\n",
         DEFAULT_HDF5_COMPRESSION);
-    fprintf(stderr, "                            0=none, 1-8=internal Zstd, "
-                    ">=9=ultra Zstd-9 external multi-threaded\n");
+    fprintf(stderr, "                            0=none, 1-8=Zstd (gzip fallback if Zstd unavailable)\n");
     fprintf(stderr, "  -k, --chunk-size INT      HDF5 chunk size [%d]\n",
             DEFAULT_HDF5_CHUNK_SIZE);
-    fprintf(stderr, "  -f, --output-format STR   Output format (hdf5, txt, both, "
-                    "parquet) [hdf5]\n");
+    fprintf(stderr, "  -f, --output-format STR   Output format (hdf5, txt, both) "
+                    "[hdf5]\n");
     fprintf(stderr, "  -s, --split               Split output by context\n");
     fprintf(stderr, "  -o, --output-dir DIR      Output directory\n");
     fprintf(stderr, "\n");
@@ -60,27 +59,26 @@ int main(int argc, char *argv[])
     const char *chrom_mapping_file = NULL; // Default to NULL
     const char *ref_file = NULL;           // Will be set from chrom_mapping or command line
 
-    struct option long_options[] = {{"help", no_argument, 0, 'h'},
-                                    {"threads", required_argument, 0, 't'},
-                                    {"min-mapq", required_argument, 0, 'q'},
-                                    {"min-phred", required_argument, 0, 'p'},
-                                    {"min-cov", required_argument, 0, 'c'},
-                                    {"cap-cov", required_argument, 0, 'C'},
-                                    {"CHG", no_argument, 0, 'G'},
-                                    {"CHH", no_argument, 0, 'H'},
-                                    {"chrom-mapping", required_argument, 0, 'm'},
-                                    {"compression", required_argument, 0, 'z'},
-                                    {"chunk-size", required_argument, 0, 'k'},
-                                    {"output-format", required_argument, 0, 'f'},
-                                    {"split", no_argument, 0, 's'},
-                                    {"output-dir", required_argument, 0, 'o'},
-                                    {0, 0, 0, 0}};
+    struct option long_options[] = {
+        {"help", no_argument, 0, 'h'},
+        {"threads", required_argument, 0, 't'},
+        {"min-mapq", required_argument, 0, 'q'},
+        {"min-phred", required_argument, 0, 'p'},
+        {"min-cov", required_argument, 0, 'c'},
+        {"cap-cov", required_argument, 0, 'C'},
+        {"CHG", no_argument, 0, 'G'},
+        {"CHH", no_argument, 0, 'H'},
+        {"chrom-mapping", required_argument, 0, 'm'},
+        {"compression", required_argument, 0, 'z'},
+        {"chunk-size", required_argument, 0, 'k'},
+        {"output-format", required_argument, 0, 'f'},
+        {"split", no_argument, 0, 's'},
+        {"output-dir", required_argument, 0, 'o'},
+        {0, 0, 0, 0}};
     int opt;
     while ((opt = getopt_long(argc, argv, "ht:q:p:c:C:GHm:z:k:f:so:",
                               long_options, NULL)) != -1)
     {
-        fprintf(stderr, "DEBUG: Processing option: %c, optarg: %s\n", opt,
-                optarg ? optarg : "(null)");
         switch (opt)
         {
         case 'h':
@@ -153,13 +151,11 @@ int main(int argc, char *argv[])
                 output_format = OUTPUT_HDF5;
             else if (strcmp(optarg, "txt") == 0)
                 output_format = OUTPUT_TXT;
-            else if (strcmp(optarg, "parquet") == 0)
-                output_format = OUTPUT_PARQUET;
             else
             {
                 fprintf(stderr,
                         "Error: Invalid output format '%s'. Must be one of: both, "
-                        "hdf5, txt, parquet\n",
+                        "hdf5, txt\n",
                         optarg);
                 return 1;
             }
@@ -292,14 +288,6 @@ int main(int argc, char *argv[])
         fai_destroy(fai);
         return 1;
     }
-
-    // Print chromosome names from BAM header
-    // fprintf(stderr, "\nChromosomes in BAM file:\n");
-    // for (int i = 0; i < header->n_targets; i++) {
-    //     fprintf(stderr, "  %d: %s (length: %d)\n", i, header->target_name[i],
-    //     header->target_len[i]);
-    // }
-    // fprintf(stderr, "\n");
 
     sam_close(in);
 

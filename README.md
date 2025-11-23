@@ -8,7 +8,7 @@ A high-performance tool for extracting DNA methylation data from bisulfite seque
 - **⚡ High Performance**: Multi-threaded processing with deterministic results
 - **📊 Comprehensive Analysis**: CpG, CHG, and CHH methylation contexts with detailed statistics
 - **💾 Flexible Output**: HDF5, text, or combined formats with compression
-- **🚀 Ultra-Fast Compression**: Automatic multi-threaded Zstd compression for HDF5 output
+- **🚀 Efficient Compression**: Zstd compression with gzip fallback for HDF5 output
 - **🎯 Quality Control**: Rigorous filtering with MAPQ ≥ 30 and Phred ≥ 20 defaults
 
 ## Installation
@@ -49,9 +49,9 @@ bin/MethylExtractor [options] <input.bam> <output_directory> [reference.fa]
 | `-G, --CHG` | Include CHG methylation contexts | Disabled |
 | `-H, --CHH` | Include CHH methylation contexts | Disabled |
 | `-m, --chrom-mapping FILE` | Chromosome mapping configuration file | `chrom_mapping.json` |
-| `-z, --compression INT` | Compression level (0-9). **Level ≥9 triggers ultra-fast external Zstd** | 6 |
+| `-z, --compression INT` | Compression level (0-8). Zstd with gzip fallback | 6 |
 | `-k, --chunk-size INT` | HDF5 chunk size for I/O optimization | 1,000,000 |
-| `-f, --output-format STR` | Output format: `hdf5`, `txt`, `both`, or `parquet` | `hdf5` |
+| `-f, --output-format STR` | Output format: `hdf5`, `txt`, or `both` | `hdf5` |
 | `-s, --split` | Split output by methylation context | Disabled |
 | `-o, --output-dir DIR` | Output directory | N/A |
 
@@ -98,25 +98,6 @@ Dataset: methylation_data
 └── tnc (uint8) - Trinucleotide context and strand
 ```
 
-### Parquet Format
-Columnar storage format with Zstd compression for efficient querying and cloud storage:
-
-```bash
-# Columns in Parquet file:
-position: uint32          # Genomic position (1-based)
-strand: string            # '+' or '-'
-methylated_count: uint16  # Methylated cytosine count
-unmethylated_count: uint16 # Unmethylated cytosine count
-context: string           # 'CG', 'CHG', or 'CHH'
-trinucleotide: string     # Full trinucleotide context
-```
-
-**Advantages:**
-- ⚡ Fast queries on specific genomic regions
-- 📦 Excellent compression with Zstd
-- ☁️ Cloud-optimized storage (S3, GCS)
-- 🔧 Compatible with Python, R, Java ecosystems
-
 ### Text Format
 Human-readable tab-separated values:
 ```bash
@@ -132,7 +113,6 @@ Human-readable tab-separated values:
 | `-f hdf5` | `chr1.h5`, `chr2.h5`, ... | Per-chromosome HDF5 files |
 | `-f txt` | `chr1.txt`, `chr2.txt`, ... | Per-chromosome text files |
 | `-f both` | Both HDF5 and text files | Combined output |
-| `-f parquet` | `chr1.parquet`, `chr2.parquet`, ... | Per-chromosome Parquet files (Zstd compressed) |
 | `-s --split` | `chr1.CG.h5`, `chr1.CHG.h5`, ... | Separate files per context |
 
 ### Statistics Output
@@ -229,7 +209,7 @@ MethylExtractor implements rigorous quality control:
 - **HDF5**: Binary data storage and compression
 - **Zlib/Bzip2/LZMA**: Compression libraries
 - **GCC**: Compiler with OpenMP support
-- **Zstd**: For ultra-fast compression optimization
+- **Zstd**: High-performance compression with fallback to gzip
 
 ## Troubleshooting
 

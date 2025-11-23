@@ -243,10 +243,7 @@ void process_chromosome(ThreadArg *targ)
 
                 // Output file name - use appropriate extension based on output format
                 char out_path[1024];
-                const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt"
-                                  : (targ->output_format == OUTPUT_PARQUET)
-                                      ? ".parquet"
-                                      : ".h5"; // For OUTPUT_BOTH, use .h5
+                const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt" : ".h5";
                 snprintf(out_path, sizeof(out_path), "%s/%s-%s%s", targ->out_dir,
                          targ->chr, get_context_string(ctx), ext);
 
@@ -256,31 +253,7 @@ void process_chromosome(ThreadArg *targ)
 
                 free(ctx_buffer);
 
-                // OPTIMIZATION: External Zstd compression
-                if (targ->compression >= 9 && (targ->output_format == OUTPUT_HDF5 ||
-                                               targ->output_format == OUTPUT_BOTH))
-                {
-                    char cmd[4096];
-                    int cmd_len = snprintf(cmd, sizeof(cmd),
-                                           "zstd --ultra -9 -T0 --rm \"%s\" -o \"%s.zst.h5\" && "
-                                           "mv \"%s.zst.h5\" \"%s\" 2>/dev/null",
-                                           out_path, out_path, out_path, out_path);
-
-                    if (cmd_len > 0 && cmd_len < sizeof(cmd))
-                    {
-                        log_time("Launching multi-threaded Zstd-9 compression for %s ...\n",
-                                 out_path);
-                        int ret = system(cmd);
-                        if (ret == 0)
-                            log_time(
-                                "Finished ultra-compression of %s (Zstd-9, multi-threaded)\n",
-                                out_path);
-                        else
-                            log_time("Warning: external Zstd failed for %s (you can compress "
-                                     "manually)\n",
-                                     out_path);
-                    }
-                }
+                // Note: External compression removed to maintain HDF5 compatibility
             }
         }
     }
@@ -289,39 +262,14 @@ void process_chromosome(ThreadArg *targ)
         // Output file name - use appropriate extension based on output format
         char out_path[1024];
         const char *ext = (targ->output_format == OUTPUT_TXT) ? ".txt"
-                          : (targ->output_format == OUTPUT_PARQUET)
-                              ? ".parquet"
-                              : ".h5"; // For OUTPUT_BOTH, use .h5
+                          : ".h5"; // For OUTPUT_BOTH, use .h5
         snprintf(out_path, sizeof(out_path), "%s/%s%s", targ->out_dir, targ->chr,
                  ext);
         flush_buffer(out_path, buffer, site_count, targ->compression,
                      targ->hdf5_chunk_size, 0, targ->min_cov, targ->cap_cov,
                      targ->output_format);
 
-        // OPTIMIZATION: External Zstd compression
-        if (targ->compression >= 9 && (targ->output_format == OUTPUT_HDF5 ||
-                                       targ->output_format == OUTPUT_BOTH))
-        {
-            char cmd[4096];
-            int cmd_len = snprintf(cmd, sizeof(cmd),
-                                   "zstd --ultra -9 -T0 --rm \"%s\" -o \"%s.zst.h5\" && "
-                                   "mv \"%s.zst.h5\" \"%s\" 2>/dev/null",
-                                   out_path, out_path, out_path, out_path);
-
-            if (cmd_len > 0 && cmd_len < sizeof(cmd))
-            {
-                log_time("Launching multi-threaded Zstd-9 compression for %s ...\n",
-                         out_path);
-                int ret = system(cmd);
-                if (ret == 0)
-                    log_time("Finished ultra-compression of %s (Zstd-9, multi-threaded)\n",
-                             out_path);
-                else
-                    log_time("Warning: external Zstd failed for %s (you can compress "
-                             "manually)\n",
-                             out_path);
-            }
-        }
+        // Note: External compression removed to maintain HDF5 compatibility
     }
 
     free(site_positions);

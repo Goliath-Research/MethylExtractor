@@ -47,8 +47,7 @@ typedef enum
     OUTPUT_NONE = 0,
     OUTPUT_HDF5 = 1,
     OUTPUT_TXT = 2,
-    OUTPUT_BOTH = 3,
-    OUTPUT_PARQUET = 4
+    OUTPUT_BOTH = 3
 } OutputFormat;
 
 typedef struct
