@@ -30,7 +30,7 @@ def csv_to_parquet(csv_file):
         ratio = parquet_size / csv_size
         
         print(f"Converted to {parquet_file}")
-        print(".1f"        print(".1f"
+        print(f"Compression ratio: {ratio:.1f}")
         return True
         
     except Exception as e:
