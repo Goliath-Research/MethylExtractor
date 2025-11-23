@@ -194,10 +194,6 @@ void process_chromosome(ThreadArg *targ) {
     free(regions[i].counts.uC);
   }
 
-  // Output (unchanged)
-  char final_out_path[1024] = {
-      0}; // Store the last written file path for compression
-
   if (targ->split_context_files) {
     for (int ctx = CONTEXT_CPG; ctx <= CONTEXT_CHH; ++ctx) {
       if ((ctx == CONTEXT_CPG) || (ctx == CONTEXT_CHG && targ->keep_chg) ||
@@ -235,23 +231,25 @@ void process_chromosome(ThreadArg *targ) {
         // OPTIMIZATION: External Zstd compression
         if (targ->compression >= 9 && (targ->output_format == OUTPUT_HDF5 ||
                                        targ->output_format == OUTPUT_BOTH)) {
-          char cmd[2048];
-          snprintf(cmd, sizeof(cmd),
+          char cmd[4096];
+          int cmd_len = snprintf(cmd, sizeof(cmd),
                    "zstd --ultra -9 -T0 --rm \"%s\" -o \"%s.zst.h5\" && "
                    "mv \"%s.zst.h5\" \"%s\" 2>/dev/null",
                    out_path, out_path, out_path, out_path);
 
-          log_time("Launching multi-threaded Zstd-9 compression for %s ...\n",
-                   out_path);
-          int ret = system(cmd);
-          if (ret == 0)
-            log_time(
-                "Finished ultra-compression of %s (Zstd-9, multi-threaded)\n",
-                out_path);
-          else
-            log_time("Warning: external Zstd failed for %s (you can compress "
-                     "manually)\n",
+          if (cmd_len > 0 && cmd_len < sizeof(cmd)) {
+            log_time("Launching multi-threaded Zstd-9 compression for %s ...\n",
                      out_path);
+            int ret = system(cmd);
+            if (ret == 0)
+              log_time(
+                  "Finished ultra-compression of %s (Zstd-9, multi-threaded)\n",
+                  out_path);
+            else
+              log_time("Warning: external Zstd failed for %s (you can compress "
+                       "manually)\n",
+                       out_path);
+          }
         }
       }
     }
@@ -271,22 +269,24 @@ void process_chromosome(ThreadArg *targ) {
     // OPTIMIZATION: External Zstd compression
     if (targ->compression >= 9 && (targ->output_format == OUTPUT_HDF5 ||
                                    targ->output_format == OUTPUT_BOTH)) {
-      char cmd[2048];
-      snprintf(cmd, sizeof(cmd),
+      char cmd[4096];
+      int cmd_len = snprintf(cmd, sizeof(cmd),
                "zstd --ultra -9 -T0 --rm \"%s\" -o \"%s.zst.h5\" && "
                "mv \"%s.zst.h5\" \"%s\" 2>/dev/null",
                out_path, out_path, out_path, out_path);
 
-      log_time("Launching multi-threaded Zstd-9 compression for %s ...\n",
-               out_path);
-      int ret = system(cmd);
-      if (ret == 0)
-        log_time("Finished ultra-compression of %s (Zstd-9, multi-threaded)\n",
+      if (cmd_len > 0 && cmd_len < sizeof(cmd)) {
+        log_time("Launching multi-threaded Zstd-9 compression for %s ...\n",
                  out_path);
-      else
-        log_time("Warning: external Zstd failed for %s (you can compress "
-                 "manually)\n",
-                 out_path);
+        int ret = system(cmd);
+        if (ret == 0)
+          log_time("Finished ultra-compression of %s (Zstd-9, multi-threaded)\n",
+                   out_path);
+        else
+          log_time("Warning: external Zstd failed for %s (you can compress "
+                   "manually)\n",
+                   out_path);
+      }
     }
   }
 
