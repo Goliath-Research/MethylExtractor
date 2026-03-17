@@ -26,7 +26,14 @@ cd MethylExtractor
 make
 ```
 
-The Makefile automatically installs required dependencies (on Debian/Ubuntu systems) and compiles the optimized binary.
+The Makefile automatically installs required dependencies (on Debian/Ubuntu systems) and compiles the optimized binary. The **HDF5 Zstd plugin** is also built into the project tree (`build/dynamic/<arch>/hdf5_zstd_plugin/`) so that HDF5 output can use Zstd compression; it is **not** installed to the system until you run `make install`.
+
+### System install (optional)
+```bash
+make install
+```
+
+This copies the MethylExtractor binary to `/usr/local/bin/`, the HDF5 Zstd plugin to `/usr/local/hdf5/lib/plugin`, and appends `HDF5_PLUGIN_PATH` to your `~/.bashrc`. Before copying anything, **architecture is checked**: the binary and plugin must match the current machine (e.g. you cannot install an arm64 build on an x86_64 host). If there is a mismatch, `make install` aborts with an error—run `make` on the target machine first.
 
 ## Usage
 

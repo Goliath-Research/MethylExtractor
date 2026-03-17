@@ -32,6 +32,8 @@ STATIC_LIBS = -lz -lm -ldl -lpthread -lbz2 -llzma -lcurl -lcrypto -lssl -lzstd
 STATIC_DIR = build/static/$(ARCH_NAME)
 DYNAMIC_DIR = build/dynamic/$(ARCH_NAME)
 DEBUG_DIR = build/debug/$(ARCH_NAME)
+HDF5_PLUGIN_BUILD = $(DYNAMIC_DIR)/hdf5_zstd_plugin
+PLUGIN_SO = $(HDF5_PLUGIN_BUILD)/libH5Zzstd.so
 
 # Source files
 SRCS = src/main.c src/bam_processing.c src/output_formats.c src/utils.c src/cjson/cJSON.c
@@ -44,6 +46,8 @@ deps:
 	sudo apt-get update
 	sudo apt-get install -y \
 		build-essential \
+		cmake \
+		git \
 		libhdf5-dev \
 		libhts-dev \
 		zlib1g-dev \
@@ -52,8 +56,15 @@ deps:
 		libcurl4-gnutls-dev \
 		libssl-dev \
 		libzstd-dev \
-		zstd
+		zstd \
+		hdf5-tools
 	@echo "Dependencies installed successfully"
+
+# HDF5 Zstd plugin (built into project tree, installed only on make install)
+$(PLUGIN_SO):
+	@echo "Building HDF5 Zstd plugin into $(HDF5_PLUGIN_BUILD)..."
+	@mkdir -p $(HDF5_PLUGIN_BUILD)
+	bash scripts/install_hdf5_zstd_plugin.sh $(HDF5_PLUGIN_BUILD)
 
 # Note: Static linking is challenging due to missing static libraries for HTSlib and HDF5 dependencies
 # (like libdeflate, rans, arith, fqz, tok3, and szip). Consider using dynamic linking instead.
@@ -76,11 +87,29 @@ $(DEBUG_DIR)/MethylExtractor: $(SRCS)
 	mkdir -p $(DEBUG_DIR)
 	$(CC) $(DEBUG_CFLAGS) -o $@ $^ $(LDFLAGS) -L$(HTSLIB_DIR)/lib -L$(HDF5_LIB_PATH) $(HTSLIB_LIBS) $(HDF5_LIBS) -lpthread -lm
 
-install: dynamic
+install: dynamic $(PLUGIN_SO)
+	@echo "Checking architecture..."
+	@bin_arch=$$(file -b $(DYNAMIC_DIR)/MethylExtractor); \
+	plug_arch=$$(file -b $(PLUGIN_SO)); \
+	case "$(ARCH)" in \
+		aarch64) want="aarch64";; \
+		x86_64) want="x86-64";; \
+		*) want="";; \
+	esac; \
+	echo "$$bin_arch" | grep -q "$$want" || { echo "Architecture mismatch: binary is for $$bin_arch but this machine is $(ARCH). Run make on this machine first."; exit 1; }; \
+	echo "$$plug_arch" | grep -q "$$want" || { echo "Architecture mismatch: plugin is for $$plug_arch but this machine is $(ARCH). Run make on this machine first."; exit 1; }
+	@echo "Installing binary and HDF5 Zstd plugin..."
 	sudo cp $(DYNAMIC_DIR)/MethylExtractor /usr/local/bin/
 	sudo chmod +x /usr/local/bin/MethylExtractor
+	sudo mkdir -p /usr/local/hdf5/lib/plugin
+	sudo cp $(PLUGIN_SO) /usr/local/hdf5/lib/plugin/
+	@if ! grep -q "HDF5_PLUGIN_PATH" $$HOME/.bashrc 2>/dev/null; then \
+		echo "export HDF5_PLUGIN_PATH=/usr/local/hdf5/lib/plugin" >> $$HOME/.bashrc; \
+		echo "Appended HDF5_PLUGIN_PATH to $$HOME/.bashrc"; \
+	fi
 
 clean:
 	rm -rf build
+	@# Removes all build artifacts including the plugin under build/dynamic/$(ARCH_NAME)/
 
 .PHONY: all deps static dynamic debug install clean
