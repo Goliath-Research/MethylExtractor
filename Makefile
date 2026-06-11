@@ -63,11 +63,20 @@ deps:
 		hdf5-tools
 	@echo "Dependencies installed successfully"
 
-# HDF5 Zstd plugin (built into project tree, installed only on make install)
+# HDF5 Zstd plugin (built into project tree, installed only on make install).
+# HDF5_PLUGIN_BUILD = build/dynamic/$(ARCH_NAME)/hdf5_zstd_plugin, so the plugin
+# is always built into the directory matching this machine's architecture.
 $(PLUGIN_SO):
-	@echo "Building HDF5 Zstd plugin into $(HDF5_PLUGIN_BUILD)..."
+	@echo "Building HDF5 Zstd plugin for $(ARCH) into $(HDF5_PLUGIN_BUILD)..."
 	@mkdir -p $(HDF5_PLUGIN_BUILD)
 	bash scripts/install_hdf5_zstd_plugin.sh $(HDF5_PLUGIN_BUILD)
+
+# Convenience alias: `make plugin` builds the Zstd filter into the arch-correct
+# tree and prints the HDF5_PLUGIN_PATH to export for in-tree (no-install) use.
+plugin: $(PLUGIN_SO)
+	@echo "HDF5 Zstd plugin ready: $(PLUGIN_SO)"
+	@echo "To use it without 'make install', export:"
+	@echo "  export HDF5_PLUGIN_PATH=$(abspath $(HDF5_PLUGIN_BUILD))"
 
 # Note: Static linking is challenging due to missing static libraries for HTSlib and HDF5 dependencies
 # (like libdeflate, rans, arith, fqz, tok3, and szip). Consider using dynamic linking instead.
@@ -115,4 +124,4 @@ clean:
 	rm -rf build
 	@# Removes all build artifacts including the plugin under build/dynamic/$(ARCH_NAME)/
 
-.PHONY: all deps static dynamic debug install clean
+.PHONY: all deps plugin static dynamic debug install clean

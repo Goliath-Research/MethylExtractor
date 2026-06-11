@@ -27,7 +27,15 @@ make deps   # one-time: install system dependencies (Debian/Ubuntu, uses sudo)
 make        # compile the optimized binary
 ```
 
-`make deps` installs the required system packages (on Debian/Ubuntu). It is a separate, explicit step so that a plain `make` never runs `sudo` on its own. `make` compiles the binary into `build/dynamic/<arch>/MethylExtractor`. The **HDF5 Zstd plugin** is built into the project tree (`build/dynamic/<arch>/hdf5_zstd_plugin/`) by `make install` so that HDF5 output can use Zstd compression; it is **not** installed to the system until you run `make install`.
+`make deps` installs the required system packages (on Debian/Ubuntu); it is architecture-agnostic (apt installs for the native arch). It is a separate, explicit step so that a plain `make` never runs `sudo` on its own. `make` compiles the binary into `build/dynamic/<arch>/MethylExtractor`, where `<arch>` is auto-detected (`x64` on x86_64, `arm64` on aarch64).
+
+The **HDF5 Zstd plugin** enables Zstd-compressed HDF5 output. Build it into the arch-correct project tree (`build/dynamic/<arch>/hdf5_zstd_plugin/`) with:
+
+```bash
+make plugin   # builds libH5Zzstd.so for this machine's architecture
+```
+
+`make plugin` prints the `HDF5_PLUGIN_PATH` to export if you want Zstd without a system install. The plugin is **not** copied to the system until you run `make install`. Without the plugin on `HDF5_PLUGIN_PATH`, HDF5 output falls back to gzip automatically.
 
 ### System install (optional)
 ```bash
