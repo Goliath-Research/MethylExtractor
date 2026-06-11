@@ -6,13 +6,13 @@
 set -euo pipefail
 
 # Reference genome path
-REF_GENOME="/home/ubuntu/Work/genomes/human_genome/release-113/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+REF_GENOME="/work/genomes/human_genome/release-114/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
 
 # Chromosome mapping file
-CHROM_MAPPING="/home/ubuntu/Work/HRA006113/chrom_mapping.json"
+CHROM_MAPPING="/work/chrom_mapping.json"
 
 # Base directory containing BAM files
-BASE_DIR="/home/ubuntu/Work/HRA006113"
+BASE_DIR="/work/samples"
 
 # MethylExtractor binary (built with `make`)
 METHYL_EXTRACTOR="/home/ubuntu/MethylExtractor/build/dynamic/x64/MethylExtractor"
