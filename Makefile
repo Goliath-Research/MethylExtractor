@@ -39,7 +39,10 @@ PLUGIN_SO = $(HDF5_PLUGIN_BUILD)/libH5Zzstd.so
 SRCS = src/main.c src/bam_processing.c src/output_formats.c src/utils.c src/cjson/cJSON.c
 
 # Targets
-all: deps dynamic
+# Note: `deps` is intentionally NOT a prerequisite of `all` so that a plain
+# `make` never runs `sudo apt-get`. Run `make deps` once to install system
+# packages, then `make`.
+all: dynamic
 
 deps:
 	@echo "Installing required dependencies..."

@@ -2,12 +2,12 @@
 
 static void print_usage(const char *prog)
 {
-    fprintf(stderr, "Usage: %s [options] <input.bam> <output_dir> [ref.fa]\n",
+    fprintf(stderr, "Usage: %s [options] <input.bam> [output_dir] [ref.fa]\n",
             prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -h, --help                Show this help message\n");
-    fprintf(stderr, "  -t, --threads INT         Number of threads [%d]\n",
-            DEFAULT_THREADS);
+    fprintf(stderr, "  -t, --threads INT         Number of worker threads "
+                    "[auto: CPU count]\n");
     fprintf(stderr, "  -q, --min-mapq INT        Minimum mapping quality [%d]\n",
             DEFAULT_MIN_MAPQ);
     fprintf(stderr, "  -p, --min-phred INT       Minimum base quality [%d]\n",
@@ -24,7 +24,7 @@ static void print_usage(const char *prog)
         stderr,
         "  -z, --compression INT     Compression level for HDF5 [%d]\n",
         DEFAULT_HDF5_COMPRESSION);
-    fprintf(stderr, "                            0=none, 1-8=Zstd (gzip fallback if Zstd unavailable)\n");
+    fprintf(stderr, "                            0=none, 1-19=Zstd (gzip fallback if Zstd unavailable)\n");
     fprintf(stderr, "  -k, --chunk-size INT      HDF5 chunk size [%d]\n",
             DEFAULT_HDF5_CHUNK_SIZE);
     fprintf(stderr, "  -f, --output-format STR   Output format (hdf5, txt, both) "
@@ -32,6 +32,8 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -s, --split               Split output by context\n");
     fprintf(stderr, "  -o, --output-dir DIR      Output directory\n");
     fprintf(stderr, "\n");
+    fprintf(stderr, "Note: output_dir may be given positionally (2nd argument) "
+                    "or via -o/--output-dir.\n");
     fprintf(stderr, "Note: ref.fa is optional. If provided, it will override the "
                     "reference in chrom_mapping.json\n");
     fprintf(stderr, "\n");
@@ -46,7 +48,7 @@ int main(int argc, char *argv[])
     int compression = DEFAULT_HDF5_COMPRESSION;
     int hdf5_chunk_size = DEFAULT_HDF5_CHUNK_SIZE;
     uint32_t chunk_size = DEFAULT_CHUNK_SIZE;
-    int num_threads = DEFAULT_THREADS;
+    int num_threads = 0; // 0 = auto-detect from CPU count
     int keep_chg = 0;
     int keep_chh = 0;
     int min_mapq = DEFAULT_MIN_MAPQ;
@@ -135,6 +137,11 @@ int main(int argc, char *argv[])
             break;
         case 'z':
             compression = atoi(optarg);
+            if (compression < 0 || compression > 19)
+            {
+                fprintf(stderr, "Compression level must be between 0 and 19\n");
+                return 1;
+            }
             break;
         case 'k':
             hdf5_chunk_size = atoi(optarg);
@@ -184,16 +191,27 @@ int main(int argc, char *argv[])
         argv[optind];                // BAM file is the first non-option argument
     const char *cmd_ref_file = NULL; // Will be set if reference file is provided
 
-    if (optind + 1 < argc) // If we have a reference file
-    {
-        cmd_ref_file = argv[optind + 1]; // It's the second non-option argument
-    }
+    // Positional layout after options: <input.bam> [output_dir] [ref.fa].
+    // If -o/--output-dir was not given, the next positional is the output dir;
+    // the following positional (if any) is the reference.
+    int next_pos = optind + 1;
+    if (!out_dir && next_pos < argc)
+        out_dir = argv[next_pos++];
+    if (next_pos < argc)
+        cmd_ref_file = argv[next_pos];
 
-    if (num_threads == DEFAULT_THREADS)
+    if (num_threads <= 0)
     {
         num_threads = sysconf(_SC_NPROCESSORS_ONLN);
         if (num_threads < 1)
             num_threads = DEFAULT_THREADS;
+    }
+
+    if (!out_dir)
+    {
+        fprintf(stderr, "Error: no output directory specified (provide it as the "
+                        "2nd argument or via -o/--output-dir)\n");
+        return 1;
     }
 
     if (make_directory(out_dir) != 0)
@@ -342,129 +360,29 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].chr_seq = seq;
         thread_args[valid_chr_count].output_format = output_format;
         thread_args[valid_chr_count].split_context_files = split_context_files;
+        thread_args[valid_chr_count].num_threads = num_threads;
         valid_chr_count++;
     }
     free(chroms);
 
-    log_time("Allocating threads...\n");
-    pthread_t *threads = malloc(valid_chr_count * sizeof(pthread_t));
-    if (!threads)
-    {
-        fprintf(stderr, "Failed to allocate threads\n");
-        for (int i = 0; i < valid_chr_count; i++)
-            free(thread_args[i].chr_seq);
-        free(thread_args);
-        sam_hdr_destroy(header);
-        fai_destroy(fai);
-        return 1;
-    }
-
-    log_time("Creating thread argument copies...\n");
-    // Create a copy of thread arguments for each thread
-    ThreadArg **thread_args_copies =
-        malloc(valid_chr_count * sizeof(ThreadArg *));
-    if (!thread_args_copies)
-    {
-        fprintf(stderr, "Failed to allocate thread argument copies\n");
-        free(threads);
-        for (int i = 0; i < valid_chr_count; i++)
-            free(thread_args[i].chr_seq);
-        free(thread_args);
-        sam_hdr_destroy(header);
-        fai_destroy(fai);
-        return 1;
-    }
-
-    log_time("Creating threads...\n");
-    int active_threads = 0;
+    // Chromosomes are processed one at a time; parallelism happens inside
+    // process_chromosome(), which splits each chromosome into num_threads
+    // regions. This bounds peak memory to a single chromosome's working set
+    // while letting the user's --threads setting govern the actual work.
+    log_time("Processing %d chromosome(s), %d worker thread(s) each...\n",
+             valid_chr_count, num_threads);
     for (int i = 0; i < valid_chr_count; i++)
-    {
-        // Create a deep copy of the thread arguments
-        thread_args_copies[i] = malloc(sizeof(ThreadArg));
-        if (!thread_args_copies[i])
-        {
-            fprintf(stderr, "Failed to allocate thread argument copy %d\n", i);
-            continue;
-        }
-
-        // Initialize the structure to zero
-        memset(thread_args_copies[i], 0, sizeof(ThreadArg));
-
-        // Make deep copies of all string fields
-        thread_args_copies[i]->bam_file = strdup(thread_args[i].bam_file);
-        thread_args_copies[i]->out_dir = strdup(thread_args[i].out_dir);
-        thread_args_copies[i]->chr = strdup(thread_args[i].chr);
-
-        // Make a deep copy of the chromosome sequence
-        thread_args_copies[i]->chr_seq = malloc(thread_args[i].chr_len + 1);
-        memcpy(thread_args_copies[i]->chr_seq, thread_args[i].chr_seq,
-               thread_args[i].chr_len + 1);
-
-        // Copy all non-pointer fields
-        thread_args_copies[i]->tid = thread_args[i].tid;
-        thread_args_copies[i]->chr_len = thread_args[i].chr_len;
-        thread_args_copies[i]->min_mapq = thread_args[i].min_mapq;
-        thread_args_copies[i]->min_phred = thread_args[i].min_phred;
-        thread_args_copies[i]->min_cov = thread_args[i].min_cov;
-        thread_args_copies[i]->cap_cov = thread_args[i].cap_cov;
-        thread_args_copies[i]->keep_chg = thread_args[i].keep_chg;
-        thread_args_copies[i]->keep_chh = thread_args[i].keep_chh;
-        thread_args_copies[i]->compression = thread_args[i].compression;
-        thread_args_copies[i]->hdf5_chunk_size = thread_args[i].hdf5_chunk_size;
-        thread_args_copies[i]->chunk_size = thread_args[i].chunk_size;
-        thread_args_copies[i]->output_format = thread_args[i].output_format;
-        thread_args_copies[i]->split_context_files =
-            thread_args[i].split_context_files;
-
-        if (pthread_create(&threads[i], NULL, (void *(*)(void *))process_chromosome,
-                           thread_args_copies[i]) != 0)
-        {
-            fprintf(stderr, "Failed to create thread for %s\n", thread_args[i].chr);
-            free(thread_args_copies[i]->chr_seq);
-            free(thread_args_copies[i]->chr);
-            free(thread_args_copies[i]);
-            continue;
-        }
-        active_threads++;
-        for (int j = 0; j <= i; j++)
-            if (pthread_join(threads[j], NULL) == 0)
-                active_threads--;
-
-        while (active_threads >= num_threads)
-            for (int j = 0; j <= i; j++)
-                if (pthread_join(threads[j], NULL) == 0)
-                    active_threads--;
-    }
-
-    log_time("Joining threads...\n");
-    for (int i = 0; i < valid_chr_count; i++)
-        if (pthread_join(threads[i], NULL) == 0)
-            if (active_threads > 0)
-                active_threads--;
+        process_chromosome(&thread_args[i]);
 
     log_time("Cleaning up HDF5...\n");
     cleanup_hdf5();
 
-    log_time("Cleaning up thread argument copies...\n");
-    // Clean up thread argument copies
-    for (int i = 0; i < valid_chr_count; i++)
-        if (thread_args_copies[i])
-        {
-            free(thread_args_copies[i]->chr_seq);
-            free(thread_args_copies[i]->chr);
-            free(thread_args_copies[i]);
-        }
-
-    free(thread_args_copies);
-
-    log_time("Cleaning up original thread arguments...\n");
-    // Clean up original thread arguments
+    log_time("Cleaning up thread arguments...\n");
     for (int i = 0; i < valid_chr_count; i++)
     {
         free(thread_args[i].chr_seq);
         free(thread_args[i].chr); // Free the copied chromosome name
     }
-    free(threads);
     free(thread_args);
     sam_hdr_destroy(header);
     fai_destroy(fai);

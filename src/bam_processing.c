@@ -42,16 +42,11 @@ void *process_region_direct(void *arg)
     samFile *in = sam_open(t->bam_file, "r");
     if (!in)
         return NULL;
-    hts_idx_t *idx = sam_index_load(in, t->bam_file);
-    if (!idx)
-    {
-        sam_close(in);
-        return NULL;
-    }
-    hts_itr_t *iter = sam_itr_queryi(idx, t->tid, t->start_pos, t->end_pos);
+    // The index is loaded once per chromosome and shared read-only across the
+    // region threads (see process_chromosome) to avoid repeated index I/O.
+    hts_itr_t *iter = sam_itr_queryi(r->idx, t->tid, t->start_pos, t->end_pos);
     if (!iter)
     {
-        hts_idx_destroy(idx);
         sam_close(in);
         return NULL;
     }
@@ -75,6 +70,23 @@ void *process_region_direct(void *arg)
         if (strand == 0)
             continue;
 
+        // Overlapping mate de-duplication (coordinate-based clip). For an FR
+        // read pair the two mates overlap; to count each reference position
+        // exactly once, the left mate (smaller start) yields the overlapping
+        // region to the right mate by skipping reference positions >= the
+        // mate's start. On equal starts (dovetailed pairs) READ2 yields to
+        // READ1. The decision uses only this read's own fields, so it stays
+        // consistent even when the two mates fall in different region threads.
+        int32_t clip_from = INT32_MAX;
+        if ((c->flag & BAM_FPAIRED) && !(c->flag & BAM_FMUNMAP) &&
+            c->mtid == c->tid)
+        {
+            if (c->pos < c->mpos)
+                clip_from = c->mpos;
+            else if (c->pos == c->mpos && (c->flag & BAM_FREAD2))
+                clip_from = c->mpos;
+        }
+
         uint8_t *seq = bam_get_seq(b);
         uint8_t *qual = bam_get_qual(b);
         int32_t pos = c->pos;
@@ -90,7 +102,8 @@ void *process_region_direct(void *arg)
             {
                 for (int i = 0; i < len; ++i)
                 {
-                    if (pos < t->start_pos || pos >= t->end_pos)
+                    if (pos >= clip_from || pos < t->start_pos ||
+                        pos >= t->end_pos)
                     {
                         pos++;
                         qpos++;
@@ -141,7 +154,6 @@ void *process_region_direct(void *arg)
     bam_destroy1(b);
     sam_hdr_destroy(hdr);
     hts_itr_destroy(iter);
-    hts_idx_destroy(idx);
     sam_close(in);
     return NULL;
 }
@@ -161,27 +173,49 @@ void process_chromosome(ThreadArg *targ)
     for (size_t i = 0; i < site_count; i++)
         site_positions[i] = buffer[i].pos - 1;
 
-    int n_threads = get_nprocs();
-    if (n_threads > 32)
-        n_threads = 32;
+    int n_threads = targ->num_threads;
     if (n_threads < 1)
-        n_threads = 8;
+        n_threads = 1;
+    if ((size_t)n_threads > site_count)
+        n_threads = (int)site_count;
+
+    // Load the BAM index once and share it (read-only) across region threads.
+    samFile *idx_fp = sam_open(targ->bam_file, "r");
+    hts_idx_t *idx = idx_fp ? sam_index_load(idx_fp, targ->bam_file) : NULL;
+    if (!idx)
+    {
+        fprintf(stderr,
+                "Failed to load BAM index for %s (is the BAM sorted and "
+                "indexed?)\n",
+                targ->chr);
+        if (idx_fp)
+            sam_close(idx_fp);
+        free(site_positions);
+        free(buffer);
+        return;
+    }
 
     size_t sites_per_thread = (site_count + n_threads - 1) / n_threads;
 
     RegionArg *regions = calloc(n_threads, sizeof(RegionArg));
     pthread_t *threads = malloc(n_threads * sizeof(pthread_t));
 
+    // Only create threads for non-empty site ranges; track how many were
+    // actually launched so join/merge never touch uninitialized entries.
+    int n_created = 0;
     for (int i = 0; i < n_threads; i++)
     {
+        size_t start_idx = (size_t)i * sites_per_thread;
+        if (start_idx >= site_count)
+            break;
+
         RegionArg *r = &regions[i];
         r->base = *targ;
-        r->start_site_idx = i * sites_per_thread;
-        r->end_site_idx = (i + 1) * sites_per_thread;
+        r->idx = idx;
+        r->start_site_idx = start_idx;
+        r->end_site_idx = start_idx + sites_per_thread;
         if (r->end_site_idx > site_count)
             r->end_site_idx = site_count;
-        if (r->start_site_idx >= site_count)
-            break;
 
         r->base.start_pos = site_positions[r->start_site_idx];
         r->base.end_pos = (r->end_site_idx < site_count)
@@ -194,18 +228,14 @@ void process_chromosome(ThreadArg *targ)
         r->counts.size = range;
 
         pthread_create(&threads[i], NULL, process_region_direct, r);
+        n_created++;
     }
 
-    for (int i = 0; i < n_threads; i++)
-    {
-        if (regions[i].start_site_idx < site_count)
-            pthread_join(threads[i], NULL);
-    }
+    for (int i = 0; i < n_created; i++)
+        pthread_join(threads[i], NULL);
 
-    for (int i = 0; i < n_threads; i++)
+    for (int i = 0; i < n_created; i++)
     {
-        if (regions[i].start_site_idx >= site_count)
-            continue;
         uint32_t offset = regions[i].base.start_pos;
         for (size_t j = regions[i].start_site_idx; j < regions[i].end_site_idx;
              j++)
@@ -272,6 +302,9 @@ void process_chromosome(ThreadArg *targ)
         // Note: External compression removed to maintain HDF5 compatibility
     }
 
+    hts_idx_destroy(idx);
+    if (idx_fp)
+        sam_close(idx_fp);
     free(site_positions);
     free(buffer);
     free(threads);

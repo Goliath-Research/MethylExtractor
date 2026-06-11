@@ -251,26 +251,41 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer,
             goto cleanup;
         }
 
-        // Set compression (Zstd with gzip fallback)
+        // Set compression. Prefer Zstd, but only if the filter is actually
+        // available at runtime; otherwise fall back to gzip deterministically.
+        // (H5Pset_filter alone does not detect a missing plugin, and
+        // H5Z_FLAG_OPTIONAL would silently write uncompressed data instead.)
         if (compression > 0)
         {
-            // Levels 1–8: try Zstd first, fall back to gzip if not available
-            unsigned int cd_values[1] = {(unsigned int)compression};
-            status = H5Pset_filter(dcpl, ZSTD_FILTER, H5Z_FLAG_OPTIONAL, 1, cd_values);
-            if (status < 0)
+            htri_t zstd_avail = H5Zfilter_avail(ZSTD_FILTER);
+            int use_gzip = 1;
+            if (zstd_avail > 0)
             {
-                // Zstd not available in HDF5, fall back to gzip
-                fprintf(stderr, "Note: Zstd not available in HDF5, using gzip compression instead\n");
-                // Fall back to gzip with similar compression level (gzip levels are 0-9)
-                int gzip_level = compression > 6 ? 6 : compression; // Cap at 6 for gzip
-                status = H5Pset_deflate(dcpl, gzip_level);
+                unsigned int cd_values[1] = {(unsigned int)compression};
+                status = H5Pset_filter(dcpl, ZSTD_FILTER, H5Z_FLAG_MANDATORY, 1,
+                                       cd_values);
                 if (status < 0)
-                    fprintf(stderr, "Warning: Gzip compression also failed, writing uncompressed HDF5\n");
+                    fprintf(stderr, "Warning: failed to set Zstd filter, falling "
+                                    "back to gzip\n");
+                else
+                {
+                    log_time("Using Zstd compression level %d\n", compression);
+                    use_gzip = 0;
+                }
             }
             else
+                fprintf(stderr, "Note: Zstd HDF5 filter not available "
+                                "(HDF5_PLUGIN_PATH not set?); using gzip\n");
+
+            if (use_gzip)
             {
-                // Zstd compression successfully set
-                log_time("Using Zstd compression level %d\n", compression);
+                // gzip/deflate supports levels 0-9
+                int gzip_level = compression > 9 ? 9 : compression;
+                if (H5Pset_deflate(dcpl, gzip_level) < 0)
+                    fprintf(stderr, "Warning: gzip compression failed, writing "
+                                    "uncompressed HDF5\n");
+                else
+                    log_time("Using gzip compression level %d\n", gzip_level);
             }
         }
         else

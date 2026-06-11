@@ -1,4 +1,9 @@
 #!/bin/bash
+#
+# Batch-process every BAM under BASE_DIR with MethylExtractor.
+# Output for each sample is written next to its BAM file.
+
+set -euo pipefail
 
 # Reference genome path
 REF_GENOME="/home/ubuntu/Work/genomes/human_genome/release-113/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
@@ -9,40 +14,40 @@ CHROM_MAPPING="/home/ubuntu/Work/HRA006113/chrom_mapping.json"
 # Base directory containing BAM files
 BASE_DIR="/home/ubuntu/Work/HRA006113"
 
+# MethylExtractor binary (built with `make`)
+METHYL_EXTRACTOR="/home/ubuntu/MethylExtractor/build/dynamic/x64/MethylExtractor"
+
 # Find all BAM files
 find "$BASE_DIR" -name "*.bam" | while read -r bam_file; do
-    # Get the directory name (sample ID)
     sample_dir=$(dirname "$bam_file")
     sample_id=$(basename "$sample_dir")
-    
+
     echo "Processing $sample_id..."
-    
-    # Create output directory
+
+    # Output directory (per sample)
     output_dir="$sample_dir"
-    
-    # Run MethylExtractor with parameters from launch.json
-    /home/ubuntu/MethylExtractor/build/dynamic/MethylExtractor \
+
+    # CLI: MethylExtractor [options] <input.bam> [output_dir] [ref.fa]
+    "$METHYL_EXTRACTOR" \
         --chrom-mapping "$CHROM_MAPPING" \
-        --@ 16 \
-        --o "$output_dir" \
-        --hdf5-compression 9 \
-        --q 30 \
-        --p 20 \
+        --threads 16 \
+        --min-mapq 30 \
+        --min-phred 20 \
+        --min-cov 0 \
+        --compression 9 \
+        --chunk-size 1000000 \
         --CHG \
         --CHH \
-        --c 0 \
-        --chunk-size 1000000 \
-        --no-cap-coverage \
-        --split-context-files \
-        "$REF_GENOME" \
-        "$bam_file"
-    
-    # Check if the command was successful
+        --split \
+        "$bam_file" \
+        "$output_dir" \
+        "$REF_GENOME"
+
     if [ $? -eq 0 ]; then
         echo "Successfully processed $sample_id"
     else
         echo "Error processing $sample_id"
     fi
-    
+
     echo "----------------------------------------"
-done 
+done

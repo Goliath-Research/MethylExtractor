@@ -95,6 +95,7 @@ typedef struct
     uint32_t end_pos;
     OutputFormat output_format;
     int split_context_files;
+    int num_threads;
 } ThreadArg;
 
 // Extended for private counting
@@ -102,6 +103,7 @@ typedef struct
 {
     ThreadArg base;
     PrivateCounts counts;
+    hts_idx_t *idx; // shared, read-only BAM index (owned by process_chromosome)
     size_t start_site_idx;
     size_t end_site_idx;
 } RegionArg;

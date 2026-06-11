@@ -4,7 +4,7 @@ A high-performance tool for extracting DNA methylation data from bisulfite seque
 
 ## ✨ Key Features
 
-- **🔬 Advanced Read Processing**: Proper handling of overlapping paired-end reads to prevent double-counting
+- **🔬 Advanced Read Processing**: Coordinate-based clipping of overlapping paired-end mates to prevent double-counting
 - **⚡ High Performance**: Multi-threaded processing with deterministic results
 - **📊 Comprehensive Analysis**: CpG, CHG, and CHH methylation contexts with detailed statistics
 - **💾 Flexible Output**: HDF5, text, or combined formats with compression
@@ -23,10 +23,11 @@ A high-performance tool for extracting DNA methylation data from bisulfite seque
 ```bash
 git clone <repository-url>
 cd MethylExtractor
-make
+make deps   # one-time: install system dependencies (Debian/Ubuntu, uses sudo)
+make        # compile the optimized binary
 ```
 
-The Makefile automatically installs required dependencies (on Debian/Ubuntu systems) and compiles the optimized binary. The **HDF5 Zstd plugin** is also built into the project tree (`build/dynamic/<arch>/hdf5_zstd_plugin/`) so that HDF5 output can use Zstd compression; it is **not** installed to the system until you run `make install`.
+`make deps` installs the required system packages (on Debian/Ubuntu). It is a separate, explicit step so that a plain `make` never runs `sudo` on its own. `make` compiles the binary into `build/dynamic/<arch>/MethylExtractor`. The **HDF5 Zstd plugin** is built into the project tree (`build/dynamic/<arch>/hdf5_zstd_plugin/`) by `make install` so that HDF5 output can use Zstd compression; it is **not** installed to the system until you run `make install`.
 
 ### System install (optional)
 ```bash
@@ -39,16 +40,18 @@ This copies the MethylExtractor binary to `/usr/local/bin/`, the HDF5 Zstd plugi
 
 ### Basic Syntax
 ```bash
-bin/MethylExtractor [options] <input.bam> <output_directory> [reference.fa]
+build/dynamic/x64/MethylExtractor [options] <input.bam> [output_directory] [reference.fa]
 ```
-*(Note: Binary is located in `build/dynamic/x64/MethylExtractor` or similar, depending on architecture)*
+*(Note: Binary is located in `build/dynamic/x64/MethylExtractor` or similar, depending on architecture.)*
+
+The output directory may be given positionally (2nd argument) or via `-o/--output-dir`; one of the two is required. The reference is optional and, if provided, overrides the one in `chrom_mapping.json`.
 
 ### Command-Line Options
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-h, --help` | Show help message and exit | N/A |
-| `-t, --threads INT` | Number of processing threads | 16 |
+| `-t, --threads INT` | Number of worker threads | auto (CPU count) |
 | `-q, --min-mapq INT` | Minimum mapping quality (MAPQ) | 30 |
 | `-p, --min-phred INT` | Minimum base quality (Phred score) | 20 |
 | `-c, --min-cov INT` | Minimum coverage threshold | 4 |
@@ -56,24 +59,26 @@ bin/MethylExtractor [options] <input.bam> <output_directory> [reference.fa]
 | `-G, --CHG` | Include CHG methylation contexts | Disabled |
 | `-H, --CHH` | Include CHH methylation contexts | Disabled |
 | `-m, --chrom-mapping FILE` | Chromosome mapping configuration file | `chrom_mapping.json` |
-| `-z, --compression INT` | Compression level (0-8). Zstd with gzip fallback | 6 |
+| `-z, --compression INT` | Compression level (0=none, 1-19=Zstd, gzip fallback) | 6 |
 | `-k, --chunk-size INT` | HDF5 chunk size for I/O optimization | 1,000,000 |
 | `-f, --output-format STR` | Output format: `hdf5`, `txt`, or `both` | `hdf5` |
 | `-s, --split` | Split output by methylation context | Disabled |
 | `-o, --output-dir DIR` | Output directory | N/A |
 
-### 🚀 Performance Optimization (New!)
+### Compression
 
-For the best balance of speed and compression ratio, use **compression level 9**:
+HDF5 output is compressed in-place with the Zstd HDF5 filter when it is available
+(see `make install`, which sets up `HDF5_PLUGIN_PATH`). If the Zstd filter is not
+available at runtime, MethylExtractor falls back to gzip/deflate automatically.
 
 ```bash
-./MethylExtractor input.bam output_dir -z 9 -t 32
+build/dynamic/x64/MethylExtractor input.bam output_dir -z 9 -t 32
 ```
 
-This triggers a special optimization:
-1. Writes uncompressed HDF5 data extremely fast.
-2. Automatically launches a multi-threaded `zstd` process to compress the file in the background.
-3. Result: **~5x faster processing** with maximum compression.
+- `-z 0` disables compression (fastest write, largest files).
+- `-z 1-19` selects the Zstd level (higher = smaller, slower). With the gzip
+  fallback the level is capped at 9.
+- Output files remain valid, self-describing HDF5 in all cases.
 
 ### Chromosome Mapping File
 
@@ -195,7 +200,7 @@ MethylExtractor implements rigorous quality control:
 - **Read-level filtering**: MAPQ ≥ 30, removes duplicates, secondary alignments, and multimappers
 - **Base-level filtering**: Phred ≥ 20 quality scores
 - **Bisulfite validation**: Ensures reads match expected conversion patterns
-- **Overlapping read handling**: Prevents double-counting in paired-end data
+- **Overlapping read handling**: Coordinate-based mate clipping prevents double-counting in paired-end data (the left mate yields the overlap to the right mate so each reference position is counted once)
 - **Coverage normalization**: Optional capping for PCR bias correction
 
 ## Performance Guidelines
@@ -223,7 +228,7 @@ MethylExtractor implements rigorous quality control:
 ### Common Issues
 - **Empty output**: Check chromosome mapping and BAM headers
 - **High memory usage**: Reduce thread count or process fewer chromosomes
-- **Slow processing**: Use SSD storage and adjust chunk sizes. **Try `-z 9` for faster compression.**
+- **Slow processing**: Use SSD storage, increase `--threads`, and adjust chunk sizes. Lower the `-z` level (or use `-z 0`) to trade compression ratio for write speed.
 - **Low methylation**: Verify bisulfite conversion and quality filters
 
 ### Performance Optimization
@@ -237,4 +242,9 @@ For complete documentation, see `MethylExtractor_Documentation.html`.
 
 ## License
 
-This project is licensed under the MIT License.
+Copyright © Epimethyl Analytics. All rights reserved. This software is proprietary;
+see [`LICENSE`](LICENSE) for terms.
+
+MethylExtractor is a fork of [MethylDackel](https://github.com/dpryan79/MethylDackel),
+which is distributed under the MIT License; portions derived from it remain under
+those terms (see the third-party notice in [`LICENSE`](LICENSE)).
