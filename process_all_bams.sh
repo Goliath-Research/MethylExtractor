@@ -15,7 +15,7 @@ CHROM_MAPPING="/work/chrom_mapping.json"
 BASE_DIR="/work/samples"
 
 # MethylExtractor binary (built with `make`)
-METHYL_EXTRACTOR="/home/ubuntu/MethylExtractor/build/dynamic/x64/MethylExtractor"
+METHYL_EXTRACTOR="/home/ubuntu/MethylExtractor/build/dynamic/arm64/MethylExtractor"
 
 # Find all BAM files
 find "$BASE_DIR" -name "*.bam" | while read -r bam_file; do
