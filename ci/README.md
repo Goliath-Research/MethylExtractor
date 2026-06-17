@@ -57,7 +57,7 @@ az vm open-port --resource-group rg-methyl-build --name methyl-build-arm64 --por
   --priority 1001 --source-address "$MY_IP/32"
 ```
 
-SSH in and install build dependencies (or let the pipeline run `make deps` on first build):
+SSH in and install build dependencies (or let the pipeline install them on first build):
 
 ```bash
 az vm show -d --resource-group rg-methyl-build --name methyl-build-arm64 \
@@ -65,8 +65,10 @@ az vm show -d --resource-group rg-methyl-build --name methyl-build-arm64 \
 # ssh azureuser@<public-ip>
 
 sudo apt-get update
-sudo apt-get install -y curl git jq
+sudo apt-get install -y curl git jq build-essential
 ```
+
+The ARM64 release pipeline also runs `apt-get install` for the full MethylExtractor dependency set before `make`, so a minimal VM is fine. Ensure **`azureuser` can run `sudo apt-get` without a password** (default on Ubuntu cloud images).
 
 ### Agent pool + pipeline agent
 

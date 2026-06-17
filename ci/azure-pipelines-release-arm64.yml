@@ -42,7 +42,22 @@ steps:
   - bash: |
       set -euo pipefail
       cd "$(Pipeline.Workspace)/s/$(Build.Repository.Name)"
-      make deps
+      # Fresh build-arm64 VMs may not have make yet; install deps via apt (same set as `make deps`).
+      sudo apt-get update
+      sudo apt-get install -y \
+        build-essential \
+        cmake \
+        git \
+        libhdf5-dev \
+        libhts-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        liblzma-dev \
+        libcurl4-gnutls-dev \
+        libssl-dev \
+        libzstd-dev \
+        zstd \
+        hdf5-tools
       make
     displayName: Build MethylExtractor
 
