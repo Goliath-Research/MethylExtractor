@@ -1,4 +1,7 @@
-# MethylExtractor PR validation — build + smoke test (no publish)
+# MethylExtractor PR validation — x64 build + smoke test (no publish)
+#
+# ARM64 PR builds require the self-hosted build-arm64 pool (use release ARM64 pipeline
+# or add a separate PR pipeline if needed).
 
 trigger: none
 
@@ -9,37 +12,22 @@ pr:
       - master
       - develop
 
-parameters:
-  - name: architectures
-    type: object
-    default:
-      - arm64
-      - x64
+pool:
+  vmImage: ubuntu-latest
 
-stages:
-  - ${{ each arch in parameters.architectures }}:
-      - stage: build_${{ arch }}
-        displayName: PR build ${{ arch }}
-        pool:
-          ${{ if eq(arch, 'arm64') }}:
-            name: GPU-ARM64
-          ${{ else }}:
-            name: GPU-x86_64
-        jobs:
-          - job: build
-            steps:
-              - checkout: self
+steps:
+  - checkout: self
 
-              - script: make
-                displayName: Build MethylExtractor
+  - bash: |
+      set -euo pipefail
+      make deps
+      make
+    displayName: Build MethylExtractor
 
-              - script: |
-                  case "${{ arch }}" in
-                    arm64) SUB=arm64 ;;
-                    *) SUB=x64 ;;
-                  esac
-                  BIN="build/dynamic/${SUB}/MethylExtractor"
-                  [[ -x "$BIN" ]] || { echo "Missing $BIN"; exit 1; }
-                  "$BIN" --help 2>/dev/null || "$BIN" -h 2>/dev/null || true
-                  echo "Smoke OK: $BIN"
-                displayName: Smoke test binary
+  - bash: |
+      set -euo pipefail
+      BIN="build/dynamic/x64/MethylExtractor"
+      [[ -x "$BIN" ]] || { echo "Missing $BIN"; exit 1; }
+      "$BIN" --help 2>/dev/null || "$BIN" -h 2>/dev/null || true
+      echo "Smoke OK: $BIN"
+    displayName: Smoke test binary
