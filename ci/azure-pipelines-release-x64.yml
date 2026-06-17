@@ -16,6 +16,12 @@ resources:
       name: Development/MethylPipeline
       ref: main
 
+parameters:
+  - name: releaseVersion
+    displayName: Release version (manual runs only; e.g. 2026.6.1)
+    type: string
+    default: ''
+
 variables:
   azureDevOpsProject: Development
   methylExtractorFeed: methyl-extractor
@@ -41,7 +47,15 @@ steps:
 
   - bash: |
       set -euo pipefail
-      VERSION="${BUILD_SOURCEBRANCHNAME#v}"
+      if [[ "${BUILD_SOURCEBRANCH}" == refs/tags/v* ]]; then
+        VERSION="${BUILD_SOURCEBRANCHNAME#v}"
+      elif [[ -n "${RELEASE_VERSION_PARAM}" ]]; then
+        VERSION="${RELEASE_VERSION_PARAM}"
+      else
+        echo "##[error]Run from a v* tag (e.g. v2026.6.1) or set pipeline parameter releaseVersion for manual runs."
+        echo "##[error]Manual runs from main leave BUILD_SOURCEBRANCHNAME=main, which is not a valid package version."
+        exit 1
+      fi
       ME_ROOT="$(Pipeline.Workspace)/s/$(Build.Repository.Name)"
       PKG="$(Pipeline.Workspace)/s/MethylPipeline/scripts/package_methyl_extractor.sh"
       OUT="$(Build.ArtifactStagingDirectory)/methyl-extractor-linux-$(archKey).tar.gz"
@@ -55,6 +69,8 @@ steps:
       sha256sum "$OUT" | tee "$(Build.ArtifactStagingDirectory)/universal/$(archKey).sha256"
       echo "##vso[task.setvariable variable=PackageVersion]$VERSION"
     displayName: Package tarball
+    env:
+      RELEASE_VERSION_PARAM: ${{ parameters.releaseVersion }}
 
   - task: PublishPipelineArtifact@1
     inputs:

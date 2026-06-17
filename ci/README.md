@@ -10,6 +10,8 @@ Register in the **MethylExtractor** repository (Development project).
 
 Tag `v2026.6.1` on MethylExtractor runs **both** release pipelines. Each publishes its arch to the `methyl-extractor` Universal Packages feed (`methyl-extractor-linux-aarch64`, `methyl-extractor-linux-amd64`).
 
+**Manual test runs** from `main` are supported: when queueing the pipeline, set parameter **releaseVersion** (e.g. `2026.6.1-test`). Without a tag or that parameter, packaging fails because `main` is not valid SemVer.
+
 Release pipelines check out **MethylPipeline** for `scripts/package_methyl_extractor.sh` only.
 
 ## Prerequisites
