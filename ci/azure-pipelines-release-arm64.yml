@@ -3,6 +3,7 @@
 #
 # Azure DevOps: New pipeline → MethylExtractor-Release-ARM64 → /ci/azure-pipelines-release-arm64.yml
 # Pool: self-hosted build-arm64 (small ARM64 Ubuntu VM; no GPU required)
+# If validation fails on the pool, see ci/README.md § "Troubleshooting: build-arm64"
 
 trigger:
   tags:

@@ -120,6 +120,52 @@ sudo ./svc.sh start
 
 Authorize the pool for YAML pipelines when Azure DevOps prompts on first run ([authorization](https://aka.ms/yamlauthz)).
 
+### Troubleshooting: `Could not find a pool with name build-arm64`
+
+YAML validation fails **before any step runs**. The error text combines two causes: the **Development** project cannot see the pool, or the **pipeline** is not on the allow list.
+
+**Your personal Administrator role does not authorize pipelines.** Azure DevOps has separate sections on the pool **Security** tab:
+
+| Section | Who | What it grants |
+|---------|-----|----------------|
+| **User permissions** | David Izada Rodriguez, groups | Manage/view the pool in UI |
+| **Pipeline permissions** | Each YAML pipeline by name | Use the pool at queue/validate time |
+
+#### Fix 1 — Register the org pool in the Development project (most common)
+
+If you created `build-arm64` under **Organization settings**, the project must link it:
+
+1. **Development** → **Project settings** → **Agent pools**
+2. If **`build-arm64` is missing** from this list (even though it exists at org level):
+   - **Add pool** → **Register existing agent pool from organization** → select **`build-arm64`**
+3. Re-queue **MethylExtractor-Release-ARM64**
+
+#### Fix 2 — Pipeline permissions (required for YAML)
+
+1. **Development** → **Project settings** → **Agent pools** → **`build-arm64`**
+2. Open **Security**
+3. Scroll to **Pipeline permissions** (below user/group permissions)
+4. Either:
+   - **⋯** (upper right of Pipeline permissions) → **Open access** — all YAML pipelines in the project may use this pool, **or**
+   - **+** → select pipeline **`MethylExtractor-Release-ARM64`** → **Authorize**
+
+Without Fix 2, validation fails immediately and there is often **no** “Authorize resources” button on the run.
+
+#### Fix 3 — Agent online
+
+**Agents** tab → at least one agent **Online**. (Offline agents fail later with a different message.)
+
+#### Fix 4 — Multi-repo checkout (after pool works)
+
+First successful run may also prompt to authorize **`Development/MethylPipeline`** repository access — approve that separately.
+
+#### Quick checklist
+
+- [ ] `build-arm64` appears under **Development** project agent pools (not only org settings)
+- [ ] **Pipeline permissions**: Open access **or** **MethylExtractor-Release-ARM64** authorized
+- [ ] At least one agent **Online**
+- [ ] Manual run: set parameter **`releaseVersion`** = `2026.6.1` (not `2026.06.01`)
+
 ### Cost control (optional)
 
 ```bash
