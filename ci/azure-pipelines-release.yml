@@ -1,0 +1,94 @@
+# MethylExtractor production release — tag v* (SemVer e.g. v2026.6.1)
+# Publishes Universal Packages per arch to feed methyl-extractor.
+#
+# Azure DevOps: New pipeline → this repo → /ci/azure-pipelines-release.yml
+
+trigger:
+  tags:
+    include:
+      - v*
+
+resources:
+  repositories:
+    - repository: MethylPipeline
+      type: git
+      name: Development/MethylPipeline
+      ref: main
+
+parameters:
+  - name: architectures
+    type: object
+    default:
+      - arm64
+      - x64
+
+variables:
+  azureDevOpsProject: Development
+  methylExtractorFeed: methyl-extractor
+
+stages:
+  - ${{ each arch in parameters.architectures }}:
+      - stage: build_${{ arch }}
+        displayName: Release ${{ arch }}
+        pool:
+          ${{ if eq(arch, 'arm64') }}:
+            name: GPU-ARM64
+          ${{ else }}:
+            name: GPU-x86_64
+        jobs:
+          - job: package_publish
+            displayName: Build, package, publish
+            steps:
+              - checkout: self
+                persistCredentials: true
+                path: s/$(Build.Repository.Name)
+
+              - checkout: MethylPipeline
+                path: s/MethylPipeline
+
+              - bash: |
+                  set -euo pipefail
+                  cd "$(Pipeline.Workspace)/s/$(Build.Repository.Name)"
+                  make
+                displayName: Build MethylExtractor
+
+              - bash: |
+                  set -euo pipefail
+                  VERSION="${BUILD_SOURCEBRANCHNAME#v}"
+                  ME_ROOT="$(Pipeline.Workspace)/s/$(Build.Repository.Name)"
+                  ARCH_LABEL="${{ arch }}"
+                  case "$ARCH_LABEL" in
+                    arm64) KEY=aarch64 ;;
+                    x64) KEY=amd64 ;;
+                  esac
+                  PKG="$(Pipeline.Workspace)/s/MethylPipeline/scripts/package_methyl_extractor.sh"
+                  OUT="$(Build.ArtifactStagingDirectory)/methyl-extractor-linux-${KEY}.tar.gz"
+                  bash "$PKG" \
+                    --build-dir "$ME_ROOT" \
+                    --arch "$KEY" \
+                    --version "$VERSION" \
+                    --output "$OUT"
+                  mkdir -p "$(Build.ArtifactStagingDirectory)/universal"
+                  cp "$OUT" "$(Build.ArtifactStagingDirectory)/universal/"
+                  sha256sum "$OUT" | tee "$(Build.ArtifactStagingDirectory)/universal/${KEY}.sha256"
+                  echo "##vso[task.setvariable variable=PackageVersion]$VERSION"
+                  echo "##vso[task.setvariable variable=ArchKey]$KEY"
+                displayName: Package tarball
+
+              - task: PublishPipelineArtifact@1
+                inputs:
+                  targetPath: $(Build.ArtifactStagingDirectory)
+                  artifactName: methyl-extractor-${{ arch }}-$(PackageVersion)
+                displayName: Publish pipeline artifact
+
+              - task: UniversalPackages@0
+                displayName: Publish Universal Package
+                inputs:
+                  command: publish
+                  publishDirectory: $(Build.ArtifactStagingDirectory)/universal
+                  feedsToUsePublish: internal
+                  vstsFeedPublish: $(azureDevOpsProject)/$(methylExtractorFeed)
+                  vstsFeedPackagePublish: methyl-extractor-linux-$(ArchKey)
+                  versionOption: custom
+                  versionPublish: $(PackageVersion)
+                  packagePublishDescription: MethylExtractor binary tarball ($(ArchKey))
