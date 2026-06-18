@@ -2,6 +2,8 @@
 
 Register in the **MethylExtractor** repository (Development project).
 
+See also: [implementation plans](../docs/plans/README.md) (Azure DevOps Task/Epic traceability).
+
 | YAML | Suggested pipeline name | Pool | Trigger |
 |------|-------------------------|------|---------|
 | [`azure-pipelines-pr.yml`](azure-pipelines-pr.yml) | MethylExtractor-PR | Microsoft-hosted `ubuntu-latest` | Pull requests |
