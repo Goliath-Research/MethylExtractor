@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
+#include <limits.h>
 #include <htslib/sam.h>
 #include <htslib/faidx.h>
 #include <unistd.h>
@@ -42,6 +44,14 @@
 
 #define ZSTD_FILTER 32015
 
+#define MAX_CONTEXTS_PER_CHR 3
+#define COV_HIST_BINS 256
+
+#define EXTRACTION_CONTEXT_QC_SCHEMA "methylextractor.context_qc"
+#define EXTRACTION_MANIFEST_SCHEMA "methylextractor.extraction_manifest"
+#define EXTRACTION_CONTEXT_QC_VERSION "1.0.0"
+#define EXTRACTION_MANIFEST_VERSION "1.0.0"
+
 typedef enum
 {
     OUTPUT_NONE = 0,
@@ -66,13 +76,92 @@ typedef struct
     uint8_t _pad[1];
 } MethylRecord;
 
-// Private per-thread counters (dense genomic arrays)
 typedef struct
 {
     uint32_t *mC;
     uint32_t *uC;
     size_t size;
 } PrivateCounts;
+
+typedef struct
+{
+    uint64_t reads_seen;
+    uint64_t reads_used;
+    uint64_t reads_dropped_unmapped;
+    uint64_t reads_dropped_secondary;
+    uint64_t reads_dropped_qc_fail;
+    uint64_t reads_dropped_duplicate;
+    uint64_t reads_dropped_supplementary;
+    uint64_t reads_dropped_low_mapq;
+    uint64_t reads_dropped_multimap;
+    uint64_t reads_dropped_no_strand;
+    uint64_t bases_skipped_overlap_clip;
+    uint64_t bases_skipped_low_phred;
+    uint64_t bases_skipped_non_cytosine;
+    uint64_t bases_counted_methylated;
+    uint64_t bases_counted_unmethylated;
+} FilterStats;
+
+typedef struct
+{
+    size_t num_positions;
+    uint64_t total_methylated, total_unmethylated;
+    double avg_methylation_level, avg_coverage;
+    size_t sites_in_reference;
+    size_t sites_with_any_coverage;
+    size_t sites_below_min_cov;
+    size_t sites_capped;
+    double avg_coverage_all_sites;
+    double coverage_median;
+    double coverage_p10;
+    double coverage_p90;
+    double methylation_plus;
+    double methylation_minus;
+    uint64_t methylated_plus;
+    uint64_t unmethylated_plus;
+    uint64_t methylated_minus;
+    uint64_t unmethylated_minus;
+} MethylStats;
+
+typedef struct
+{
+    const char *chromosome;
+    const char *context;
+    const char *output_path;
+    int min_mapq;
+    int min_phred;
+    int min_cov;
+    int cap_cov;
+} ExtractionMeta;
+
+typedef struct
+{
+    char context[8];
+    char output_path[1024];
+    MethylStats stats;
+} ContextExport;
+
+typedef struct
+{
+    char chromosome[64];
+    int n_contexts;
+    ContextExport contexts[MAX_CONTEXTS_PER_CHR];
+    FilterStats filter_stats;
+} ChromosomeExport;
+
+typedef struct
+{
+    const char *bam_file;
+    const char *out_dir;
+    const char *reference;
+    int min_mapq;
+    int min_phred;
+    int min_cov;
+    int cap_cov;
+    int keep_chg;
+    int keep_chh;
+    int split_context_files;
+} SampleRunInfo;
 
 typedef struct
 {
@@ -96,16 +185,17 @@ typedef struct
     OutputFormat output_format;
     int split_context_files;
     int num_threads;
+    ChromosomeExport *chr_export;
 } ThreadArg;
 
-// Extended for private counting
 typedef struct
 {
     ThreadArg base;
     PrivateCounts counts;
-    hts_idx_t *idx; // shared, read-only BAM index (owned by process_chromosome)
+    hts_idx_t *idx;
     size_t start_site_idx;
     size_t end_site_idx;
+    FilterStats filter_stats;
 } RegionArg;
 
 typedef struct
@@ -118,12 +208,10 @@ typedef struct
 
 typedef struct
 {
-    size_t num_positions;
-    uint64_t total_methylated, total_unmethylated;
-    double avg_methylation_level, avg_coverage;
-} MethylStats;
-
-// Function Prototypes
+    uint64_t bins[COV_HIST_BINS];
+    uint64_t overflow;
+    uint64_t total_sites;
+} CoverageHistogram;
 
 // utils.c
 void log_time(const char *format, ...);
@@ -141,13 +229,25 @@ size_t count_methylation_sites(const char *chr_seq, uint32_t chr_len, int keep_c
 void initialize_buffer(MethylRecord *buffer, size_t site_count, const char *chr_seq, uint32_t chr_len, int keep_chg, int keep_chh);
 
 // output_formats.c
+void merge_filter_stats(FilterStats *dst, const FilterStats *src);
+void coverage_histogram_init(CoverageHistogram *hist);
+void coverage_histogram_add(CoverageHistogram *hist, uint32_t coverage);
+double coverage_histogram_percentile(const CoverageHistogram *hist, double percentile);
 MethylStats calculate_statistics(MethylRecord *filtered_buffer, size_t n_records);
-int write_statistics_json(const char *base_filename, MethylStats stats);
+MethylStats analyze_buffer(MethylRecord *buffer, size_t n_records, int min_cov);
 size_t flush_buffer(const char *filename, MethylRecord *buffer, size_t n_records,
                     int compression, int chunk_size, int append_mode,
-                    int min_cov, int cap_cov,
-                    OutputFormat output_format);
+                    int min_cov, int cap_cov, OutputFormat output_format,
+                    const ExtractionMeta *meta, const FilterStats *filter_stats,
+                    MethylStats *out_stats);
 void cleanup_hdf5(void);
+
+// extraction_export.c
+int write_context_qc_json(const char *base_filename, const ExtractionMeta *meta,
+                          const FilterStats *filter_stats, MethylStats stats);
+int write_extraction_manifest(const SampleRunInfo *run,
+                              const ChromosomeExport *chromosomes, int n_chromosomes);
+void path_basename(const char *path, char *out, size_t out_len);
 
 // bam_processing.c
 int getRealStrand(bam1_t *b);

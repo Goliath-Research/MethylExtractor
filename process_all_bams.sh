@@ -45,6 +45,8 @@ find "$BASE_DIR" -name "*.bam" | while read -r bam_file; do
 
     if [ $? -eq 0 ]; then
         echo "Successfully processed $sample_id"
+        echo "Extraction manifest: ${output_dir}/${sample_id}.extraction_manifest.json"
+        echo "Post-extraction Pass/Fail QC is run by MethylPipeline using the manifest and JSON sidecars."
     else
         echo "Error processing $sample_id"
     fi

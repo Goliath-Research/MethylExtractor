@@ -137,7 +137,9 @@ Human-readable tab-separated values:
 
 ### Statistics Output
 
-Each run generates a JSON statistics file with genome-wide metrics:
+Each output file (`{chrom}-{context}.h5` or `{chrom}.h5`) gets a companion JSON sidecar with legacy top-level fields plus an extended QC block for [MethylPipeline](https://github.com/) post-extraction Pass/Fail evaluation.
+
+**Legacy fields** (unchanged for backward compatibility):
 
 ```json
 {
@@ -148,6 +150,27 @@ Each run generates a JSON statistics file with genome-wide metrics:
   "avg_coverage": 17.65
 }
 ```
+
+**Extended context QC** (`schema_name`: `methylextractor.context_qc`) adds:
+
+- `metadata` — chromosome, context, filters (`min_mapq`, `min_phred`, `min_cov`, `cap_cov`)
+- `sites` — `sites_in_reference`, `sites_passing_min_cov`, `fraction_sites_covered`
+- `coverage` — mean/median/p10/p90 on all reference sites
+- `methylation` — global level and `by_strand` (+/−)
+- `read_filtering` — per-chromosome read drop counts and retention rate
+
+### Extraction manifest (sample-level)
+
+After all chromosomes complete, MethylExtractor writes `{sample_id}.extraction_manifest.json` in the output directory (`schema_name`: `methylextractor.extraction_manifest`). MethylPipeline should consume this file (and/or per-context JSON sidecars) to run post-extraction guardrails — Pass/Fail is **not** computed in MethylExtractor.
+
+The manifest contains:
+
+- `metadata` — sample ID, BAM path, reference, contexts extracted (CG always; CHG/CHH when `-G`/`-H` used), filter parameters
+- `summary` — genome-wide weighted CpG coverage/methylation, CHG/CHH methylation when applicable, `cpg_fraction_sites_covered`
+- `read_filtering` — aggregated read filter stats across chromosomes
+- `per_chromosome` — per-context stats and read filtering for each chromosome
+
+Example path: `/work/samples/1401-042825-50082/1401-042825-50082.extraction_manifest.json`
 
 ## Examples
 

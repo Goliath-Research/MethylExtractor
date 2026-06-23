@@ -1,16 +1,78 @@
 #include "methyl_extractor.h"
 
-MethylStats calculate_statistics(MethylRecord *filtered_buffer,
-                                 size_t n_records)
+void merge_filter_stats(FilterStats *dst, const FilterStats *src)
 {
-    MethylStats stats = {0, 0, 0, 0.0, 0.0};
+    if (!dst || !src)
+        return;
+    dst->reads_seen += src->reads_seen;
+    dst->reads_used += src->reads_used;
+    dst->reads_dropped_unmapped += src->reads_dropped_unmapped;
+    dst->reads_dropped_secondary += src->reads_dropped_secondary;
+    dst->reads_dropped_qc_fail += src->reads_dropped_qc_fail;
+    dst->reads_dropped_duplicate += src->reads_dropped_duplicate;
+    dst->reads_dropped_supplementary += src->reads_dropped_supplementary;
+    dst->reads_dropped_low_mapq += src->reads_dropped_low_mapq;
+    dst->reads_dropped_multimap += src->reads_dropped_multimap;
+    dst->reads_dropped_no_strand += src->reads_dropped_no_strand;
+    dst->bases_skipped_overlap_clip += src->bases_skipped_overlap_clip;
+    dst->bases_skipped_low_phred += src->bases_skipped_low_phred;
+    dst->bases_skipped_non_cytosine += src->bases_skipped_non_cytosine;
+    dst->bases_counted_methylated += src->bases_counted_methylated;
+    dst->bases_counted_unmethylated += src->bases_counted_unmethylated;
+}
+
+void coverage_histogram_init(CoverageHistogram *hist)
+{
+    if (!hist)
+        return;
+    memset(hist, 0, sizeof(*hist));
+}
+
+void coverage_histogram_add(CoverageHistogram *hist, uint32_t coverage)
+{
+    if (!hist)
+        return;
+    if (coverage >= COV_HIST_BINS)
+        hist->overflow++;
+    else
+        hist->bins[coverage]++;
+    hist->total_sites++;
+}
+
+double coverage_histogram_percentile(const CoverageHistogram *hist, double percentile)
+{
+    if (!hist || hist->total_sites == 0)
+        return 0.0;
+    if (percentile < 0.0)
+        percentile = 0.0;
+    if (percentile > 1.0)
+        percentile = 1.0;
+
+    uint64_t target = (uint64_t)ceil(percentile * (double)hist->total_sites);
+    if (target == 0)
+        target = 1;
+
+    uint64_t cumulative = 0;
+    for (int i = 0; i < COV_HIST_BINS; i++)
+    {
+        cumulative += hist->bins[i];
+        if (cumulative >= target)
+            return (double)i;
+    }
+    return (double)COV_HIST_BINS;
+}
+
+MethylStats calculate_statistics(MethylRecord *filtered_buffer, size_t n_records)
+{
+    MethylStats stats;
+    memset(&stats, 0, sizeof(stats));
 
     if (n_records == 0)
         return stats;
 
     stats.num_positions = n_records;
+    stats.sites_in_reference = n_records;
 
-    // Use uint64_t to avoid overflow for large datasets
     uint64_t total_mC = 0;
     uint64_t total_uC = 0;
 
@@ -24,7 +86,6 @@ MethylStats calculate_statistics(MethylRecord *filtered_buffer,
     stats.total_unmethylated = total_uC;
 
     uint64_t total_coverage = total_mC + total_uC;
-
     if (total_coverage > 0)
     {
         stats.avg_methylation_level = (double)total_mC / (double)total_coverage;
@@ -34,75 +95,71 @@ MethylStats calculate_statistics(MethylRecord *filtered_buffer,
     return stats;
 }
 
-int write_statistics_json(const char *base_filename, MethylStats stats)
+MethylStats analyze_buffer(MethylRecord *buffer, size_t n_records, int min_cov)
 {
-    char json_filename[1024];
+    MethylStats stats;
+    memset(&stats, 0, sizeof(stats));
 
-    // Create JSON filename by replacing the extension with .json
-    const char *dot = strrchr(base_filename, '.');
-    if (dot && (strcmp(dot, ".txt") == 0 || strcmp(dot, ".h5") == 0))
+    if (n_records == 0)
+        return stats;
+
+    stats.sites_in_reference = n_records;
+
+    CoverageHistogram hist;
+    coverage_histogram_init(&hist);
+
+    uint64_t total_coverage_all = 0;
+    uint64_t plus_mC = 0, plus_uC = 0, minus_mC = 0, minus_uC = 0;
+
+    for (size_t i = 0; i < n_records; i++)
     {
-        size_t base_len = dot - base_filename;
-        strncpy(json_filename, base_filename, base_len);
-        json_filename[base_len] = '\0';
-        strcat(json_filename, ".json");
-    }
-    else
-        snprintf(json_filename, sizeof(json_filename), "%s.json", base_filename);
+        uint32_t cov = (uint32_t)buffer[i].mC + (uint32_t)buffer[i].uC;
+        coverage_histogram_add(&hist, cov);
+        total_coverage_all += cov;
 
-    // Create JSON object
-    cJSON *root = cJSON_CreateObject();
-    if (!root)
-    {
-        fprintf(stderr, "Failed to create JSON root object\n");
-        return -1;
-    }
+        if (cov > 0)
+            stats.sites_with_any_coverage++;
+        if (cov > 0 && cov < (uint32_t)min_cov)
+            stats.sites_below_min_cov++;
 
-    // Add statistics to JSON
-    cJSON_AddNumberToObject(root, "num_positions", (double)stats.num_positions);
-    cJSON_AddNumberToObject(root, "total_methylated",
-                            (double)stats.total_methylated);
-    cJSON_AddNumberToObject(root, "total_unmethylated",
-                            (double)stats.total_unmethylated);
-    cJSON_AddNumberToObject(root, "avg_methylation_level",
-                            stats.avg_methylation_level);
-    cJSON_AddNumberToObject(root, "avg_coverage", stats.avg_coverage);
-
-    // Write JSON to file
-    char *json_string = cJSON_Print(root);
-    if (!json_string)
-    {
-        fprintf(stderr, "Failed to print JSON\n");
-        cJSON_Delete(root);
-        return -1;
+        if (buffer[i].tnc.strand)
+        {
+            minus_mC += buffer[i].mC;
+            minus_uC += buffer[i].uC;
+        }
+        else
+        {
+            plus_mC += buffer[i].mC;
+            plus_uC += buffer[i].uC;
+        }
     }
 
-    FILE *json_fp = fopen(json_filename, "w");
-    if (!json_fp)
-    {
-        fprintf(stderr, "Failed to open JSON file for writing: %s\n",
-                json_filename);
-        free(json_string);
-        cJSON_Delete(root);
-        return -1;
-    }
+    stats.avg_coverage_all_sites =
+        (double)total_coverage_all / (double)n_records;
+    stats.coverage_p10 = coverage_histogram_percentile(&hist, 0.10);
+    stats.coverage_median = coverage_histogram_percentile(&hist, 0.50);
+    stats.coverage_p90 = coverage_histogram_percentile(&hist, 0.90);
 
-    fprintf(json_fp, "%s\n", json_string);
-    fclose(json_fp);
+    stats.methylated_plus = plus_mC;
+    stats.unmethylated_plus = plus_uC;
+    stats.methylated_minus = minus_mC;
+    stats.unmethylated_minus = minus_uC;
 
-    log_time("Wrote statistics to: %s\n", json_filename);
+    uint64_t plus_total = plus_mC + plus_uC;
+    uint64_t minus_total = minus_mC + minus_uC;
+    if (plus_total > 0)
+        stats.methylation_plus = (double)plus_mC / (double)plus_total;
+    if (minus_total > 0)
+        stats.methylation_minus = (double)minus_mC / (double)minus_total;
 
-    // Cleanup
-    free(json_string);
-    cJSON_Delete(root);
-
-    return 0;
+    return stats;
 }
 
 size_t flush_buffer(const char *filename, MethylRecord *buffer,
                     size_t n_records, int compression, int chunk_size,
                     int append_mode, int min_cov, int cap_cov,
-                    OutputFormat output_format)
+                    OutputFormat output_format, const ExtractionMeta *meta,
+                    const FilterStats *filter_stats, MethylStats *out_stats)
 {
     size_t records_written = 0;
     hsize_t dims[1] = {0};
@@ -111,8 +168,8 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer,
           dcpl = -1;
     herr_t status = -1;
 
-    // Calculate the number of records to write (filtered by coverage)
-    // and the average coverage
+    MethylStats pre_stats = analyze_buffer(buffer, n_records, min_cov);
+
     double avg_cov = 0.0;
     for (size_t i = 0; i < n_records; i++)
     {
@@ -120,19 +177,21 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer,
         if (total >= min_cov)
         {
             dims[0]++;
-            // Online mean update using dims[0] as valid_count
             avg_cov += ((double)total - avg_cov) / dims[0];
         }
     }
 
-    // If no records pass the filter, return early
     if (dims[0] == 0)
     {
         log_time("No records passed the coverage filter\n");
+        if (out_stats)
+        {
+            *out_stats = pre_stats;
+            out_stats->num_positions = 0;
+        }
         return 0;
     }
 
-    // Prepare filtered buffer
     MethylRecord *filtered_buffer = malloc(dims[0] * sizeof(MethylRecord));
     if (!filtered_buffer)
     {
@@ -140,25 +199,24 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer,
         goto cleanup;
     }
 
-    // fill filtered buffer
+    size_t sites_capped = 0;
     size_t j = 0;
     for (size_t i = 0; i < n_records; i++)
     {
         int coverage = buffer[i].mC + buffer[i].uC;
         if (coverage >= min_cov)
         {
-            // Only cap coverage if enabled
             if (cap_cov && coverage > avg_cov)
             {
                 double prop = (double)buffer[i].mC / coverage;
-                buffer[i].mC = (uint16_t)round((avg_cov * prop));
+                buffer[i].mC = (uint16_t)round(avg_cov * prop);
                 buffer[i].uC = (uint16_t)(avg_cov - buffer[i].mC);
+                sites_capped++;
             }
             filtered_buffer[j++] = buffer[i];
         }
     }
 
-    // Handle TXT output
     if (output_format == OUTPUT_TXT || output_format == OUTPUT_BOTH)
     {
         char txt_filename[1024];
@@ -206,10 +264,6 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer,
         txt_fp = NULL;
     }
 
-    // Note: Parquet output removed to maintain pure C implementation
-    // Use HDF5 format with proper compression instead
-
-    // Handle HDF5 output
     if (output_format == OUTPUT_HDF5 || output_format == OUTPUT_BOTH)
     {
         log_time("Starting to write HDF5 file: %s\n", filename);
@@ -251,10 +305,6 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer,
             goto cleanup;
         }
 
-        // Set compression. Prefer Zstd, but only if the filter is actually
-        // available at runtime; otherwise fall back to gzip deterministically.
-        // (H5Pset_filter alone does not detect a missing plugin, and
-        // H5Z_FLAG_OPTIONAL would silently write uncompressed data instead.)
         if (compression > 0)
         {
             htri_t zstd_avail = H5Zfilter_avail(ZSTD_FILTER);
@@ -268,10 +318,7 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer,
                     fprintf(stderr, "Warning: failed to set Zstd filter, falling "
                                     "back to gzip\n");
                 else
-                {
-                    log_time("Using Zstd compression level %d\n", compression);
                     use_gzip = 0;
-                }
             }
             else
                 fprintf(stderr, "Note: Zstd HDF5 filter not available "
@@ -279,19 +326,11 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer,
 
             if (use_gzip)
             {
-                // gzip/deflate supports levels 0-9
                 int gzip_level = compression > 9 ? 9 : compression;
                 if (H5Pset_deflate(dcpl, gzip_level) < 0)
                     fprintf(stderr, "Warning: gzip compression failed, writing "
                                     "uncompressed HDF5\n");
-                else
-                    log_time("Using gzip compression level %d\n", gzip_level);
             }
-        }
-        else
-        {
-            // compression == 0 → truly raw
-            log_time("Writing raw uncompressed HDF5\n");
         }
 
         mem_type = H5Tcopy(type);
@@ -358,10 +397,29 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer,
         log_time("Finished writing HDF5 file: %s\n", filename);
     }
 
-    // Calculate and write statistics (same for both formats since content is
-    // identical)
     MethylStats stats = calculate_statistics(filtered_buffer, dims[0]);
-    write_statistics_json(filename, stats);
+    stats.sites_in_reference = pre_stats.sites_in_reference;
+    stats.sites_with_any_coverage = pre_stats.sites_with_any_coverage;
+    stats.sites_below_min_cov = pre_stats.sites_below_min_cov;
+    stats.sites_capped = sites_capped;
+    stats.avg_coverage_all_sites = pre_stats.avg_coverage_all_sites;
+    stats.coverage_p10 = pre_stats.coverage_p10;
+    stats.coverage_median = pre_stats.coverage_median;
+    stats.coverage_p90 = pre_stats.coverage_p90;
+    stats.methylation_plus = pre_stats.methylation_plus;
+    stats.methylation_minus = pre_stats.methylation_minus;
+    stats.methylated_plus = pre_stats.methylated_plus;
+    stats.unmethylated_plus = pre_stats.unmethylated_plus;
+    stats.methylated_minus = pre_stats.methylated_minus;
+    stats.unmethylated_minus = pre_stats.unmethylated_minus;
+
+    if (meta)
+        write_context_qc_json(filename, meta, filter_stats, stats);
+    else
+        write_context_qc_json(filename, NULL, filter_stats, stats);
+
+    if (out_stats)
+        *out_stats = stats;
 
     records_written = dims[0];
     log_time("Finished writing output files, wrote %llu filtered records\n",

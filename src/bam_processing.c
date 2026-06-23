@@ -57,18 +57,53 @@ void *process_region_direct(void *arg)
     while (sam_itr_next(in, iter, b) >= 0)
     {
         bam1_core_t *c = &b->core;
-        if (c->flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP |
-                       BAM_FSUPPLEMENTARY))
+        int used_this_read = 0;
+
+        r->filter_stats.reads_seen++;
+
+        if (c->flag & BAM_FUNMAP)
+        {
+            r->filter_stats.reads_dropped_unmapped++;
             continue;
+        }
+        if (c->flag & BAM_FSECONDARY)
+        {
+            r->filter_stats.reads_dropped_secondary++;
+            continue;
+        }
+        if (c->flag & BAM_FQCFAIL)
+        {
+            r->filter_stats.reads_dropped_qc_fail++;
+            continue;
+        }
+        if (c->flag & BAM_FDUP)
+        {
+            r->filter_stats.reads_dropped_duplicate++;
+            continue;
+        }
+        if (c->flag & BAM_FSUPPLEMENTARY)
+        {
+            r->filter_stats.reads_dropped_supplementary++;
+            continue;
+        }
         if (c->qual < t->min_mapq)
+        {
+            r->filter_stats.reads_dropped_low_mapq++;
             continue;
+        }
         uint8_t *nh = bam_aux_get(b, "NH");
         if (nh && bam_aux2i(nh) > 1)
+        {
+            r->filter_stats.reads_dropped_multimap++;
             continue;
+        }
 
         int strand = getRealStrand(b);
         if (strand == 0)
+        {
+            r->filter_stats.reads_dropped_no_strand++;
             continue;
+        }
 
         // Overlapping mate de-duplication (coordinate-based clip). For an FR
         // read pair the two mates overlap; to count each reference position
@@ -105,6 +140,9 @@ void *process_region_direct(void *arg)
                     if (pos >= clip_from || pos < t->start_pos ||
                         pos >= t->end_pos)
                     {
+                        if (pos >= clip_from && pos < t->end_pos &&
+                            pos >= t->start_pos)
+                            r->filter_stats.bases_skipped_overlap_clip++;
                         pos++;
                         qpos++;
                         continue;
@@ -112,12 +150,14 @@ void *process_region_direct(void *arg)
                     char ref = toupper(t->chr_seq[pos]);
                     if (ref != 'C' && ref != 'G')
                     {
+                        r->filter_stats.bases_skipped_non_cytosine++;
                         pos++;
                         qpos++;
                         continue;
                     }
                     if (qual[qpos] < t->min_phred)
                     {
+                        r->filter_stats.bases_skipped_low_phred++;
                         pos++;
                         qpos++;
                         continue;
@@ -129,16 +169,32 @@ void *process_region_direct(void *arg)
                     if (ref == 'C' && (strand == 1 || strand == 3))
                     {
                         if (base == 2)
-                            r->counts.mC[rel]++; // C->C methylated
+                        {
+                            r->counts.mC[rel]++;
+                            r->filter_stats.bases_counted_methylated++;
+                            used_this_read = 1;
+                        }
                         else if (base == 8)
-                            r->counts.uC[rel]++; // C->T unmethylated
+                        {
+                            r->counts.uC[rel]++;
+                            r->filter_stats.bases_counted_unmethylated++;
+                            used_this_read = 1;
+                        }
                     }
                     else if (ref == 'G' && (strand == 2 || strand == 4))
                     {
                         if (base == 4)
-                            r->counts.mC[rel]++; // G->G methylated
+                        {
+                            r->counts.mC[rel]++;
+                            r->filter_stats.bases_counted_methylated++;
+                            used_this_read = 1;
+                        }
                         else if (base == 1)
-                            r->counts.uC[rel]++; // G->A unmethylated
+                        {
+                            r->counts.uC[rel]++;
+                            r->filter_stats.bases_counted_unmethylated++;
+                            used_this_read = 1;
+                        }
                     }
                     pos++;
                     qpos++;
@@ -149,6 +205,9 @@ void *process_region_direct(void *arg)
             else if (op == BAM_CINS || op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP)
                 qpos += len;
         }
+
+        if (used_this_read)
+            r->filter_stats.reads_used++;
     }
 
     bam_destroy1(b);
@@ -158,8 +217,31 @@ void *process_region_direct(void *arg)
     return NULL;
 }
 
+static void record_context_export(ChromosomeExport *export_out, const char *context,
+                                  const char *output_path, const MethylStats *stats)
+{
+    if (!export_out || export_out->n_contexts >= MAX_CONTEXTS_PER_CHR)
+        return;
+
+    ContextExport *ctx = &export_out->contexts[export_out->n_contexts++];
+    strncpy(ctx->context, context, sizeof(ctx->context) - 1);
+    ctx->context[sizeof(ctx->context) - 1] = '\0';
+    strncpy(ctx->output_path, output_path, sizeof(ctx->output_path) - 1);
+    ctx->output_path[sizeof(ctx->output_path) - 1] = '\0';
+    if (stats)
+        ctx->stats = *stats;
+}
+
 void process_chromosome(ThreadArg *targ)
 {
+    ChromosomeExport *export_out = targ->chr_export;
+    if (export_out)
+    {
+        memset(export_out, 0, sizeof(*export_out));
+        strncpy(export_out->chromosome, targ->chr, sizeof(export_out->chromosome) - 1);
+        export_out->chromosome[sizeof(export_out->chromosome) - 1] = '\0';
+    }
+
     size_t site_count = count_methylation_sites(targ->chr_seq, targ->chr_len,
                                                 targ->keep_chg, targ->keep_chh);
     if (site_count == 0)
@@ -210,6 +292,7 @@ void process_chromosome(ThreadArg *targ)
             break;
 
         RegionArg *r = &regions[i];
+        memset(&r->filter_stats, 0, sizeof(r->filter_stats));
         r->base = *targ;
         r->idx = idx;
         r->start_site_idx = start_idx;
@@ -233,6 +316,13 @@ void process_chromosome(ThreadArg *targ)
 
     for (int i = 0; i < n_created; i++)
         pthread_join(threads[i], NULL);
+
+    FilterStats chr_filters;
+    memset(&chr_filters, 0, sizeof(chr_filters));
+    for (int i = 0; i < n_created; i++)
+        merge_filter_stats(&chr_filters, &regions[i].filter_stats);
+    if (export_out)
+        export_out->filter_stats = chr_filters;
 
     for (int i = 0; i < n_created; i++)
     {
@@ -277,9 +367,21 @@ void process_chromosome(ThreadArg *targ)
                 snprintf(out_path, sizeof(out_path), "%s/%s-%s%s", targ->out_dir,
                          targ->chr, get_context_string(ctx), ext);
 
+                ExtractionMeta meta = {
+                    .chromosome = targ->chr,
+                    .context = get_context_string(ctx),
+                    .output_path = out_path,
+                    .min_mapq = targ->min_mapq,
+                    .min_phred = targ->min_phred,
+                    .min_cov = targ->min_cov,
+                    .cap_cov = targ->cap_cov,
+                };
+                MethylStats ctx_stats;
                 flush_buffer(out_path, ctx_buffer, n_ctx_records, targ->compression,
                              targ->hdf5_chunk_size, 0, targ->min_cov, targ->cap_cov,
-                             targ->output_format);
+                             targ->output_format, &meta, &chr_filters, &ctx_stats);
+                record_context_export(export_out, get_context_string(ctx), out_path,
+                                      &ctx_stats);
 
                 free(ctx_buffer);
 
@@ -295,9 +397,20 @@ void process_chromosome(ThreadArg *targ)
                           : ".h5"; // For OUTPUT_BOTH, use .h5
         snprintf(out_path, sizeof(out_path), "%s/%s%s", targ->out_dir, targ->chr,
                  ext);
+        ExtractionMeta meta = {
+            .chromosome = targ->chr,
+            .context = "ALL",
+            .output_path = out_path,
+            .min_mapq = targ->min_mapq,
+            .min_phred = targ->min_phred,
+            .min_cov = targ->min_cov,
+            .cap_cov = targ->cap_cov,
+        };
+        MethylStats chr_stats;
         flush_buffer(out_path, buffer, site_count, targ->compression,
                      targ->hdf5_chunk_size, 0, targ->min_cov, targ->cap_cov,
-                     targ->output_format);
+                     targ->output_format, &meta, &chr_filters, &chr_stats);
+        record_context_export(export_out, "ALL", out_path, &chr_stats);
 
         // Note: External compression removed to maintain HDF5 compatibility
     }

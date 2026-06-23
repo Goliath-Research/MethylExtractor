@@ -311,9 +311,12 @@ int main(int argc, char *argv[])
 
     log_time("Allocating thread arguments...\n");
     ThreadArg *thread_args = malloc(header->n_targets * sizeof(ThreadArg));
-    if (!thread_args)
+    ChromosomeExport *chr_exports = calloc(header->n_targets, sizeof(ChromosomeExport));
+    if (!thread_args || !chr_exports)
     {
         fprintf(stderr, "Failed to allocate thread arguments\n");
+        free(thread_args);
+        free(chr_exports);
         sam_hdr_destroy(header);
         fai_destroy(fai);
         return 1;
@@ -361,6 +364,7 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].output_format = output_format;
         thread_args[valid_chr_count].split_context_files = split_context_files;
         thread_args[valid_chr_count].num_threads = num_threads;
+        thread_args[valid_chr_count].chr_export = &chr_exports[valid_chr_count];
         valid_chr_count++;
     }
     free(chroms);
@@ -374,6 +378,21 @@ int main(int argc, char *argv[])
     for (int i = 0; i < valid_chr_count; i++)
         process_chromosome(&thread_args[i]);
 
+    SampleRunInfo run_info = {
+        .bam_file = bam_file,
+        .out_dir = out_dir,
+        .reference = ref_file,
+        .min_mapq = min_mapq,
+        .min_phred = min_phred,
+        .min_cov = min_cov,
+        .cap_cov = cap_cov,
+        .keep_chg = keep_chg,
+        .keep_chh = keep_chh,
+        .split_context_files = split_context_files,
+    };
+    if (write_extraction_manifest(&run_info, chr_exports, valid_chr_count) != 0)
+        fprintf(stderr, "Warning: failed to write extraction manifest\n");
+
     log_time("Cleaning up HDF5...\n");
     cleanup_hdf5();
 
@@ -384,6 +403,7 @@ int main(int argc, char *argv[])
         free(thread_args[i].chr); // Free the copied chromosome name
     }
     free(thread_args);
+    free(chr_exports);
     sam_hdr_destroy(header);
     fai_destroy(fai);
     if (mapping_ref_file)
