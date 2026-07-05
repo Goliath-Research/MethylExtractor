@@ -71,12 +71,12 @@ typedef struct
 | Base filter | Phred threshold | Phred threshold (`-p`) | Equivalent. |
 | **Overlapping mate de-dup** | **Yes** | **Claimed, but NOT implemented** | See §5.1 — major gap. |
 | M-bias analysis (`mbias`) | Yes (plots + trimming) | No | MethylDackel feature not ported. |
-| Read-level / per-read methylation | Yes (`--perRead`) | No | Not ported. |
+| Read-level / per-read methylation | Yes (`--perRead`) | Yes (`--read-level` tile-pattern sidecars) | Sidecar `{chrom}-{ctx}.patterns.h5` per MethylPipeline contract; not per-read text dumps. |
 | Output formats | bedGraph, methylKit, cytosine report | HDF5, TXT, both; per-context split | ME trades interchange formats for compact HDF5. |
 | Coverage cap | No (external) | Yes (`-C`, mean-based downscale) | ME adds this natively. |
 | Stats summary | No native JSON | Per-file stats JSON | ME adds this. |
 
-**Conclusion for §3:** For the common "extract mC/uC per cytosine by context" task, MethylExtractor is functionally comparable to MethylDackel and adds useful native features (coverage capping, stats JSON, compact partitioned output). It omits M-bias analysis and per-read output, and — critically — does not implement the overlapping-mate handling it advertises.
+**Conclusion for §3:** For the common "extract mC/uC per cytosine by context" task, MethylExtractor is functionally comparable to MethylDackel and adds useful native features (coverage capping, stats JSON, compact partitioned output, read-level pattern sidecars). It omits M-bias analysis and per-read text output, and — critically — does not implement the overlapping-mate handling it advertises.
 
 ---
 
@@ -274,7 +274,7 @@ The only C "test" (`tests/test_statistics_example.c`) **copies** the struct and 
 
 ## 8. Final Assessment
 
-- **Similar job:** Confirmed for the core extraction task, with notable feature gaps (overlap de-dup, M-bias, per-read).
+- **Similar job:** Confirmed for the core extraction task, with notable feature gaps (overlap de-dup, M-bias, per-read text dumps). Read-level co-methylation sidecars (`--read-level`) are supported.
 - **Better organization:** Confirmed. The compact, chunked, Zstd-compressed, per-chromosome/per-context HDF5 schema is a real, well-motivated improvement over MethylDackel's text outputs.
 - **Better performance:** Not confirmed. The intra-chromosome parallel design is promising, but the top-level threading is bugged and serial, `--threads` is inert, and the advertised fast-compression path is absent. No benchmarks exist in-repo to support the claim.
 - **Better software engineering overall:** Partially. Good modular layout and a strong storage concept are offset by correctness bugs, doc/code drift, broken scripts, weak tests, no CI, and licensing inconsistencies.

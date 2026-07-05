@@ -30,7 +30,14 @@
 #define DEFAULT_MIN_PHRED 20
 #define DEFAULT_MIN_COV 4
 #define DEFAULT_CAP_COVERAGE 0
+#define DEFAULT_TILE_SIZE 4
+#define MIN_TILE_SIZE 2
+#define MAX_TILE_SIZE 8
 #define DEFAULT_FLAGS (BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY)
+
+#define READ_LEVEL_PATTERN_ENCODING "bitmask_msb_first"
+#define READ_LEVEL_SCHEMA_VERSION "1.0.0"
+#define READ_LEVEL_GROUP "read_level_patterns"
 
 #define TNC_A 0
 #define TNC_C 1
@@ -161,6 +168,8 @@ typedef struct
     int keep_chg;
     int keep_chh;
     int split_context_files;
+    int read_level;
+    int tile_size;
 } SampleRunInfo;
 
 typedef struct
@@ -185,8 +194,35 @@ typedef struct
     OutputFormat output_format;
     int split_context_files;
     int num_threads;
+    int read_level;
+    int tile_size;
     ChromosomeExport *chr_export;
 } ThreadArg;
+
+typedef struct
+{
+    int context;
+    int tile_size;
+    size_t n_cpg;
+    uint32_t *cpg_pos;
+    int *pos_to_cpg;
+    size_t n_tiles;
+    uint32_t *tile_start_pos;
+    uint32_t *tile_cpg_positions;
+} ReadLevelTiles;
+
+typedef struct
+{
+    ReadLevelTiles tiles;
+    uint32_t *hist;
+    int active;
+} ReadLevelContext;
+
+typedef struct
+{
+    ReadLevelContext ctx[MAX_CONTEXTS_PER_CHR + 1];
+    int n_active;
+} ReadLevelChromData;
 
 typedef struct
 {
@@ -196,6 +232,9 @@ typedef struct
     size_t start_site_idx;
     size_t end_site_idx;
     FilterStats filter_stats;
+    ReadLevelChromData *rl;
+    size_t *rl_tile_start;
+    size_t *rl_tile_end;
 } RegionArg;
 
 typedef struct
@@ -254,5 +293,26 @@ int getRealStrand(bam1_t *b);
 void *process_region_direct(void *arg);
 void process_chromosome(ThreadArg *targ);
 int load_chrom_mapping(const char *filename, ChromMapEntry **entries, int *n_entries, char **reference_file);
+
+// read_level.c
+void free_read_level_tiles(ReadLevelTiles *tiles);
+int build_read_level_tiles(const char *chr_seq, uint32_t chr_len, int context,
+                           int tile_size, ReadLevelTiles *out);
+size_t read_level_tile_range_for_region(const ReadLevelTiles *tiles,
+                                        uint32_t region_start,
+                                        uint32_t region_end,
+                                        size_t *out_start, size_t *out_end);
+void read_level_accumulate(const ReadLevelTiles *tiles, uint32_t *hist,
+                           size_t tile_start, size_t tile_end,
+                           const char *chr_seq, uint8_t *seq, uint8_t *qual,
+                           uint32_t *cigar, int n_cigar, int32_t read_start,
+                           int32_t clip_from, int strand, int min_phred,
+                           uint32_t chr_len);
+int write_read_level_patterns_h5(const char *filename, const char *context,
+                                 int tile_size, int min_tile_reads,
+                                 int compression,
+                                 const ReadLevelTiles *tiles,
+                                 const uint32_t *hist);
+void free_read_level_chrom_data(ReadLevelChromData *data);
 
 #endif // METHYL_EXTRACTOR_H

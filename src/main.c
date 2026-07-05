@@ -31,6 +31,10 @@ static void print_usage(const char *prog)
                     "[hdf5]\n");
     fprintf(stderr, "  -s, --split               Split output by context\n");
     fprintf(stderr, "  -o, --output-dir DIR      Output directory\n");
+    fprintf(stderr, "  -R, --read-level          Emit read-level pattern sidecars "
+                    "({chrom}-{ctx}.patterns.h5)\n");
+    fprintf(stderr, "  -T, --tile-size INT       CpG sites per read-level tile "
+                    "[%d]\n", DEFAULT_TILE_SIZE);
     fprintf(stderr, "\n");
     fprintf(stderr, "Note: output_dir may be given positionally (2nd argument) "
                     "or via -o/--output-dir.\n");
@@ -58,6 +62,8 @@ int main(int argc, char *argv[])
     OutputFormat output_format = OUTPUT_HDF5; // Default to HDF5 output
     const char *out_dir = NULL;
     int split_context_files = 0;
+    int read_level = 0;
+    int tile_size = DEFAULT_TILE_SIZE;
     const char *chrom_mapping_file = NULL; // Default to NULL
     const char *ref_file = NULL;           // Will be set from chrom_mapping or command line
 
@@ -76,9 +82,11 @@ int main(int argc, char *argv[])
         {"output-format", required_argument, 0, 'f'},
         {"split", no_argument, 0, 's'},
         {"output-dir", required_argument, 0, 'o'},
+        {"read-level", no_argument, 0, 'R'},
+        {"tile-size", required_argument, 0, 'T'},
         {0, 0, 0, 0}};
     int opt;
-    while ((opt = getopt_long(argc, argv, "ht:q:p:c:C:GHm:z:k:f:so:",
+    while ((opt = getopt_long(argc, argv, "ht:q:p:c:C:GHm:z:k:f:so:RT:",
                               long_options, NULL)) != -1)
     {
         switch (opt)
@@ -172,6 +180,18 @@ int main(int argc, char *argv[])
             break;
         case 'o':
             out_dir = optarg;
+            break;
+        case 'R':
+            read_level = 1;
+            break;
+        case 'T':
+            tile_size = atoi(optarg);
+            if (tile_size < MIN_TILE_SIZE || tile_size > MAX_TILE_SIZE)
+            {
+                fprintf(stderr, "Tile size must be between %d and %d\n",
+                        MIN_TILE_SIZE, MAX_TILE_SIZE);
+                return 1;
+            }
             break;
         case '?':
         default:
@@ -364,6 +384,8 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].output_format = output_format;
         thread_args[valid_chr_count].split_context_files = split_context_files;
         thread_args[valid_chr_count].num_threads = num_threads;
+        thread_args[valid_chr_count].read_level = read_level;
+        thread_args[valid_chr_count].tile_size = tile_size;
         thread_args[valid_chr_count].chr_export = &chr_exports[valid_chr_count];
         valid_chr_count++;
     }
@@ -389,6 +411,8 @@ int main(int argc, char *argv[])
         .keep_chg = keep_chg,
         .keep_chh = keep_chh,
         .split_context_files = split_context_files,
+        .read_level = read_level,
+        .tile_size = tile_size,
     };
     if (write_extraction_manifest(&run_info, chr_exports, valid_chr_count) != 0)
         fprintf(stderr, "Warning: failed to write extraction manifest\n");

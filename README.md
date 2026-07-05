@@ -72,6 +72,8 @@ The output directory may be given positionally (2nd argument) or via `-o/--outpu
 | `-f, --output-format STR` | Output format: `hdf5`, `txt`, or `both` | `hdf5` |
 | `-s, --split` | Split output by methylation context | Disabled |
 | `-o, --output-dir DIR` | Output directory | N/A |
+| `-R, --read-level` | Emit read-level pattern sidecars (`{chrom}-{ctx}.patterns.h5`) | Disabled |
+| `-T, --tile-size INT` | Consecutive CpG sites per read-level tile (2–8) | 4 |
 
 ### Compression
 
@@ -133,7 +135,10 @@ Human-readable tab-separated values:
 | `-f hdf5` | `chr1.h5`, `chr2.h5`, ... | Per-chromosome HDF5 files |
 | `-f txt` | `chr1.txt`, `chr2.txt`, ... | Per-chromosome text files |
 | `-f both` | Both HDF5 and text files | Combined output |
-| `-s --split` | `chr1.CG.h5`, `chr1.CHG.h5`, ... | Separate files per context |
+| `-s --split` | `chr1-CG.h5`, `chr1-CHG.h5`, ... | Separate files per context |
+| `-R --read-level` | `chr1-CG.patterns.h5`, ... | Read-level co-methylation pattern sidecars (requires `-s`) |
+
+Read-level sidecars follow the [MethylPipeline read-level pattern contract](https://github.com/epimethyl/MethylPipeline/blob/main/docs/reference/read_level_pattern_contract.md): per-tile sparse histograms of joint methylation patterns over `k` consecutive CpGs (`bitmask_msb_first` encoding). Marginal `{chrom}-{ctx}.h5` files are unchanged.
 
 ### Statistics Output
 
@@ -208,6 +213,8 @@ Example path: `/work/samples/1401-042825-50082/1401-042825-50082.extraction_mani
     --cap-cov 100 \
     --CHG \
     --CHH \
+    --read-level \
+    --tile-size 4 \
     --output-format hdf5 \
     --compression 9 \
     sample.bam \

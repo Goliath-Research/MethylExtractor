@@ -208,6 +208,20 @@ void *process_region_direct(void *arg)
 
         if (used_this_read)
             r->filter_stats.reads_used++;
+
+        if (r->rl && r->rl->n_active > 0 && r->rl_tile_start && r->rl_tile_end)
+        {
+            for (int ci = 0; ci < r->rl->n_active; ++ci)
+            {
+                if (r->rl_tile_end[ci] <= r->rl_tile_start[ci])
+                    continue;
+                ReadLevelContext *ctx = &r->rl->ctx[ci];
+                read_level_accumulate(
+                    &ctx->tiles, ctx->hist, r->rl_tile_start[ci],
+                    r->rl_tile_end[ci], t->chr_seq, seq, qual, cigar, c->n_cigar,
+                    c->pos, clip_from, strand, t->min_phred, t->chr_len);
+            }
+        }
     }
 
     bam_destroy1(b);
@@ -279,6 +293,58 @@ void process_chromosome(ThreadArg *targ)
 
     size_t sites_per_thread = (site_count + n_threads - 1) / n_threads;
 
+    ReadLevelChromData rl_data;
+    memset(&rl_data, 0, sizeof(rl_data));
+    if (targ->read_level)
+    {
+        int ctx_ids[] = {CONTEXT_CPG, CONTEXT_CHG, CONTEXT_CHH};
+        int ctx_keep[] = {1, targ->keep_chg, targ->keep_chh};
+        for (int ci = 0; ci < 3; ++ci)
+        {
+            if (!ctx_keep[ci])
+                continue;
+            if (!targ->split_context_files && ctx_ids[ci] != CONTEXT_CPG)
+                continue;
+
+            ReadLevelContext *rc = &rl_data.ctx[rl_data.n_active];
+            if (build_read_level_tiles(targ->chr_seq, targ->chr_len, ctx_ids[ci],
+                                       targ->tile_size, &rc->tiles) != 0)
+            {
+                fprintf(stderr, "Failed to build read-level tiles for %s %s\n",
+                        targ->chr, get_context_string(ctx_ids[ci]));
+                hts_idx_destroy(idx);
+                if (idx_fp)
+                    sam_close(idx_fp);
+                free(site_positions);
+                free(buffer);
+                free_read_level_chrom_data(&rl_data);
+                return;
+            }
+            if (rc->tiles.n_tiles == 0)
+            {
+                free_read_level_tiles(&rc->tiles);
+                continue;
+            }
+
+            size_t hist_size =
+                rc->tiles.n_tiles * (size_t)(1U << (unsigned)targ->tile_size);
+            rc->hist = calloc(hist_size, sizeof(uint32_t));
+            if (!rc->hist)
+            {
+                free_read_level_tiles(&rc->tiles);
+                hts_idx_destroy(idx);
+                if (idx_fp)
+                    sam_close(idx_fp);
+                free(site_positions);
+                free(buffer);
+                free_read_level_chrom_data(&rl_data);
+                return;
+            }
+            rc->active = 1;
+            rl_data.n_active++;
+        }
+    }
+
     RegionArg *regions = calloc(n_threads, sizeof(RegionArg));
     pthread_t *threads = malloc(n_threads * sizeof(pthread_t));
 
@@ -310,6 +376,21 @@ void process_chromosome(ThreadArg *targ)
         r->counts.uC = calloc(range, sizeof(uint32_t));
         r->counts.size = range;
 
+        if (rl_data.n_active > 0)
+        {
+            r->rl = &rl_data;
+            r->rl_tile_start = calloc(rl_data.n_active, sizeof(size_t));
+            r->rl_tile_end = calloc(rl_data.n_active, sizeof(size_t));
+            if (r->rl_tile_start && r->rl_tile_end)
+            {
+                for (int ci = 0; ci < rl_data.n_active; ++ci)
+                    read_level_tile_range_for_region(
+                        &rl_data.ctx[ci].tiles, r->base.start_pos,
+                        r->base.end_pos, &r->rl_tile_start[ci],
+                        &r->rl_tile_end[ci]);
+            }
+        }
+
         pthread_create(&threads[i], NULL, process_region_direct, r);
         n_created++;
     }
@@ -337,6 +418,28 @@ void process_chromosome(ThreadArg *targ)
         }
         free(regions[i].counts.mC);
         free(regions[i].counts.uC);
+        free(regions[i].rl_tile_start);
+        free(regions[i].rl_tile_end);
+    }
+
+    if (rl_data.n_active > 0)
+    {
+        for (int ci = 0; ci < rl_data.n_active; ++ci)
+        {
+            ReadLevelContext *rc = &rl_data.ctx[ci];
+            char pattern_path[1024];
+            snprintf(pattern_path, sizeof(pattern_path), "%s/%s-%s.patterns.h5",
+                     targ->out_dir, targ->chr,
+                     get_context_string(rc->tiles.context));
+            if (write_read_level_patterns_h5(
+                    pattern_path, get_context_string(rc->tiles.context),
+                    targ->tile_size, 1, targ->compression, &rc->tiles,
+                    rc->hist) != 0)
+            {
+                fprintf(stderr, "Warning: failed to write read-level sidecar %s\n",
+                        pattern_path);
+            }
+        }
     }
 
     if (targ->split_context_files)
@@ -422,6 +525,7 @@ void process_chromosome(ThreadArg *targ)
     free(buffer);
     free(threads);
     free(regions);
+    free_read_level_chrom_data(&rl_data);
 }
 
 int load_chrom_mapping(const char *filename, ChromMapEntry **entries,
