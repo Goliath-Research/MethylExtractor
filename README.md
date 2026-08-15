@@ -142,7 +142,7 @@ Read-level sidecars follow the [MethylPipeline read-level pattern contract](http
 
 ### Statistics Output
 
-Each output file (`{chrom}-{context}.h5` or `{chrom}.h5`) gets a companion JSON sidecar with legacy top-level fields plus an extended QC block for [MethylPipeline](https://github.com/) post-extraction Pass/Fail evaluation.
+Each output file (`{chrom}-{context}.h5` or `{chrom}.h5`) gets a companion JSON sidecar with legacy top-level fields plus an extended QC block for [MethylPipeline](https://github.com/) **extraction QC** (`sample.extraction_qc` / `methylextractionqc`) — not alignment QC.
 
 **Legacy fields** (unchanged for backward compatibility):
 

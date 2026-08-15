@@ -1,0 +1,11 @@
+{
+  "reference": "toy.fa",
+  "chromosomes": [
+    {
+      "fasta": "chr1",
+      "bam": "chr1",
+      "name": "1",
+      "extract": true
+    }
+  ]
+}
