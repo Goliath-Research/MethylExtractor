@@ -42,8 +42,11 @@ void *process_region_direct(void *arg)
     samFile *in = sam_open(t->bam_file, "r");
     if (!in)
         return NULL;
-    // The index is loaded once per chromosome and shared read-only across the
-    // region threads (see process_chromosome) to avoid repeated index I/O.
+    /* One handle per region thread (htslib is not multi-reader on one fp).
+     * Index is shared read-only. Header is loaded once in main and not
+     * re-read here — iterators seek via the BAM index. */
+    if (t->bgzf_threads > 1)
+        hts_set_threads(in, t->bgzf_threads);
     hts_itr_t *iter = sam_itr_queryi(r->idx, t->tid, t->start_pos, t->end_pos);
     if (!iter)
     {
@@ -51,7 +54,6 @@ void *process_region_direct(void *arg)
         return NULL;
     }
 
-    bam_hdr_t *hdr = sam_hdr_read(in);
     bam1_t *b = bam_init1();
 
     while (sam_itr_next(in, iter, b) >= 0)
@@ -225,7 +227,6 @@ void *process_region_direct(void *arg)
     }
 
     bam_destroy1(b);
-    sam_hdr_destroy(hdr);
     hts_itr_destroy(iter);
     sam_close(in);
     return NULL;
@@ -248,6 +249,18 @@ static void record_context_export(ChromosomeExport *export_out, const char *cont
 
 void process_chromosome(ThreadArg *targ)
 {
+    uint64_t chrom_t0 = now_ms();
+    ChromosomeTiming *timing = targ->timing;
+    if (timing)
+    {
+        memset(timing, 0, sizeof(*timing));
+        strncpy(timing->chromosome, targ->chr, sizeof(timing->chromosome) - 1);
+        timing->chromosome[sizeof(timing->chromosome) - 1] = '\0';
+        timing->rss_est_bytes = estimate_chromosome_rss_bytes(
+            targ->chr_len, targ->keep_chg, targ->keep_chh, targ->read_level,
+            targ->split_context_files);
+    }
+
     ChromosomeExport *export_out = targ->chr_export;
     if (export_out)
     {
@@ -256,14 +269,21 @@ void process_chromosome(ThreadArg *targ)
         export_out->chromosome[sizeof(export_out->chromosome) - 1] = '\0';
     }
 
+    uint64_t t_enum = now_ms();
     size_t site_count = count_methylation_sites(targ->chr_seq, targ->chr_len,
                                                 targ->keep_chg, targ->keep_chh);
     if (site_count == 0)
+    {
+        if (timing)
+            timing->total_ms = elapsed_ms(chrom_t0);
         return;
+    }
 
     MethylRecord *buffer = calloc(site_count, sizeof(MethylRecord));
     initialize_buffer(buffer, site_count, targ->chr_seq, targ->chr_len,
                       targ->keep_chg, targ->keep_chh);
+    if (timing)
+        timing->site_enum_ms = elapsed_ms(t_enum);
 
     uint32_t *site_positions = malloc(site_count * sizeof(uint32_t));
     for (size_t i = 0; i < site_count; i++)
@@ -395,8 +415,11 @@ void process_chromosome(ThreadArg *targ)
         n_created++;
     }
 
+    uint64_t t_bam = now_ms();
     for (int i = 0; i < n_created; i++)
         pthread_join(threads[i], NULL);
+    if (timing)
+        timing->bam_scan_ms = elapsed_ms(t_bam);
 
     FilterStats chr_filters;
     memset(&chr_filters, 0, sizeof(chr_filters));
@@ -405,6 +428,7 @@ void process_chromosome(ThreadArg *targ)
     if (export_out)
         export_out->filter_stats = chr_filters;
 
+    uint64_t t_merge = now_ms();
     for (int i = 0; i < n_created; i++)
     {
         uint32_t offset = regions[i].base.start_pos;
@@ -421,6 +445,10 @@ void process_chromosome(ThreadArg *targ)
         free(regions[i].rl_tile_start);
         free(regions[i].rl_tile_end);
     }
+    if (timing)
+        timing->merge_ms = elapsed_ms(t_merge);
+
+    uint64_t t_write = now_ms();
 
     if (rl_data.n_active > 0)
     {
@@ -478,6 +506,7 @@ void process_chromosome(ThreadArg *targ)
                     .min_phred = targ->min_phred,
                     .min_cov = targ->min_cov,
                     .cap_cov = targ->cap_cov,
+                    .timing = timing,
                 };
                 MethylStats ctx_stats;
                 flush_buffer(out_path, ctx_buffer, n_ctx_records, targ->compression,
@@ -508,6 +537,7 @@ void process_chromosome(ThreadArg *targ)
             .min_phred = targ->min_phred,
             .min_cov = targ->min_cov,
             .cap_cov = targ->cap_cov,
+            .timing = timing,
         };
         MethylStats chr_stats;
         flush_buffer(out_path, buffer, site_count, targ->compression,
@@ -518,6 +548,9 @@ void process_chromosome(ThreadArg *targ)
         // Note: External compression removed to maintain HDF5 compatibility
     }
 
+    if (timing)
+        timing->hdf5_write_ms = elapsed_ms(t_write);
+
     hts_idx_destroy(idx);
     if (idx_fp)
         sam_close(idx_fp);
@@ -526,6 +559,139 @@ void process_chromosome(ThreadArg *targ)
     free(threads);
     free(regions);
     free_read_level_chrom_data(&rl_data);
+
+    if (timing)
+    {
+        timing->total_ms = elapsed_ms(chrom_t0);
+        log_time("%s site_enum=%lums bam_scan=%lums merge=%lums write=%lums "
+                 "qc=%lums total=%lums\n",
+                 targ->chr, (unsigned long)timing->site_enum_ms,
+                 (unsigned long)timing->bam_scan_ms,
+                 (unsigned long)timing->merge_ms,
+                 (unsigned long)timing->hdf5_write_ms,
+                 (unsigned long)timing->qc_json_ms,
+                 (unsigned long)timing->total_ms);
+    }
+}
+
+typedef struct
+{
+    ThreadArg *jobs;
+    uint64_t *rss_est;
+    int n;
+    int next;
+    int in_flight;
+    int max_inflight;
+    uint64_t in_flight_rss;
+    uint64_t max_rss;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+} ChromPool;
+
+static void *chrom_pool_worker(void *arg)
+{
+    ChromPool *pool = (ChromPool *)arg;
+    for (;;)
+    {
+        ThreadArg *job = NULL;
+        uint64_t est = 0;
+        pthread_mutex_lock(&pool->mu);
+        for (;;)
+        {
+            if (pool->next >= pool->n)
+            {
+                pthread_mutex_unlock(&pool->mu);
+                return NULL;
+            }
+            est = pool->rss_est[pool->next];
+            int at_cap = pool->in_flight >= pool->max_inflight;
+            int would_exceed =
+                (pool->in_flight > 0 && pool->in_flight_rss + est > pool->max_rss);
+            if (at_cap || would_exceed)
+            {
+                pthread_cond_wait(&pool->cv, &pool->mu);
+                continue;
+            }
+            job = &pool->jobs[pool->next++];
+            pool->in_flight++;
+            pool->in_flight_rss += est;
+            break;
+        }
+        pthread_mutex_unlock(&pool->mu);
+
+        process_chromosome(job);
+
+        pthread_mutex_lock(&pool->mu);
+        pool->in_flight--;
+        pool->in_flight_rss -= est;
+        pthread_cond_broadcast(&pool->cv);
+        pthread_mutex_unlock(&pool->mu);
+    }
+}
+
+void process_chromosomes_parallel(ThreadArg *args, int n_chroms, int chrom_parallel,
+                                  uint64_t max_rss_bytes)
+{
+    if (n_chroms <= 0)
+        return;
+    if (chrom_parallel < 1)
+        chrom_parallel = 1;
+    if (chrom_parallel > n_chroms)
+        chrom_parallel = n_chroms;
+
+    if (chrom_parallel == 1)
+    {
+        for (int i = 0; i < n_chroms; i++)
+            process_chromosome(&args[i]);
+        return;
+    }
+
+    uint64_t *rss_est = malloc((size_t)n_chroms * sizeof(uint64_t));
+    if (!rss_est)
+    {
+        for (int i = 0; i < n_chroms; i++)
+            process_chromosome(&args[i]);
+        return;
+    }
+    for (int i = 0; i < n_chroms; i++)
+        rss_est[i] = estimate_chromosome_rss_bytes(
+            args[i].chr_len, args[i].keep_chg, args[i].keep_chh,
+            args[i].read_level, args[i].split_context_files);
+
+    ChromPool pool;
+    memset(&pool, 0, sizeof(pool));
+    pool.jobs = args;
+    pool.rss_est = rss_est;
+    pool.n = n_chroms;
+    pool.max_inflight = chrom_parallel;
+    pool.max_rss = max_rss_bytes ? max_rss_bytes : UINT64_MAX;
+    pthread_mutex_init(&pool.mu, NULL);
+    pthread_cond_init(&pool.cv, NULL);
+
+    pthread_t *workers = malloc((size_t)chrom_parallel * sizeof(pthread_t));
+    int n_workers = 0;
+    for (int i = 0; i < chrom_parallel; i++)
+    {
+        if (pthread_create(&workers[i], NULL, chrom_pool_worker, &pool) == 0)
+            n_workers++;
+        else
+            break;
+    }
+    if (n_workers == 0)
+    {
+        for (int i = 0; i < n_chroms; i++)
+            process_chromosome(&args[i]);
+    }
+    else
+    {
+        for (int i = 0; i < n_workers; i++)
+            pthread_join(workers[i], NULL);
+    }
+
+    pthread_mutex_destroy(&pool.mu);
+    pthread_cond_destroy(&pool.cv);
+    free(workers);
+    free(rss_est);
 }
 
 int load_chrom_mapping(const char *filename, ChromMapEntry **entries,

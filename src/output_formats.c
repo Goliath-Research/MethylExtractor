@@ -167,6 +167,7 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer,
     hid_t file = -1, dataset = -1, space = -1, type = -1, mem_type = -1,
           dcpl = -1;
     herr_t status = -1;
+    int hdf5_locked = 0;
 
     MethylStats pre_stats = analyze_buffer(buffer, n_records, min_cov);
 
@@ -266,6 +267,8 @@ size_t flush_buffer(const char *filename, MethylRecord *buffer,
 
     if (output_format == OUTPUT_HDF5 || output_format == OUTPUT_BOTH)
     {
+        export_lock();
+        hdf5_locked = 1;
         log_time("Starting to write HDF5 file: %s\n", filename);
         type = H5Tcreate(H5T_COMPOUND, sizeof(MethylRecord));
         H5Tinsert(type, "pos", HOFFSET(MethylRecord, pos), H5T_NATIVE_UINT32);
@@ -443,6 +446,8 @@ cleanup:
         H5Fflush(file, H5F_SCOPE_GLOBAL);
         H5Fclose(file);
     }
+    if (hdf5_locked)
+        export_unlock();
     return records_written;
 }
 

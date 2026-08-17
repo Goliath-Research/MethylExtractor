@@ -563,6 +563,7 @@ int write_read_level_patterns_h5(const char *filename, const char *context,
         emit_idx++;
     }
 
+    export_lock();
     hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
     if (file < 0)
         goto fail;
@@ -628,6 +629,7 @@ int write_read_level_patterns_h5(const char *filename, const char *context,
 
     H5Gclose(grp);
     H5Fclose(file);
+    export_unlock();
 
     free(pattern_tile_id);
     free(pattern_id);
@@ -642,6 +644,7 @@ int write_read_level_patterns_h5(const char *filename, const char *context,
 fail_close:
     H5Fclose(file);
 fail:
+    export_unlock();
     free(pattern_tile_id);
     free(pattern_id);
     free(pattern_count);

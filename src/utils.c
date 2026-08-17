@@ -16,6 +16,60 @@ void log_time(const char *format, ...)
     va_end(args);
 }
 
+uint64_t now_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+uint64_t elapsed_ms(uint64_t start_ms)
+{
+    uint64_t end = now_ms();
+    return end >= start_ms ? end - start_ms : 0;
+}
+
+static pthread_mutex_t g_export_mu;
+static pthread_once_t g_export_once = PTHREAD_ONCE_INIT;
+
+static void init_export_mu(void)
+{
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_export_mu, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
+void export_lock(void)
+{
+    pthread_once(&g_export_once, init_export_mu);
+    pthread_mutex_lock(&g_export_mu);
+}
+
+void export_unlock(void)
+{
+    pthread_mutex_unlock(&g_export_mu);
+}
+
+uint64_t estimate_chromosome_rss_bytes(uint32_t chr_len, int keep_chg, int keep_chh,
+                                       int read_level, int split_context_files)
+{
+    uint64_t n = (uint64_t)chr_len;
+    uint64_t rss = n; /* fasta sequence */
+    rss += n * sizeof(MethylRecord); /* worst-case site buffer (CHH) */
+    rss += n * sizeof(uint32_t);     /* site_positions */
+    rss += 8ull * n;                 /* dense mC + uC across region partitions */
+    if (read_level)
+    {
+        int nctx = split_context_files ? (1 + (keep_chg ? 1 : 0) + (keep_chh ? 1 : 0))
+                                       : 1;
+        rss += (uint64_t)nctx * n * sizeof(int); /* pos_to_cpg */
+    }
+    return rss;
+}
+
 int make_directory(const char *path)
 {
     struct stat st = {0};

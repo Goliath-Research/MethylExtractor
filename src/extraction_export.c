@@ -100,6 +100,8 @@ static cJSON *methyl_stats_to_json(const MethylStats *stats)
 int write_context_qc_json(const char *base_filename, const ExtractionMeta *meta,
                           const FilterStats *filter_stats, MethylStats stats)
 {
+    uint64_t t0 = now_ms();
+    export_lock();
     char json_filename[1024];
     json_path_from_base(base_filename, json_filename, sizeof(json_filename));
 
@@ -107,6 +109,7 @@ int write_context_qc_json(const char *base_filename, const ExtractionMeta *meta,
     if (!root)
     {
         fprintf(stderr, "Failed to create JSON root object\n");
+        export_unlock();
         return -1;
     }
 
@@ -193,6 +196,7 @@ int write_context_qc_json(const char *base_filename, const ExtractionMeta *meta,
     {
         fprintf(stderr, "Failed to print JSON\n");
         cJSON_Delete(root);
+        export_unlock();
         return -1;
     }
 
@@ -203,6 +207,7 @@ int write_context_qc_json(const char *base_filename, const ExtractionMeta *meta,
                 json_filename);
         free(json_string);
         cJSON_Delete(root);
+        export_unlock();
         return -1;
     }
 
@@ -213,6 +218,9 @@ int write_context_qc_json(const char *base_filename, const ExtractionMeta *meta,
 
     free(json_string);
     cJSON_Delete(root);
+    if (meta && meta->timing)
+        meta->timing->qc_json_ms += elapsed_ms(t0);
+    export_unlock();
     return 0;
 }
 
@@ -384,6 +392,75 @@ int write_extraction_manifest(const SampleRunInfo *run,
     fclose(fp);
     log_time("Wrote extraction manifest to: %s\n", manifest_path);
 
+    free(json_string);
+    cJSON_Delete(root);
+    return 0;
+}
+
+int write_extraction_timing(const char *out_dir, const SampleTiming *sample,
+                            const ChromosomeTiming *chromosomes, int n_chromosomes)
+{
+    if (!out_dir || !sample)
+        return -1;
+
+    char sample_id[256];
+    path_basename(out_dir, sample_id, sizeof(sample_id));
+
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/%s.timing.json", out_dir, sample_id);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root)
+        return -1;
+
+    cJSON_AddStringToObject(root, "schema_name", EXTRACTION_TIMING_SCHEMA);
+    cJSON_AddStringToObject(root, "schema_version", EXTRACTION_TIMING_VERSION);
+    cJSON_AddNumberToObject(root, "total_ms", (double)sample->total_ms);
+    cJSON_AddNumberToObject(root, "bam_ms", (double)sample->bam_ms);
+    cJSON_AddNumberToObject(root, "write_ms", (double)sample->write_ms);
+    double tot = sample->total_ms > 0 ? (double)sample->total_ms : 1.0;
+    cJSON_AddNumberToObject(root, "bam_fraction", (double)sample->bam_ms / tot);
+    cJSON_AddNumberToObject(root, "write_fraction", (double)sample->write_ms / tot);
+    cJSON_AddNumberToObject(root, "chrom_parallel", sample->chrom_parallel);
+    cJSON_AddNumberToObject(root, "region_threads", sample->region_threads);
+    cJSON_AddNumberToObject(root, "max_rss_gb", sample->max_rss_gb);
+    cJSON_AddNumberToObject(root, "n_chromosomes", sample->n_chromosomes);
+
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < n_chromosomes; i++)
+    {
+        const ChromosomeTiming *ct = &chromosomes[i];
+        cJSON *obj = cJSON_CreateObject();
+        cJSON_AddStringToObject(obj, "name", ct->chromosome);
+        cJSON_AddNumberToObject(obj, "site_enum_ms", (double)ct->site_enum_ms);
+        cJSON_AddNumberToObject(obj, "bam_scan_ms", (double)ct->bam_scan_ms);
+        cJSON_AddNumberToObject(obj, "merge_ms", (double)ct->merge_ms);
+        cJSON_AddNumberToObject(obj, "hdf5_write_ms", (double)ct->hdf5_write_ms);
+        cJSON_AddNumberToObject(obj, "qc_json_ms", (double)ct->qc_json_ms);
+        cJSON_AddNumberToObject(obj, "total_ms", (double)ct->total_ms);
+        cJSON_AddNumberToObject(obj, "rss_est_bytes", (double)ct->rss_est_bytes);
+        cJSON_AddItemToArray(arr, obj);
+    }
+    cJSON_AddItemToObject(root, "chromosomes", arr);
+
+    char *json_string = cJSON_Print(root);
+    if (!json_string)
+    {
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    FILE *fp = fopen(path, "w");
+    if (!fp)
+    {
+        fprintf(stderr, "Failed to open timing JSON: %s\n", path);
+        free(json_string);
+        cJSON_Delete(root);
+        return -1;
+    }
+    fprintf(fp, "%s\n", json_string);
+    fclose(fp);
+    log_time("Wrote extraction timing to: %s\n", path);
     free(json_string);
     cJSON_Delete(root);
     return 0;

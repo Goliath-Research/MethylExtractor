@@ -35,12 +35,28 @@ static void print_usage(const char *prog)
                     "({chrom}-{ctx}.patterns.h5)\n");
     fprintf(stderr, "  -T, --tile-size INT       CpG sites per read-level tile "
                     "[%d]\n", DEFAULT_TILE_SIZE);
+    fprintf(stderr, "      --chrom-parallel INT  Max chromosomes in flight "
+                    "[%d; 1 if RSS estimate exceeds --max-rss-gb]\n",
+            DEFAULT_CHROM_PARALLEL);
+    fprintf(stderr, "      --max-rss-gb INT      Memory gate for chrom-parallel "
+                    "[%d]\n", DEFAULT_MAX_RSS_GB);
     fprintf(stderr, "\n");
     fprintf(stderr, "Note: output_dir may be given positionally (2nd argument) "
                     "or via -o/--output-dir.\n");
     fprintf(stderr, "Note: ref.fa is optional. If provided, it will override the "
                     "reference in chrom_mapping.json\n");
     fprintf(stderr, "\n");
+}
+
+static int cmp_chr_len_desc(const void *a, const void *b)
+{
+    const ThreadArg *ta = (const ThreadArg *)a;
+    const ThreadArg *tb = (const ThreadArg *)b;
+    if (ta->chr_len > tb->chr_len)
+        return -1;
+    if (ta->chr_len < tb->chr_len)
+        return 1;
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -64,6 +80,8 @@ int main(int argc, char *argv[])
     int split_context_files = 0;
     int read_level = 0;
     int tile_size = DEFAULT_TILE_SIZE;
+    int chrom_parallel = DEFAULT_CHROM_PARALLEL;
+    int max_rss_gb = DEFAULT_MAX_RSS_GB;
     const char *chrom_mapping_file = NULL; // Default to NULL
     const char *ref_file = NULL;           // Will be set from chrom_mapping or command line
 
@@ -84,6 +102,8 @@ int main(int argc, char *argv[])
         {"output-dir", required_argument, 0, 'o'},
         {"read-level", no_argument, 0, 'R'},
         {"tile-size", required_argument, 0, 'T'},
+        {"chrom-parallel", required_argument, 0, 1000},
+        {"max-rss-gb", required_argument, 0, 1001},
         {0, 0, 0, 0}};
     int opt;
     while ((opt = getopt_long(argc, argv, "ht:q:p:c:C:GHm:z:k:f:so:RT:",
@@ -193,6 +213,22 @@ int main(int argc, char *argv[])
                 return 1;
             }
             break;
+        case 1000:
+            chrom_parallel = atoi(optarg);
+            if (chrom_parallel < 1)
+            {
+                fprintf(stderr, "chrom-parallel must be at least 1\n");
+                return 1;
+            }
+            break;
+        case 1001:
+            max_rss_gb = atoi(optarg);
+            if (max_rss_gb < 1)
+            {
+                fprintf(stderr, "max-rss-gb must be at least 1\n");
+                return 1;
+            }
+            break;
         case '?':
         default:
             print_usage(argv[0]);
@@ -241,6 +277,16 @@ int main(int argc, char *argv[])
     }
 
     log_time("Starting processing...\n");
+    {
+        const char *plugin = getenv("HDF5_PLUGIN_PATH");
+        htri_t zstd_avail = H5Zfilter_avail(ZSTD_FILTER);
+        log_time("HDF5 Zstd filter %s (HDF5_PLUGIN_PATH=%s)\n",
+                 zstd_avail > 0 ? "available" : "NOT available",
+                 plugin && plugin[0] ? plugin : "(unset)");
+        if (zstd_avail <= 0)
+            log_time("Note: HDF5 writes will use gzip fallback; set "
+                     "HDF5_PLUGIN_PATH to the Zstd filter directory.\n");
+    }
 
     log_time("Loading chromosome mapping...\n");
     int valid_chr_count = 0;
@@ -332,11 +378,13 @@ int main(int argc, char *argv[])
     log_time("Allocating thread arguments...\n");
     ThreadArg *thread_args = malloc(header->n_targets * sizeof(ThreadArg));
     ChromosomeExport *chr_exports = calloc(header->n_targets, sizeof(ChromosomeExport));
-    if (!thread_args || !chr_exports)
+    ChromosomeTiming *chr_timings = calloc(header->n_targets, sizeof(ChromosomeTiming));
+    if (!thread_args || !chr_exports || !chr_timings)
     {
         fprintf(stderr, "Failed to allocate thread arguments\n");
         free(thread_args);
         free(chr_exports);
+        free(chr_timings);
         sam_hdr_destroy(header);
         fai_destroy(fai);
         return 1;
@@ -386,19 +434,73 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].num_threads = num_threads;
         thread_args[valid_chr_count].read_level = read_level;
         thread_args[valid_chr_count].tile_size = tile_size;
+        thread_args[valid_chr_count].bgzf_threads = DEFAULT_BGZF_THREADS;
+        thread_args[valid_chr_count].hdr = header;
         thread_args[valid_chr_count].chr_export = &chr_exports[valid_chr_count];
+        thread_args[valid_chr_count].timing = &chr_timings[valid_chr_count];
         valid_chr_count++;
     }
     free(chroms);
 
-    // Chromosomes are processed one at a time; parallelism happens inside
-    // process_chromosome(), which splits each chromosome into num_threads
-    // regions. This bounds peak memory to a single chromosome's working set
-    // while letting the user's --threads setting govern the actual work.
-    log_time("Processing %d chromosome(s), %d worker thread(s) each...\n",
-             valid_chr_count, num_threads);
+    qsort(thread_args, (size_t)valid_chr_count, sizeof(ThreadArg),
+          cmp_chr_len_desc);
+    /* chr_export / timing pointers were assigned before qsort and still
+     * point at index-aligned slots; re-bind after the sort so each chrom
+     * writes its own export/timing record. */
     for (int i = 0; i < valid_chr_count; i++)
-        process_chromosome(&thread_args[i]);
+    {
+        thread_args[i].chr_export = &chr_exports[i];
+        thread_args[i].timing = &chr_timings[i];
+    }
+
+    uint64_t max_rss_bytes = (uint64_t)max_rss_gb * 1024ull * 1024ull * 1024ull;
+    if (chrom_parallel > 1 && valid_chr_count >= 2)
+    {
+        uint64_t two_largest =
+            estimate_chromosome_rss_bytes(
+                thread_args[0].chr_len, keep_chg, keep_chh, read_level,
+                split_context_files) +
+            estimate_chromosome_rss_bytes(
+                thread_args[1].chr_len, keep_chg, keep_chh, read_level,
+                split_context_files);
+        if (two_largest > max_rss_bytes)
+        {
+            log_time("RSS estimate for two largest chroms (%.1f GiB) exceeds "
+                     "--max-rss-gb %d; using chrom-parallel=1\n",
+                     two_largest / (1024.0 * 1024.0 * 1024.0), max_rss_gb);
+            chrom_parallel = 1;
+        }
+    }
+    if (chrom_parallel > valid_chr_count && valid_chr_count > 0)
+        chrom_parallel = valid_chr_count;
+
+    int region_threads = num_threads / chrom_parallel;
+    if (region_threads < 1)
+        region_threads = 1;
+    for (int i = 0; i < valid_chr_count; i++)
+        thread_args[i].num_threads = region_threads;
+
+    uint64_t sample_t0 = now_ms();
+    log_time("Processing %d chromosome(s), chrom-parallel=%d, %d region "
+             "thread(s) each, max-rss-gb=%d...\n",
+             valid_chr_count, chrom_parallel, region_threads, max_rss_gb);
+    process_chromosomes_parallel(thread_args, valid_chr_count, chrom_parallel,
+                                 max_rss_bytes);
+    uint64_t sample_total_ms = elapsed_ms(sample_t0);
+
+    uint64_t bam_ms = 0;
+    uint64_t write_ms = 0;
+    for (int i = 0; i < valid_chr_count; i++)
+    {
+        bam_ms += chr_timings[i].bam_scan_ms;
+        write_ms += chr_timings[i].hdf5_write_ms;
+    }
+    log_time("Sample wall=%lums bam_scan_sum=%lums write_sum=%lums "
+             "(bam_fraction=%.2f write_fraction=%.2f)\n",
+             (unsigned long)sample_total_ms, (unsigned long)bam_ms,
+             (unsigned long)write_ms,
+             sample_total_ms ? (double)bam_ms / (double)sample_total_ms : 0.0,
+             sample_total_ms ? (double)write_ms / (double)sample_total_ms : 0.0);
 
     SampleRunInfo run_info = {
         .bam_file = bam_file,
@@ -417,6 +519,19 @@ int main(int argc, char *argv[])
     if (write_extraction_manifest(&run_info, chr_exports, valid_chr_count) != 0)
         fprintf(stderr, "Warning: failed to write extraction manifest\n");
 
+    SampleTiming sample_timing = {
+        .total_ms = sample_total_ms,
+        .bam_ms = bam_ms,
+        .write_ms = write_ms,
+        .chrom_parallel = chrom_parallel,
+        .region_threads = region_threads,
+        .max_rss_gb = max_rss_gb,
+        .n_chromosomes = valid_chr_count,
+    };
+    if (write_extraction_timing(out_dir, &sample_timing, chr_timings,
+                                valid_chr_count) != 0)
+        fprintf(stderr, "Warning: failed to write extraction timing\n");
+
     log_time("Cleaning up HDF5...\n");
     cleanup_hdf5();
 
@@ -428,6 +543,7 @@ int main(int argc, char *argv[])
     }
     free(thread_args);
     free(chr_exports);
+    free(chr_timings);
     sam_hdr_destroy(header);
     fai_destroy(fai);
     if (mapping_ref_file)

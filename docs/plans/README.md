@@ -7,6 +7,7 @@ This repo owns **MethylExtractor** build and release CI. Cross-repo Epics and or
 | Plan file | ADO type | Parent Epic (MethylPipeline plan) | Task id |
 |-----------|----------|-----------------------------------|---------|
 | [`methyl-extractor-release-ci.plan.md`](methyl-extractor-release-ci.plan.md) | **Task** | [DevOps CI/CD release](https://dev.azure.com/EpiMethyl/Development/_git/MethylPipeline?path=/docs/plans/devops-ci-cd-release.plan.md) | `me-release-ci` |
+| [`methylextractor-c-perf.plan.md`](methylextractor-c-perf.plan.md) | **Task** | MethylExtractor C throughput (chrom-parallel, timing.json) | `me-c-perf` |
 | *(same plan)* | **Task** | [Production GPU worker layout](https://dev.azure.com/EpiMethyl/Development/_git/MethylPipeline?path=/docs/plans/production-gpu-worker-layout.plan.md) | `extractor-ci` |
 
 Create the **Task** in Azure DevOps under the appropriate Epic. Use the plan `todos[].content` for the task title. Mark **Closed** when merged.

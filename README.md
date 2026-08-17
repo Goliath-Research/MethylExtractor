@@ -250,8 +250,10 @@ MethylExtractor implements rigorous quality control:
 
 ### Memory Usage
 - Streaming I/O prevents loading entire BAM files
-- Memory scales with chromosome size, not genome size
+- Memory scales with in-flight chromosome size (`--chrom-parallel`, gated by `--max-rss-gb`)
 - HDF5 chunked storage optimizes I/O performance
+
+`--chrom-parallel` runs more than one chromosome at a time. `--threads` is the total region-worker budget split across those chromosomes. `{sample}.timing.json` reports BAM-scan vs HDF5-write elapsed ms.
 
 ## Dependencies
 
@@ -265,8 +267,8 @@ MethylExtractor implements rigorous quality control:
 
 ### Common Issues
 - **Empty output**: Check chromosome mapping and BAM headers
-- **High memory usage**: Reduce thread count or process fewer chromosomes
-- **Slow processing**: Use SSD storage, increase `--threads`, and adjust chunk sizes. Lower the `-z` level (or use `-z 0`) to trade compression ratio for write speed.
+- **High memory usage**: Reduce `--chrom-parallel` or `--threads`, or lower `--max-rss-gb` so the extractor serializes large chromosomes
+- **Slow processing**: Use SSD storage, increase `--threads`, raise `--chrom-parallel` if RAM allows, and adjust chunk sizes. Lower the `-z` level (or use `-z 0`) to trade compression ratio for write speed. Check `{sample}.timing.json` to see whether wall time is BAM-bound or write-bound.
 - **Low methylation**: Verify bisulfite conversion and quality filters
 
 ### Performance Optimization

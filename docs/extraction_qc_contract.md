@@ -8,6 +8,7 @@ MethylExtractor exports extraction QC metrics at extraction time. **MethylPipeli
 |------|--------|------|
 | `{chrom}-{context}.json` | `methylextractor.context_qc` v1.0.0 | Per H5/TXT output (e.g. `1-CG.json`) |
 | `{sample_id}.extraction_manifest.json` | `methylextractor.extraction_manifest` v1.0.0 | End of run, in output directory |
+| `{sample_id}.timing.json` | `methylextractor.timing` v1.0.0 | Diagnostic phase elapsed-ms (not a QC guardrail) |
 
 Chromosome names follow `chrom_mapping.json` (`"1"`..`"22"`, `"X"`, `"Y"`). Contexts: `CG` always; `CHG`/`CHH` when `-G`/`-H` are used with `-s`.
 

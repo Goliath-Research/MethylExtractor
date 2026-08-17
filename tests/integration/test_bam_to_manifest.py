@@ -33,26 +33,13 @@ def _resolve_extractor_bin() -> Path:
     )
 
 
-@pytest.fixture
-def toy_run(tmp_path: Path) -> Path:
-    if not (FIXTURE_DIR / "toy.bam").is_file():
-        pytest.skip(f"missing fixture BAM under {FIXTURE_DIR}")
-    work = tmp_path / "sample_toy"
-    work.mkdir()
-    for name in ("toy.fa", "toy.fa.fai", "toy.bam", "toy.bam.bai"):
-        shutil.copy2(FIXTURE_DIR / name, work / name)
-    mapping = json.loads((FIXTURE_DIR / "chrom_mapping.json").read_text(encoding="utf-8"))
-    mapping["reference"] = str(work / "toy.fa")
-    map_path = work / "chrom_mapping.json"
-    map_path.write_text(json.dumps(mapping, indent=2) + "\n", encoding="utf-8")
-
-    out_dir = work / "sample_toy"
-    out_dir.mkdir()
+def _run_extractor(work: Path, out_dir: Path, extra_args: list[str] | None = None) -> Path:
     bin_path = _resolve_extractor_bin()
+    map_path = work / "chrom_mapping.json"
     cmd = [
         str(bin_path),
         "-t",
-        "1",
+        "2",
         "-q",
         "0",
         "-p",
@@ -68,6 +55,8 @@ def toy_run(tmp_path: Path) -> Path:
         str(out_dir),
         str(work / "toy.bam"),
     ]
+    if extra_args:
+        cmd[1:1] = extra_args
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         raise AssertionError(
@@ -75,6 +64,24 @@ def toy_run(tmp_path: Path) -> Path:
             f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
         )
     return out_dir
+
+
+@pytest.fixture
+def toy_run(tmp_path: Path) -> Path:
+    if not (FIXTURE_DIR / "toy.bam").is_file():
+        pytest.skip(f"missing fixture BAM under {FIXTURE_DIR}")
+    work = tmp_path / "sample_toy"
+    work.mkdir()
+    for name in ("toy.fa", "toy.fa.fai", "toy.bam", "toy.bam.bai"):
+        shutil.copy2(FIXTURE_DIR / name, work / name)
+    mapping = json.loads((FIXTURE_DIR / "chrom_mapping.json").read_text(encoding="utf-8"))
+    mapping["reference"] = str(work / "toy.fa")
+    map_path = work / "chrom_mapping.json"
+    map_path.write_text(json.dumps(mapping, indent=2) + "\n", encoding="utf-8")
+
+    out_dir = work / "sample_toy"
+    out_dir.mkdir()
+    return _run_extractor(work, out_dir)
 
 
 def test_bam_to_manifest_schema(toy_run: Path) -> None:
@@ -128,3 +135,57 @@ def test_context_qc_links_production_export_fields(toy_run: Path) -> None:
         "avg_coverage",
     ):
         assert key in ctx
+
+
+def test_timing_json_written(toy_run: Path) -> None:
+    timing_path = toy_run / "sample_toy.timing.json"
+    assert timing_path.is_file()
+    timing = json.loads(timing_path.read_text(encoding="utf-8"))
+    assert timing["schema_name"] == "methylextractor.timing"
+    assert timing["n_chromosomes"] >= 1
+    assert "total_ms" in timing
+    assert "bam_ms" in timing
+    assert "write_ms" in timing
+    assert isinstance(timing.get("chromosomes"), list)
+    assert timing["chromosomes"][0]["name"] == "1"
+
+
+def _h5_bytes(path: Path) -> bytes:
+    return path.read_bytes()
+
+
+def test_chrom_parallel_identity(tmp_path: Path) -> None:
+    """chrom_parallel=2 must match chrom_parallel=1 on the toy BAM."""
+    if not (FIXTURE_DIR / "toy.bam").is_file():
+        pytest.skip(f"missing fixture BAM under {FIXTURE_DIR}")
+    work = tmp_path / "sample_toy"
+    work.mkdir()
+    for name in ("toy.fa", "toy.fa.fai", "toy.bam", "toy.bam.bai"):
+        shutil.copy2(FIXTURE_DIR / name, work / name)
+    mapping = json.loads((FIXTURE_DIR / "chrom_mapping.json").read_text(encoding="utf-8"))
+    mapping["reference"] = str(work / "toy.fa")
+    (work / "chrom_mapping.json").write_text(
+        json.dumps(mapping, indent=2) + "\n", encoding="utf-8"
+    )
+
+    out1 = work / "out1"
+    out2 = work / "out2"
+    out1.mkdir()
+    out2.mkdir()
+    _run_extractor(work, out1, extra_args=["--chrom-parallel=1"])
+    _run_extractor(work, out2, extra_args=["--chrom-parallel=2"])
+
+    h5_a = out1 / "1-CG.h5"
+    h5_b = out2 / "1-CG.h5"
+    assert h5_a.is_file() and h5_b.is_file()
+    assert _h5_bytes(h5_a) == _h5_bytes(h5_b)
+
+    man_a = json.loads((out1 / "out1.extraction_manifest.json").read_text(encoding="utf-8"))
+    man_b = json.loads((out2 / "out2.extraction_manifest.json").read_text(encoding="utf-8"))
+    assert man_a["read_filtering"] == man_b["read_filtering"]
+    assert man_a["summary"]["cpg_sites_passing_min_cov"] == man_b["summary"][
+        "cpg_sites_passing_min_cov"
+    ]
+    assert man_a["per_chromosome"]["1"]["CG"]["num_positions"] == man_b["per_chromosome"][
+        "1"
+    ]["CG"]["num_positions"]

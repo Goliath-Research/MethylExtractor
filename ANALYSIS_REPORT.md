@@ -1,6 +1,6 @@
 # MethylExtractor vs. MethylDackel — Software Engineering Analysis
 
-**Date:** 2026-06-11 (refreshed 2026-08-15)
+**Date:** 2026-06-11 (refreshed 2026-08-17)
 **Scope:** Source-level review of MethylExtractor (`src/`, `include/`, build system, scripts, docs) and comparison against MethylDackel as the reference WGBS methylation extractor.
 **Goal:** Confirm whether MethylExtractor performs a *similar job* to MethylDackel, and whether it does so with *better performance* and *better organization* from a Software Engineering standpoint.
 
@@ -12,7 +12,7 @@
 |----------|---------|
 | Does it do a **similar job** to MethylDackel? | **Yes, for the common extraction path.** Per-cytosine mC/uC by context/strand, MAPQ/Phred filtering, Bismark `XG` strand detection, plus overlapping-mate coordinate clip (implemented). Several MethylDackel features remain unported (M-bias plots, bedGraph interchange). |
 | Is the **output organization better**? | **Yes.** Per-chromosome / per-context HDF5 with a compact 12-byte record and Zstd compression is a genuinely better storage design than MethylDackel's text bedGraph/cytosine-report output, for large cohorts. |
-| Is the **performance better**? | **Partially.** Intra-chromosome region parallelism exists; chromosome-level scheduling remains effectively serial. Published “`-z 9` = 5× faster” claims are still unsubstantiated. |
+| Is the **performance better**? | **Partially.** Intra-chromosome region parallelism plus memory-gated `--chrom-parallel` (default 2). Published “`-z 9` = 5× faster” claims are still unsubstantiated. Gate: ≤6 min wall on a sample that was ~12 min at `threads=10` + read-level. |
 | Is the **engineering quality better**? | **Improved since the June 2026 review.** Overlap mate handling and extraction QC JSON contracts are in production; BAM→manifest integration tests exist under `tests/integration/`. Remaining gaps: chromosome parallelism, stronger automated coverage, doc hygiene. |
 
 **Bottom line:** MethylExtractor is the MethylPipeline **linear / stock-pangenome** extraction tool. Its JSON exports feed **`sample.extraction_qc`** (`methylextractionqc`), not alignment QC (`methylalignmentqc`). For `pangenome_wgbs`, methylGrapher MethylCall replaces MethylExtractor but emits a compatible extraction manifest.
@@ -76,9 +76,11 @@ The compact on-disk record (12 bytes/site, Zstd HDF5, `{chr}-{ctx}.h5` with `--s
 
 The June 2026 finding that this was missing is **obsolete**. Integration coverage: `tests/integration/test_bam_to_manifest.py`.
 
-### 5.2 Chromosome-level threading is effectively serial — **Still open**
+### 5.2 Chromosome-level threading — **Implemented (chrom-parallel pool)**
 
-Chromosomes are processed one at a time in `main.c`; `-t/--threads` primarily affects intra-chromosome region workers. Chromosome-level parallel dispatch remains the largest throughput opportunity.
+`--chrom-parallel K` (default 2, dropped to 1 when the two largest chromosomes exceed `--max-rss-gb`) runs up to K chromosomes in `process_chromosome` at once. `--threads T` is split as `max(1, T/K)` region workers per in-flight chromosome. Chromosomes are scheduled largest-first. Dense mC/uC arrays still scale with chromosome length; the RSS gate prevents stacking chr1+chr2 when the estimate exceeds the budget.
+
+Phase elapsed-ms land in `{sample}.timing.json`. Intra-chromosome I/O: BAM index is shared; each region thread still has its own `samFile*` (htslib rule) with `hts_set_threads` for BGZF inflate. Header is not re-read per region.
 
 ### 5.3 Documented "`-z 9` → ~5× faster" optimization — **Doc/code drift**
 
@@ -86,15 +88,15 @@ Background multi-threaded zstd claims remain unsubstantiated; document actual Zs
 
 ### 5.4 Silent uncompressed HDF5 risk — **Medium**
 
-Missing Zstd plugin with `H5Z_FLAG_OPTIONAL` can write uncompressed data; set `HDF5_PLUGIN_PATH` (MethylPipeline worker install does this).
+Missing Zstd plugin falls back to gzip (`H5Z_FLAG_MANDATORY` then gzip). Startup logs `HDF5_PLUGIN_PATH` and whether the Zstd filter is available. Set `HDF5_PLUGIN_PATH` (MethylPipeline worker install does this).
 
-### 5.5 Repeated per-region index load — **Medium (performance)**
+### 5.5 Per-region BAM handle — **Low (addressed)**
 
-Each region thread re-opens BAM + index.
+Each region thread still opens its own BAM handle (required for concurrent HTSlib readers). The index is loaded once per chromosome and shared read-only. `hts_set_threads` enables BGZF decompress workers on each handle.
 
 ### 5.6 Memory footprint — **Low/Medium**
 
-Dense per-chromosome counting arrays; serial chromosomes bound peak RSS.
+Dense per-chromosome counting arrays; `--chrom-parallel` + `--max-rss-gb` bound peak RSS to in-flight chromosomes.
 
 ---
 
