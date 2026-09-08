@@ -129,6 +129,14 @@ void *process_region_direct(void *arg)
         int32_t pos = c->pos;
         uint32_t *cigar = bam_get_cigar(b);
         int qpos = 0;
+        uint8_t *xm_aux = bam_aux_get(b, "XM");
+        const char *xmz = NULL;
+        if (xm_aux && xm_aux[0] == 'Z')
+            xmz = (const char *)(xm_aux + 1);
+
+        int32_t mhap_pos[MHAP_MAX_CPG_PER_READ];
+        uint8_t mhap_meth[MHAP_MAX_CPG_PER_READ];
+        int mhap_n = 0;
 
         for (int k = 0; k < c->n_cigar; ++k)
         {
@@ -167,35 +175,61 @@ void *process_region_direct(void *arg)
 
                     int base = bam_seqi(seq, qpos);
                     uint32_t rel = (uint32_t)(pos - t->start_pos);
-
-                    if (ref == 'C' && (strand == 1 || strand == 3))
+                    int called = -1;
+                    if (xmz)
                     {
-                        if (base == 2)
+                        char xc = xmz[qpos];
+                        if (xc == 'Z' || xc == 'X' || xc == 'H' || xc == 'U')
+                            called = 1;
+                        else if (xc == 'z' || xc == 'x' || xc == 'h' || xc == 'u')
+                            called = 0;
+                    }
+                    if (called < 0)
+                    {
+                        if (ref == 'C' && (strand == 1 || strand == 3))
                         {
-                            r->counts.mC[rel]++;
-                            r->filter_stats.bases_counted_methylated++;
-                            used_this_read = 1;
+                            if (base == 2)
+                                called = 1;
+                            else if (base == 8)
+                                called = 0;
                         }
-                        else if (base == 8)
+                        else if (ref == 'G' && (strand == 2 || strand == 4))
                         {
-                            r->counts.uC[rel]++;
-                            r->filter_stats.bases_counted_unmethylated++;
-                            used_this_read = 1;
+                            if (base == 4)
+                                called = 1;
+                            else if (base == 1)
+                                called = 0;
                         }
                     }
-                    else if (ref == 'G' && (strand == 2 || strand == 4))
+
+                    if (called == 1)
                     {
-                        if (base == 4)
+                        r->counts.mC[rel]++;
+                        r->filter_stats.bases_counted_methylated++;
+                        used_this_read = 1;
+                    }
+                    else if (called == 0)
+                    {
+                        r->counts.uC[rel]++;
+                        r->filter_stats.bases_counted_unmethylated++;
+                        used_this_read = 1;
+                    }
+
+                    if (t->mhap && r->mhap && called >= 0 &&
+                        mhap_n < MHAP_MAX_CPG_PER_READ)
+                    {
+                        int cpg = isCpG(t->chr_seq, pos, (int)t->chr_len);
+                        if (cpg != 0)
                         {
-                            r->counts.mC[rel]++;
-                            r->filter_stats.bases_counted_methylated++;
-                            used_this_read = 1;
-                        }
-                        else if (base == 1)
-                        {
-                            r->counts.uC[rel]++;
-                            r->filter_stats.bases_counted_unmethylated++;
-                            used_this_read = 1;
+                            int32_t canonical = (cpg == -1) ? (int32_t)(pos - 1)
+                                                            : (int32_t)pos;
+                            if (mhap_n == 0 ||
+                                mhap_pos[mhap_n - 1] != canonical)
+                            {
+                                mhap_pos[mhap_n] = canonical;
+                                mhap_meth[mhap_n] = (uint8_t)called;
+                                mhap_n++;
+                            }
                         }
                     }
                     pos++;
@@ -207,6 +241,10 @@ void *process_region_direct(void *arg)
             else if (op == BAM_CINS || op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP)
                 qpos += len;
         }
+
+        if (t->mhap && r->mhap && mhap_n > 0)
+            mhap_store_add(r->mhap, c->pos, (int8_t)strand, mhap_pos, mhap_meth,
+                           mhap_n);
 
         if (used_this_read)
             r->filter_stats.reads_used++;
@@ -410,6 +448,13 @@ void process_chromosome(ThreadArg *targ)
                         &r->rl_tile_end[ci]);
             }
         }
+        r->mhap = NULL;
+        if (targ->mhap)
+        {
+            r->mhap = malloc(sizeof(MhapStore));
+            if (r->mhap)
+                mhap_store_init(r->mhap);
+        }
 
         pthread_create(&threads[i], NULL, process_region_direct, r);
         n_created++;
@@ -429,6 +474,8 @@ void process_chromosome(ThreadArg *targ)
         export_out->filter_stats = chr_filters;
 
     uint64_t t_merge = now_ms();
+    MhapStore mhap_merged;
+    mhap_store_init(&mhap_merged);
     for (int i = 0; i < n_created; i++)
     {
         uint32_t offset = regions[i].base.start_pos;
@@ -444,11 +491,31 @@ void process_chromosome(ThreadArg *targ)
         free(regions[i].counts.uC);
         free(regions[i].rl_tile_start);
         free(regions[i].rl_tile_end);
+        if (regions[i].mhap)
+        {
+            mhap_store_merge(&mhap_merged, regions[i].mhap);
+            mhap_store_free(regions[i].mhap);
+            free(regions[i].mhap);
+        }
     }
     if (timing)
         timing->merge_ms = elapsed_ms(t_merge);
 
     uint64_t t_write = now_ms();
+
+    if (targ->mhap && mhap_merged.n_reads > 0)
+    {
+        char mhap_path[1024];
+        snprintf(mhap_path, sizeof(mhap_path), "%s/%s-CG.mhap.h5", targ->out_dir,
+                 targ->chr);
+        if (write_mhap_h5(mhap_path, targ->chr, "CG", targ->compression,
+                          &mhap_merged) != 0)
+        {
+            fprintf(stderr, "Warning: failed to write haplotype sidecar %s\n",
+                    mhap_path);
+        }
+    }
+    mhap_store_free(&mhap_merged);
 
     if (rl_data.n_active > 0)
     {

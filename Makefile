@@ -36,7 +36,7 @@ HDF5_PLUGIN_BUILD = $(DYNAMIC_DIR)/hdf5_zstd_plugin
 PLUGIN_SO = $(HDF5_PLUGIN_BUILD)/libH5Zzstd.so
 
 # Source files
-SRCS = src/main.c src/bam_processing.c src/output_formats.c src/extraction_export.c src/utils.c src/read_level.c src/cjson/cJSON.c
+SRCS = src/main.c src/bam_processing.c src/output_formats.c src/extraction_export.c src/utils.c src/read_level.c src/mhap.c src/cjson/cJSON.c
 
 # Targets
 # Note: `deps` is intentionally NOT a prerequisite of `all` so that a plain

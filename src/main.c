@@ -33,6 +33,8 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -o, --output-dir DIR      Output directory\n");
     fprintf(stderr, "  -R, --read-level          Emit read-level pattern sidecars "
                     "({chrom}-{ctx}.patterns.h5)\n");
+    fprintf(stderr, "      --mhap                Emit per-read CpG haplotype sidecars "
+                    "({chrom}-CG.mhap.h5)\n");
     fprintf(stderr, "  -T, --tile-size INT       CpG sites per read-level tile "
                     "[%d]\n", DEFAULT_TILE_SIZE);
     fprintf(stderr, "      --chrom-parallel INT  Max chromosomes in flight "
@@ -79,6 +81,7 @@ int main(int argc, char *argv[])
     const char *out_dir = NULL;
     int split_context_files = 0;
     int read_level = 0;
+    int mhap = 0;
     int tile_size = DEFAULT_TILE_SIZE;
     int chrom_parallel = DEFAULT_CHROM_PARALLEL;
     int max_rss_gb = DEFAULT_MAX_RSS_GB;
@@ -101,6 +104,7 @@ int main(int argc, char *argv[])
         {"split", no_argument, 0, 's'},
         {"output-dir", required_argument, 0, 'o'},
         {"read-level", no_argument, 0, 'R'},
+        {"mhap", no_argument, 0, 1002},
         {"tile-size", required_argument, 0, 'T'},
         {"chrom-parallel", required_argument, 0, 1000},
         {"max-rss-gb", required_argument, 0, 1001},
@@ -203,6 +207,9 @@ int main(int argc, char *argv[])
             break;
         case 'R':
             read_level = 1;
+            break;
+        case 1002:
+            mhap = 1;
             break;
         case 'T':
             tile_size = atoi(optarg);
@@ -434,6 +441,7 @@ int main(int argc, char *argv[])
         thread_args[valid_chr_count].num_threads = num_threads;
         thread_args[valid_chr_count].read_level = read_level;
         thread_args[valid_chr_count].tile_size = tile_size;
+        thread_args[valid_chr_count].mhap = mhap;
         thread_args[valid_chr_count].bgzf_threads = DEFAULT_BGZF_THREADS;
         thread_args[valid_chr_count].hdr = header;
         thread_args[valid_chr_count].chr_export = &chr_exports[valid_chr_count];
@@ -515,6 +523,7 @@ int main(int argc, char *argv[])
         .split_context_files = split_context_files,
         .read_level = read_level,
         .tile_size = tile_size,
+        .mhap = mhap,
     };
     if (write_extraction_manifest(&run_info, chr_exports, valid_chr_count) != 0)
         fprintf(stderr, "Warning: failed to write extraction manifest\n");

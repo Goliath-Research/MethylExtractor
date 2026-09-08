@@ -41,6 +41,9 @@
 #define READ_LEVEL_PATTERN_ENCODING "bitmask_msb_first"
 #define READ_LEVEL_SCHEMA_VERSION "1.0.0"
 #define READ_LEVEL_GROUP "read_level_patterns"
+#define MHAP_SCHEMA_VERSION "1.0.0"
+#define MHAP_GROUP "mhap"
+#define MHAP_MAX_CPG_PER_READ 256
 
 #define TNC_A 0
 #define TNC_C 1
@@ -199,6 +202,7 @@ typedef struct
     int split_context_files;
     int read_level;
     int tile_size;
+    int mhap;
 } SampleRunInfo;
 
 typedef struct
@@ -225,6 +229,7 @@ typedef struct
     int num_threads;
     int read_level;
     int tile_size;
+    int mhap;
     int bgzf_threads;
     bam_hdr_t *hdr;
     ChromosomeExport *chr_export;
@@ -258,6 +263,19 @@ typedef struct
 
 typedef struct
 {
+    int32_t *read_start;
+    int8_t *read_strand;
+    int32_t *n_cpg;
+    size_t n_reads;
+    size_t cap_reads;
+    int32_t *cpg_pos;
+    uint8_t *meth;
+    size_t n_obs;
+    size_t cap_obs;
+} MhapStore;
+
+typedef struct
+{
     ThreadArg base;
     PrivateCounts counts;
     hts_idx_t *idx;
@@ -267,6 +285,7 @@ typedef struct
     ReadLevelChromData *rl;
     size_t *rl_tile_start;
     size_t *rl_tile_end;
+    MhapStore *mhap;
 } RegionArg;
 
 typedef struct
@@ -356,5 +375,14 @@ int write_read_level_patterns_h5(const char *filename, const char *context,
                                  const ReadLevelTiles *tiles,
                                  const uint32_t *hist);
 void free_read_level_chrom_data(ReadLevelChromData *data);
+
+// mhap.c — per-read CpG haplotype store (panel-bounded sidecar)
+void mhap_store_init(MhapStore *s);
+void mhap_store_free(MhapStore *s);
+int mhap_store_add(MhapStore *s, int32_t start, int8_t strand,
+                   const int32_t *pos, const uint8_t *meth, int n);
+int mhap_store_merge(MhapStore *dst, const MhapStore *src);
+int write_mhap_h5(const char *filename, const char *chrom, const char *context,
+                  int compression, const MhapStore *store);
 
 #endif // METHYL_EXTRACTOR_H
