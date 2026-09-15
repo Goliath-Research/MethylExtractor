@@ -282,9 +282,5 @@ For complete documentation, see `MethylExtractor_Documentation.html`.
 
 ## License
 
-Copyright © Epimethyl Analytics. All rights reserved. This software is proprietary;
-see [`LICENSE`](LICENSE) for terms.
-
-MethylExtractor is a fork of [MethylDackel](https://github.com/dpryan79/MethylDackel),
-which is distributed under the MIT License; portions derived from it remain under
-those terms (see the third-party notice in [`LICENSE`](LICENSE)).
+**MIT.** MethylExtractor is a fork of [MethylDackel](https://github.com/dpryan79/MethylDackel)
+(MIT; Devon P. Ryan). See [`LICENSE`](LICENSE).
