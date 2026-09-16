@@ -23,8 +23,8 @@ def _resolve_extractor_bin() -> Path:
     for candidate in (
         REPO_ROOT / "build" / "dynamic" / "arm64" / "MethylExtractor",
         REPO_ROOT / "build" / "dynamic" / "x64" / "MethylExtractor",
-        Path("/work/epimethyl/methyl-extractor-aarch64/bin/MethylExtractor"),
-        Path("/work/epimethyl/methyl-extractor-amd64/bin/MethylExtractor"),
+        Path("/work/goliath/methyl-extractor-aarch64/bin/MethylExtractor"),
+        Path("/work/goliath/methyl-extractor-amd64/bin/MethylExtractor"),
     ):
         if candidate.is_file():
             return candidate

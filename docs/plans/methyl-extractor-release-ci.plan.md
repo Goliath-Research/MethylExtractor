@@ -1,6 +1,6 @@
 ---
 name: MethylExtractor release CI
-overview: Per-arch Azure DevOps release and PR pipelines that build native binaries, package tarballs via MethylPipeline scripts, and publish to the methyl-extractor Universal Packages feed on git tags.
+overview: Per-arch GitHub Actions release and PR workflows that build native binaries, package tarballs via GoliathWorkflow scripts, and publish GitHub Release assets on git tags.
 azure_devops:
   type: Task
   title: Register MethylExtractor release + PR pipelines; enable Universal Package publish per arch
@@ -14,13 +14,13 @@ azure_devops:
       task_id: extractor-ci
 todos:
   - id: pr-pipeline
-    content: Add ci/azure-pipelines-pr.yml (make + smoke on pull requests, no publish)
+    content: Add .github/workflows/build.yml (make + smoke on pull requests, no publish)
     status: completed
   - id: release-arm64
-    content: Add ci/azure-pipelines-release-arm64.yml on pool build-arm64; tag v* and manual releaseVersion param
+    content: Add .github/workflows/release.yml on pool build-arm64; tag v* and manual releaseVersion param
     status: completed
   - id: release-x64
-    content: Add ci/azure-pipelines-release-x64.yml on Microsoft-hosted ubuntu-latest; tag v*
+    content: Add .github/workflows/release.yml on Microsoft-hosted ubuntu-latest; tag v*
     status: completed
   - id: universal-publish
     content: az artifacts universal publish per arch to feed methyl-extractor (SemVer without leading zeros)
@@ -38,26 +38,25 @@ isProject: false
 
 ## Scope
 
-Build and publish **arch-specific tarballs** (`methyl-extractor-linux-aarch64`, `methyl-extractor-linux-amd64`) independently of MethylPipeline wheel releases. Orchestration (assemble + deploy to `/work/epimethyl`) is owned by MethylPipeline.
+Build and publish **arch-specific tarballs** (`methyl-extractor-linux-aarch64`, `methyl-extractor-linux-amd64`) independently of MethylPipeline wheel releases. Orchestration (assemble + deploy to `/work/goliath`) is owned by MethylPipeline.
 
 ## Pipelines
 
-| YAML | Pipeline name | Pool | Trigger |
-|------|---------------|------|---------|
-| `ci/azure-pipelines-pr.yml` | MethylExtractor-PR | `ubuntu-latest` | Pull requests |
-| `ci/azure-pipelines-release-arm64.yml` | MethylExtractor-Release-ARM64 | `build-arm64` | Tags `v*`, manual |
-| `ci/azure-pipelines-release-x64.yml` | MethylExtractor-Release-x64 | `ubuntu-latest` | Tags `v*`, manual |
+| YAML | Workflow | Runner | Trigger |
+|------|----------|--------|---------|
+| `.github/workflows/build.yml` | PR / push build | `ubuntu-latest` | Pull requests and `main` |
+| `.github/workflows/release.yml` | Release (amd64 + aarch64) | `ubuntu-latest` and `ubuntu-24.04-arm` | Tags `v*`, manual |
 
-Tag `v2026.6.1` runs **both** release pipelines. Each publishes one Universal Package version to feed **`methyl-extractor`**.
+Tag `v2026.6.1` publishes both arch tarballs to the GitHub Release.
 
 ## Release flow (cross-repo)
 
 1. Tag MethylExtractor `v2026.6.1` → both release pipelines publish.
 2. Tag MethylPipeline when Python/worker code changes.
 3. Run **GoliathOmics-Release-Assemble** (MethylPipeline) with pinned ME + MP versions.
-4. Approve **GoliathOmics-Release-Deploy** to promote `/work/epimethyl/current`.
+4. Approve **GoliathOmics-Release-Deploy** to promote `/work/goliath/current`.
 
-See MethylPipeline [`docs/deployment/production_release.md`](https://dev.azure.com/EpiMethyl/Development/_git/MethylPipeline?path=/docs/deployment/production_release.md).
+See MethylPipeline [`docs/deployment/production_release.md`](https://github.com/Goliath-Research/GoliathWorkflow/blob/main/docs/deployment/production_release.md).
 
 ## Prerequisites
 

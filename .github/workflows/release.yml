@@ -1,0 +1,118 @@
+name: MethylExtractor release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      releaseVersion:
+        description: Release version when not tagging (SemVer, e.g. 2026.6.1-test)
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: MethylExtractor
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Goliath-Research/GoliathWorkflow
+          path: GoliathWorkflow
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libhdf5-dev \
+            libhts-dev \
+            zlib1g-dev \
+            libbz2-dev \
+            liblzma-dev \
+            libcurl4-gnutls-dev \
+            libssl-dev \
+            libzstd-dev
+
+      - name: Build
+        working-directory: MethylExtractor
+        run: |
+          make deps || true
+          make
+
+      - name: Package tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${{ inputs.releaseVersion }}" ]]; then
+            VERSION="${{ inputs.releaseVersion }}"
+          else
+            echo "Run from a v* tag or set releaseVersion." >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          OUT="${{ runner.temp }}/methyl-extractor-linux-${{ matrix.arch }}.tar.gz"
+          bash GoliathWorkflow/scripts/package_methyl_extractor.sh \
+            --build-dir MethylExtractor \
+            --arch "${{ matrix.arch }}" \
+            --version "$VERSION" \
+            --output "$OUT"
+          sha256sum "$OUT" | tee "${OUT}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: methyl-extractor-linux-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/methyl-extractor-linux-${{ matrix.arch }}.tar.gz
+            ${{ runner.temp }}/methyl-extractor-linux-${{ matrix.arch }}.tar.gz.sha256
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download arch tarballs
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.releaseVersion }}"
+          fi
+          TAG="v${VERSION}"
+          shopt -s nullglob
+          FILES=( "${{ runner.temp }}/artifacts"/methyl-extractor-linux-*.tar.gz* )
+          [[ ${#FILES[@]} -gt 0 ]] || { echo "No tarballs to publish"; exit 1; }
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+          else
+            gh release create "$TAG" \
+              --title "MethylExtractor ${VERSION}" \
+              --generate-notes \
+              "${FILES[@]}"
+          fi
