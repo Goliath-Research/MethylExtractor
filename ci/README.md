@@ -184,5 +184,5 @@ az vm start --resource-group rg-methyl-build --name methyl-build-arm64
 
 1. Tag MethylExtractor `v2026.6.1` → **MethylExtractor-Release-ARM64** and **MethylExtractor-Release-x64** run in parallel.
 2. Tag MethylPipeline → **MethylPipeline-Release**.
-3. Run **Epimethyl-Release-Assemble** with both ME package versions pinned.
-4. Approve **Epimethyl-Release-Deploy**.
+3. Run **GoliathOmics-Release-Assemble** with both ME package versions pinned.
+4. Approve **GoliathOmics-Release-Deploy**.

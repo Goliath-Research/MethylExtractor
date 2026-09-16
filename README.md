@@ -138,7 +138,7 @@ Human-readable tab-separated values:
 | `-s --split` | `chr1-CG.h5`, `chr1-CHG.h5`, ... | Separate files per context |
 | `-R --read-level` | `chr1-CG.patterns.h5`, ... | Read-level co-methylation pattern sidecars (requires `-s`) |
 
-Read-level sidecars follow the [MethylPipeline read-level pattern contract](https://github.com/epimethyl/MethylPipeline/blob/main/docs/reference/read_level_pattern_contract.md): per-tile sparse histograms of joint methylation patterns over `k` consecutive CpGs (`bitmask_msb_first` encoding). Marginal `{chrom}-{ctx}.h5` files are unchanged.
+Read-level sidecars follow the [MethylPipeline read-level pattern contract](https://github.com/Goliath-Research/GoliathWorkflow/blob/main/docs/reference/read_level_pattern_contract.md): per-tile sparse histograms of joint methylation patterns over `k` consecutive CpGs (`bitmask_msb_first` encoding). Marginal `{chrom}-{ctx}.h5` files are unchanged.
 
 ### Statistics Output
 

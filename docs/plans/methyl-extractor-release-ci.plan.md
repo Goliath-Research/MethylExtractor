@@ -54,8 +54,8 @@ Tag `v2026.6.1` runs **both** release pipelines. Each publishes one Universal Pa
 
 1. Tag MethylExtractor `v2026.6.1` → both release pipelines publish.
 2. Tag MethylPipeline when Python/worker code changes.
-3. Run **Epimethyl-Release-Assemble** (MethylPipeline) with pinned ME + MP versions.
-4. Approve **Epimethyl-Release-Deploy** to promote `/work/epimethyl/current`.
+3. Run **GoliathOmics-Release-Assemble** (MethylPipeline) with pinned ME + MP versions.
+4. Approve **GoliathOmics-Release-Deploy** to promote `/work/epimethyl/current`.
 
 See MethylPipeline [`docs/deployment/production_release.md`](https://dev.azure.com/EpiMethyl/Development/_git/MethylPipeline?path=/docs/deployment/production_release.md).
 
