@@ -50,3 +50,7 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# Build output (binaries and the HDF5 Zstd plugin are produced by `make`,
+# released via .github/workflows/release.yml, never committed)
+build/

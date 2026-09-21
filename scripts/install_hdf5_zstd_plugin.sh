@@ -66,7 +66,9 @@ echo "Compiling plugin..."
 mkdir -p build
 cd build
 
-cmake ..
+# Upstream declares cmake_minimum_required(VERSION 2.8.10); CMake >= 4 rejects it.
+# Older CMake ignores this unused cache variable.
+cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
 make -j$(nproc)
 
 # Built library is libH5Zzstd.so (CMake OUTPUT_NAME H5Zzstd)

@@ -26,10 +26,13 @@ jobs:
             libzstd-dev
 
       - name: Build (dynamic)
-        run: make dynamic
+        run: |
+          make clean
+          make dynamic
 
       - name: Smoke test (--help)
         run: |
-          BIN=$(find build -name MethylExtractor -type f | head -n1)
+          set -euo pipefail
+          BIN=$(make -s print-dynamic-bin)
           echo "Built binary: $BIN"
           "$BIN" --help

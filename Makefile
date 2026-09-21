@@ -124,4 +124,8 @@ clean:
 	rm -rf build
 	@# Removes all build artifacts including the plugin under build/dynamic/$(ARCH_NAME)/
 
-.PHONY: all deps plugin static dynamic debug install clean
+# Path of the dynamic binary for this machine, for CI and packaging scripts.
+print-dynamic-bin:
+	@echo $(DYNAMIC_DIR)/MethylExtractor
+
+.PHONY: all deps plugin static dynamic debug install clean print-dynamic-bin
