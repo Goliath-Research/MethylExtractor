@@ -1,5 +1,13 @@
 # MethylExtractor
 
+**GoliathApp** is the platform. **GoliathOmics** is the genomics product. **GoliathAlign** (formerly mojo-align) aligns reads. **MethylExtractor** calls methylation from linear BAM files. **GoliathWeb** is the public hub.
+
+Index: [../GoliathApp/docs/workspace-index.md](../GoliathApp/docs/workspace-index.md).
+
+## Place in the workspace
+
+MethylExtractor is an improved, focused fork of [MethylDackel](https://github.com/dpryan79/MethylDackel). It reads linear BAM files after alignment (GoliathAlign or Parabricks) and writes per-chromosome HDF5 plus JSON QC sidecars. [GoliathOmics](https://github.com/Goliath-Research/GoliathOmics) consumes that contract in `methylextractionqc`. It is not used on the WGBS pangenome path; that path calls methylation inside GoliathAlign (`MethylCall` / `MergeCpG`). It is not part of GoliathApp.
+
 A high-performance tool for extracting DNA methylation data from bisulfite sequencing BAM files, featuring advanced overlapping read pair handling and comprehensive quality control.
 
 ## ✨ Key Features
@@ -138,11 +146,11 @@ Human-readable tab-separated values:
 | `-s --split` | `chr1-CG.h5`, `chr1-CHG.h5`, ... | Separate files per context |
 | `-R --read-level` | `chr1-CG.patterns.h5`, ... | Read-level co-methylation pattern sidecars (requires `-s`) |
 
-Read-level sidecars follow the [MethylPipeline read-level pattern contract](https://github.com/Goliath-Research/GoliathWorkflow/blob/main/docs/reference/read_level_pattern_contract.md): per-tile sparse histograms of joint methylation patterns over `k` consecutive CpGs (`bitmask_msb_first` encoding). Marginal `{chrom}-{ctx}.h5` files are unchanged.
+Read-level sidecars follow the GoliathOmics read-level pattern contract: per-tile sparse histograms of joint methylation patterns over `k` consecutive CpGs (`bitmask_msb_first` encoding). Marginal `{chrom}-{ctx}.h5` files are unchanged.
 
 ### Statistics Output
 
-Each output file (`{chrom}-{context}.h5` or `{chrom}.h5`) gets a companion JSON sidecar with legacy top-level fields plus an extended QC block for [MethylPipeline](https://github.com/) **extraction QC** (`sample.extraction_qc` / `methylextractionqc`) — not alignment QC.
+Each output file (`{chrom}-{context}.h5` or `{chrom}.h5`) gets a companion JSON sidecar with legacy top-level fields plus an extended QC block for GoliathOmics **extraction QC** (`sample.extraction_qc` / `methylextractionqc`) — not alignment QC.
 
 **Legacy fields** (unchanged for backward compatibility):
 
@@ -166,7 +174,7 @@ Each output file (`{chrom}-{context}.h5` or `{chrom}.h5`) gets a companion JSON 
 
 ### Extraction manifest (sample-level)
 
-After all chromosomes complete, MethylExtractor writes `{sample_id}.extraction_manifest.json` in the output directory (`schema_name`: `methylextractor.extraction_manifest`). MethylPipeline should consume this file (and/or per-context JSON sidecars) to run post-extraction guardrails — Pass/Fail is **not** computed in MethylExtractor.
+After all chromosomes complete, MethylExtractor writes `{sample_id}.extraction_manifest.json` in the output directory (`schema_name`: `methylextractor.extraction_manifest`). GoliathOmics (`methylextractionqc`) consumes this file and the per-context JSON sidecars to run post-extraction guardrails. Pass/Fail is not computed in MethylExtractor.
 
 The manifest contains:
 

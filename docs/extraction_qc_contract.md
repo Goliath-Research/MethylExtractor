@@ -1,6 +1,6 @@
-# Extraction QC export contract (MethylExtractor → MethylPipeline)
+# Extraction QC export contract (MethylExtractor → GoliathOmics)
 
-MethylExtractor exports extraction QC metrics at extraction time. **MethylPipeline** is responsible for reading H5 files (when needed), consuming these JSON exports, and evaluating Pass/Fail guardrails.
+MethylExtractor exports extraction QC metrics at extraction time. **GoliathOmics** (`methylextractionqc`) reads H5 files when needed, consumes these JSON exports, and evaluates Pass/Fail guardrails.
 
 ## Files produced
 
@@ -14,7 +14,7 @@ Chromosome names follow `chrom_mapping.json` (`"1"`..`"22"`, `"X"`, `"Y"`). Cont
 
 ## Reference site counts
 
-Each context JSON and manifest entry includes `sites_in_reference` — the number of cytosine sites enumerated from the reference for that chromosome and context. MethylPipeline can compute:
+Each context JSON and manifest entry includes `sites_in_reference` — the number of cytosine sites enumerated from the reference for that chromosome and context. GoliathOmics can compute:
 
 ```
 fraction_sites_covered = sites_passing_min_cov / sites_in_reference
@@ -22,9 +22,9 @@ fraction_sites_covered = sites_passing_min_cov / sites_in_reference
 
 without re-scanning the reference FASTA. Genome-wide fraction is in manifest `summary.cpg_fraction_sites_covered`.
 
-## Pass/Fail (MethylPipeline)
+## Pass/Fail (GoliathOmics)
 
-Suggested blocking guardrails (configurable in MethylPipeline):
+Suggested blocking guardrails (configurable in GoliathOmics):
 
 | Guardrail | Source field | Default |
 |-----------|--------------|---------|

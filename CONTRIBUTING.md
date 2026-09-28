@@ -1,5 +1,7 @@
 # Contributing to MethylExtractor
 
+Upstream repository: [Goliath-Research/MethylExtractor](https://github.com/Goliath-Research/MethylExtractor).
+
 Thank you for your interest in contributing to MethylExtractor! We welcome contributions from the community to help improve this tool.
 
 ## Getting Started
