@@ -288,6 +288,17 @@ MethylExtractor implements rigorous quality control:
 
 For complete documentation, see `MethylExtractor_Documentation.html`.
 
+## Type checking
+
+Python in `src/cap_coverage.py` and `tests/` is checked with [Pyrefly](https://pyrefly.org):
+
+```bash
+poetry install
+poetry run pyrefly check
+```
+
+`make typecheck` runs the same check.
+
 ## License
 
 **MIT.** MethylExtractor is a fork of [MethylDackel](https://github.com/dpryan79/MethylDackel)

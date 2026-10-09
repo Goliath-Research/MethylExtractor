@@ -4,7 +4,7 @@ All CI is **GitHub Actions** under [`.github/workflows/`](../.github/workflows/)
 
 | Workflow | Trigger |
 |----------|---------|
-| [`.github/workflows/build.yml`](../.github/workflows/build.yml) | Push/PR — `make dynamic` + `--help` smoke |
+| [`.github/workflows/build.yml`](../.github/workflows/build.yml) | Push/PR — `make dynamic` + `--help` smoke, and Pyrefly on Python sources |
 | [`.github/workflows/release.yml`](../.github/workflows/release.yml) | Tags `v*` (or manual `releaseVersion`) — amd64 + aarch64 tarballs on the GitHub Release |
 
 Orchestration (assemble/deploy) lives in [GoliathWorkflow](https://github.com/Goliath-Research/GoliathWorkflow) `.github/workflows/`.
