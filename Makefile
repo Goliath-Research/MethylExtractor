@@ -128,4 +128,8 @@ clean:
 print-dynamic-bin:
 	@echo $(DYNAMIC_DIR)/MethylExtractor
 
-.PHONY: all deps plugin static dynamic debug install clean print-dynamic-bin
+# Type-check Python sources (src/cap_coverage.py and tests/) with Pyrefly.
+typecheck:
+	poetry run pyrefly check
+
+.PHONY: all deps plugin static dynamic debug install clean print-dynamic-bin typecheck

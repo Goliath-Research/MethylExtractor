@@ -5,10 +5,22 @@ description = "Methylation Extractor is a custom fork of MethylDackel focused on
 authors = ["David Izada Rodriguez"]
 license = "MIT"
 readme = "README.md"
+package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.12"
 
+# numpy and pandas are imported by src/cap_coverage.py; pytest by tests/.
+# They live in the dev group so Pyrefly can resolve them. The C binary does not use them.
+[tool.poetry.group.dev.dependencies]
+pyrefly = "^1.3.2"
+pytest = "^8.3"
+numpy = "^2.1"
+pandas = "^2.2"
+
+[tool.pyrefly]
+project-includes = ["src/**/*.py", "tests/**/*.py"]
+python-version = "3.12"
 
 [build-system]
 requires = ["poetry-core"]
